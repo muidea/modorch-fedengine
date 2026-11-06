@@ -4,6 +4,7 @@ mod codec;
 mod control;
 mod credentials;
 mod ddl_refresh;
+mod discovery;
 mod error;
 mod extensions;
 mod functions;

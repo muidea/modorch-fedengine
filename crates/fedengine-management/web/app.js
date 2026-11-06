@@ -1,3 +1,6 @@
+import { createRegistration } from './organization.js';
+import { createBrowser } from './browser.js';
+import { createNavigator } from './navigator.js';
 const $ = (selector, root = document) => root.querySelector(selector);
 const apiBase = '/api/v1';
 const terminal = new Set(['Succeeded', 'Failed', 'Interrupted']);
@@ -38,7 +41,7 @@ function el(tag, attrs = {}, ...children) {
   }
   return node;
 }
-function replace(node, ...children) { node.replaceChildren(...children); }
+function replace(node, ...children) { node.replaceChildren(...children.flat(Infinity).filter(child => child !== null && child !== undefined)); }
 function guard(fn) {
   return (...args) => {
     try { return Promise.resolve(fn(...args)).catch(error => toast(error.message, true)); }
@@ -115,11 +118,11 @@ function renderPending() {
     el('div', {}, '请求可能已被服务受理。请使用原请求重试以找回结果；等待排空的操作需先结束相关查询或关闭 Portal。'),
     el('div', { class: 'actions' }, button('使用原幂等键重试', () => sendWrite(state.pending), 'small', false, state.writing)));
 }
-async function write(method, path, body, label) {
+async function write(method, path, body, label, keepOpen = false) {
   if (state.writing || state.pending) throw new Error('请先确认上一项请求的结果。');
   const bytes = crypto.getRandomValues(new Uint32Array(4));
   const key = `web-${Array.from(bytes, value => value.toString(16)).join('-')}`;
-  const pending = { method, path, body, label, key };
+  const pending = { method, path, body, label, key, keepOpen };
   state.pending = pending; saveSession('fedengine.pending', pending);
   return sendWrite(pending);
 }
@@ -137,7 +140,7 @@ async function sendWrite(pending) {
       toast(`${pending.label}已受理，正在跟踪执行结果。`);
     } else toast(`${pending.label}成功。`);
     state.pending = null; saveSession('fedengine.pending', null);
-    if ($('#dialog').open) $('#dialog').close();
+    if ($('#dialog').open && !pending.keepOpen) $('#dialog').close();
     await reload().catch(() => toast('请求结果已确认，但状态刷新失败，请稍后刷新状态。', true));
     return body;
   } catch (error) {
@@ -180,6 +183,7 @@ async function reload() {
     const sourceSignature = JSON.stringify(sources), databaseSignature = JSON.stringify(databases);
     const sourcesChanged = state.sourceSignature !== sourceSignature;
     const databasesChanged = state.databaseSignature !== databaseSignature;
+    if (databasesChanged || !state.initialized) navigator.update(databases);
     state.sourceSignature = sourceSignature; state.databaseSignature = databaseSignature;
     renderStats();
     if (!state.initialized) { state.initialized = true; renderPage(); }
@@ -195,32 +199,71 @@ async function reload() {
   } finally { state.loading = false; }
 }
 function renderStats() {
+  $('#stats').hidden = state.page === 'browser';
   $('#source-count').textContent = state.sources.length;
   const active = state.sources.filter(source => source.status === 'Active').length;
   const pending = new Set(state.sources.map(source => source.current_operation).filter(Boolean));
   for (const operation of state.operations.values()) if (!terminal.has(operation.status)) pending.add(operation.id);
   const errors = state.sources.filter(source => ['Degraded', 'MetadataStale'].includes(source.status)).length;
   replace($('#stats'), ...[
-    ['数据源总数', state.sources.length, '已登记的远端连接', '▤'],
-    ['运行中', active, '已激活的业务数据源', '↗'],
-    ['业务虚拟库', state.databases.length, 'PostgreSQL 业务访问入口', '▦'],
-    ['进行中操作', pending.size, errors ? `${errors} 个源需要关注` : '跟踪已受理的管理操作', '◷'],
+    ['数据源总数', state.sources.length, '', '▤'],
+    ['运行中', active, '', '↗'],
+    ['业务虚拟库', state.databases.length, '', '▦'],
+    ['进行中操作', pending.size, errors ? `${errors} 个源需要关注` : '', '◷'],
   ].map(([label, value, description, icon]) => el('div', { class: 'stat' },
     el('span', { class: 'stat-label' }, label), el('span', { class: 'stat-icon' }, icon),
-    el('strong', { class: 'stat-value' }, value), el('small', {}, description))));
+    el('strong', { class: 'stat-value' }, value), description ? el('small', {}, description) : null)));
 }
-function navigate(page, selected = null) {
-  state.page = page; state.selected = selected; renderPage();
+const browser = createBrowser({ el, button, replace, table, get, request, toast, sources: () => state.sources,
+  refreshSource: browserRefresh });
+const navigator = createNavigator({ el, button, replace, get, toast, host: $('#database-tree'),
+  open: selection => {
+    const tab = selection.action ? 'sql' : browser.mode();
+    if (state.page !== 'browser' || state.selected !== selection.database.oid) navigate('browser', selection.database.oid, tab);
+    browser.select(selection);
+  } });
+$('#toggle-database-tree').addEventListener('click', () => {
+  const open = document.querySelector('.workspace-body').classList.toggle('directory-open');
+  $('#toggle-database-tree').setAttribute('aria-expanded', String(open));
+});
+$('#database-search').addEventListener('input', event => navigator.search(event.target.value));
+$('#database-system').addEventListener('change', event => { navigator.system(event.target.checked); browser.system(event.target.checked); });
+$('#reload-database-tree').addEventListener('click', guard(async () => { await reload(); navigator.reload(); }));
+function browserRefresh(ids) {
+  const select = el('select', { id: 'browser-refresh-source', required: true, 'aria-label': '刷新来源' },
+    el('option', { value: '' }, '选择数据源'), state.sources.filter(s => ids.includes(s.id) && ['Active', 'MetadataStale'].includes(s.status)).map(s => el('option', { value: s.id }, s.desired.definition.organization?.connection_id ?? s.catalog_alias)));
+  openDialog('刷新来源元数据', el('div', {}, el('div', { class: 'notice' }, '选择一个来源发起异步刷新。操作完成后点击重新加载目录。'), select), () => {
+    const source = state.sources.find(s => s.id === select.value);
+    if (!source) throw new Error('请选择来源。');
+    return write('POST', `${sourcePath(source.id)}/refresh`, { target: sourceTarget(source) }, '刷新元数据');
+  }, '提交刷新');
 }
-function renderPage() {
+function navigate(page, selected = null, workspaceTab) {
+  if (state.page === 'browser') browser.leave();
+  state.page = page; state.selected = selected; renderPage(workspaceTab);
+}
+function renderPage(workspaceTab) {
+  const workspace = state.page === 'browser';
+  const layout = document.querySelector('.workspace-body');
+  layout.classList.toggle('database-workspace', workspace);
+  $('#database-navigation').hidden = !workspace;
+  $('#toggle-database-tree').hidden = !workspace;
+  if (!workspace) {
+    layout.classList.remove('directory-open');
+    $('#toggle-database-tree').setAttribute('aria-expanded', 'false');
+  }
+  if (state.page === 'browser') {
+    const database = state.databases.find(d => d.oid === state.selected);
+    if (!database) { navigate('databases'); return; }
+    $('#stats').hidden = true;
+    $('#page-title').textContent = database.config.name; $('#breadcrumb').textContent = `业务虚拟库 / ${database.config.name}`;
+    document.querySelectorAll('[data-page]').forEach(n => { const active = n.dataset.page === 'databases'; n.classList.toggle('active', active); if (active) n.setAttribute('aria-current', 'page'); else n.removeAttribute('aria-current'); });
+    replace($('#page-actions'), button('← 业务虚拟库', () => navigate('databases')), button('重新加载目录', () => browser.reload()), button('刷新来源元数据', () => browser.refresh(), '', true));
+    navigator.select(database); browser.mount($('#content'), database, workspaceTab); renderPending(); return;
+  }
+  $('#stats').hidden = false;
   const titles = { sources: '数据源', databases: '业务虚拟库', operations: '操作记录' };
-  const descriptions = {
-    sources: '管理远端连接与纳管范围，让业务数据有序接入。',
-    databases: '将多个数据源映射到同一业务库，通过 schema.table 访问。',
-    operations: '跟踪异步执行进度，核对结果与失败原因。',
-  };
   $('#page-title').textContent = titles[state.page]; $('#breadcrumb').textContent = titles[state.page];
-  $('#page-description').textContent = descriptions[state.page];
   document.querySelectorAll('[data-page]').forEach(node => {
     node.classList.toggle('active', node.dataset.page === state.page);
     if (node.dataset.page === state.page) node.setAttribute('aria-current', 'page'); else node.removeAttribute('aria-current');
@@ -233,9 +276,13 @@ function renderPage() {
   else if (state.page === 'databases') renderDatabases(); else renderOperations();
   renderPending(); syncWriteButtons();
 }
+function sourceLabel(source) {
+  const target = source?.desired.definition.organization;
+  return target ? `${target.connection_id} / ${target.database}` : source?.catalog_alias;
+}
 function sourceName(source) {
   return el('div', { class: 'source-name' }, el('span', { class: `db-icon ${source.kind}` }, source.kind === 'postgres' ? 'PG' : 'MY'),
-    el('div', {}, button(source.catalog_alias, () => navigate('sources', source.id), 'link name-text'), el('span', { class: 'subtext' }, source.id)));
+    el('div', {}, button(sourceLabel(source), () => navigate('sources', source.id), 'link name-text'), el('span', { class: 'subtext' }, source.id)));
 }
 function renderSources() {
   const search = el('input', { type: 'search', placeholder: '搜索名称或数据源 ID…', 'aria-label': '搜索数据源', value: state.search,
@@ -248,7 +295,7 @@ function renderSources() {
 }
 function renderSourceRows() {
   const container = $('#source-rows'); if (!container) return;
-  const sources = state.sources.filter(source => `${source.id} ${source.catalog_alias} ${source.kind}`.toLowerCase().includes(state.search.toLowerCase()));
+  const sources = state.sources.filter(source => `${source.id} ${sourceLabel(source)} ${source.desired.definition.organization?.virtual_database ?? ''} ${source.kind}`.toLowerCase().includes(state.search.toLowerCase()));
   replace(container, sources.length ? table(['数据源 / ID', '类型', '状态', '纳管范围', '版本', '操作'], sources.map(source => {
     const bindings = source.desired.bindings.filter(binding => binding.enabled).map(binding => binding.remote_schema);
     return el('tr', {}, el('td', {}, sourceName(source)), el('td', {}, source.kind === 'postgres' ? 'PostgreSQL' : 'MySQL'),
@@ -277,7 +324,7 @@ function renderSourceOverview() {
     node.dataset.unavailable = String(busy || unavailable); return node;
   };
   const details = [
-    ['源 ID', source.id], ['业务数据库名', source.catalog_alias], ['类型', source.kind],
+    ['源 ID', source.id], ['虚拟数据库名', source.desired.definition.organization?.virtual_database ?? source.catalog_alias], ['连接登记', source.desired.definition.organization?.connection_id ?? source.id], ['源数据库', source.desired.definition.organization?.database ?? '连接串指定'], ['类型', source.kind],
     ['凭据引用', definition.secret_ref], ['默认 Schema', definition.default_schema || '未设置'],
     ['生效 / 期望版本', `${source.applied_revision ?? '—'} / ${source.desired_revision}`],
     ['纳管 Schema', source.desired.bindings.map(binding => `${binding.remote_schema}${binding.enabled ? '' : '（停用）'}`).join(', ') || '未选择'],
@@ -299,13 +346,14 @@ function renderSourceOverview() {
       el('div', { class: 'actions' },
         actionButton('探测连接', () => sourceAction(source, 'probe')),
         actionButton('发现 Schema', () => sourceAction(source, 'discover')),
+        definition.organization ? actionButton('发现数据库', () => registration(source)) : null,
         actionButton('纳管范围', () => schemaForm(source)),
         actionButton('凭据引用', () => credentialForm(source)),
         actionButton('激活 / 应用', () => sourceAction(source, 'apply'), 'primary'),
         actionButton('刷新元数据', () => sourceAction(source, 'refresh'), '', !['Active', 'MetadataStale'].includes(source.status)),
         actionButton('停用', () => confirmSource(source, 'disable'), '', source.status === 'Disabled'),
         actionButton('删除登记', () => confirmSource(source, 'delete'), 'danger', source.status !== 'Disabled')),
-      el('p', { class: 'small-note' }, '激活、应用和停用可能等待长查询或悬停 Portal 排空。元数据默认手动刷新；更改范围不会改动远端数据。'))));
+      el('details', { class: 'small-note' }, el('summary', {}, '操作说明'), el('p', {}, '激活、应用和停用可能等待长查询排空。元数据需手动刷新；更改范围不会改动远端数据。')))));
   syncWriteButtons();
 }
 
@@ -385,31 +433,9 @@ function secretRef() {
   }
   return reference;
 }
-function registerForm() {
-  const kind = el('select', { name: 'kind' }, el('option', { value: 'postgres' }, 'PostgreSQL'), el('option', { value: 'mysql' }, 'MySQL / MySQL 协议'));
-  const body = el('div', {}, el('div', { class: 'notice' }, '先在服务的凭据目录保存连接串，或配置环境变量，再填写引用。登记成功后执行探测、发现与激活。'),
-    el('div', { class: 'form-grid' },
-      field('源 ID', 'id', '', { required: true, placeholder: '例如 crm_pg', hint: '登记后不能在线修改 ID。' }),
-      field('业务数据库名', 'catalog_alias', '', { required: true, placeholder: '例如 crm', hint: '作为该源对外的 catalog_alias。' }),
-      el('label', { class: 'field' }, '类型', kind),
-      field('凭据引用', 'secret_ref', '', { required: true, placeholder: 'file:crm.dsn 或环境变量名' }),
-      field('纳管 Schema', 'schemas', 'public', { required: true, hint: '多个名称用逗号分隔；MySQL 只能填写连接串指定的 database。' }),
-      field('默认 Schema', 'default_schema', 'public', { required: true })),
-    check('只读数据源', 'read_only', true), check('启用 DDL 能力（仍受授权与能力校验）', 'ddl_enabled', false));
-  const readOnly = $('[name=read_only]', body), ddl = $('[name=ddl_enabled]', body);
-  readOnly.addEventListener('change', () => { if (readOnly.checked) ddl.checked = false; ddl.disabled = readOnly.checked; });
-  ddl.disabled = true;
-  openDialog('登记数据源', body, () => {
-    const schemas = lines(formValue('schemas')), defaultSchema = formValue('default_schema');
-    if (!schemas.includes(defaultSchema)) throw new Error('默认 Schema 必须包含在纳管范围中。');
-    if (formValue('kind') === 'mysql' && (schemas.length !== 1 || schemas[0] !== defaultSchema)) throw new Error('MySQL 的纳管范围及默认 Schema 必须为同一个 database。');
-    return write('POST', 'sources', {
-      id: formValue('id'), catalog_alias: formValue('catalog_alias'), kind: formValue('kind'),
-      secret_ref: secretRef(), allowed_schemas: schemas, default_schema: defaultSchema,
-      read_only: formChecked('read_only'), ddl_enabled: formChecked('ddl_enabled'),
-    }, '登记数据源');
-  }, '登记');
-}
+const registration = createRegistration({ el, button, field, check, table, openDialog, request, get, write, reload, lines, toast, sources: () => state.sources });
+function registerForm() { registration(); }
+
 function schemaForm(source) {
   const rows = el('div');
   function add(binding = { remote_schema: '', enabled: true }) {
@@ -453,18 +479,18 @@ function confirmSource(source, action) {
 }
 
 function renderDatabases() {
-  replace($('#content'), el('div', { class: 'notice' }, '业务虚拟库是 PostgreSQL 登录入口，外部 Schema 映射只读。库 owner / CONNECT 不自动授予源 SELECT 权限；账号同名库也需显式创建。'),
+  replace($('#content'),
     state.databases.length ? el('div', { class: 'db-grid' }, state.databases.map(database => {
       const config = database.config;
       return el('section', { class: 'panel' },
-        el('div', { class: 'panel-heading' }, el('div', {}, el('h3', {}, config.name),
-          el('p', {}, `owner ${config.owner} · revision ${database.revision}`)),
+        el('div', { class: 'panel-heading' }, el('div', {}, el('h3', {}, button(config.name, () => navigate('browser', database.oid), 'link database-entry')),
+          el('p', {}, `${new Set(config.schemas.map(s => s.source)).size} 个来源`)),
           el('span', { class: `badge ${config.allow_connections ? 'good' : ''}` }, config.allow_connections ? '允许连接' : '禁止新连接')),
         el('div', { class: 'panel-body' },
-          config.schemas.length ? config.schemas.map(mapping => el('div', { class: 'mapping' }, el('strong', {}, mapping.name), el('span', {}, '→'),
-            el('div', {}, state.sources.find(source => source.id === mapping.source)?.catalog_alias ?? mapping.source,
-              el('span', { class: 'subtext' }, mapping.remote_schema)), el('span', { class: 'badge' }, '只读'))) : el('p', { class: 'small-note' }, '尚无外部 Schema 映射'),
-          el('div', { class: 'actions form-section' }, button('编辑定义与映射', () => databaseForm(database), '', true), button('删除', () => deleteDatabase(database), 'danger', true))));
+          config.schemas.length ? [...new Set(config.schemas.map(mapping => mapping.name))].map(name => el('div', { class: 'mapping' }, el('strong', {}, name), el('span', {}, '→'),
+            el('div', {}, config.schemas.filter(mapping => mapping.name === name).map(mapping => el('div', {}, sourceLabel(state.sources.find(source => source.id === mapping.source)) ?? mapping.source,
+              el('span', { class: 'subtext' }, mapping.remote_schema)))), el('span', { class: 'badge' }, '只读'))) : el('p', { class: 'small-note' }, '尚无外部 Schema 映射'),
+          database.managed ? null : el('div', { class: 'actions form-section' }, button('编辑定义与映射', () => databaseForm(database), '', true), button('删除', () => deleteDatabase(database), 'danger', true))));
     })) : empty('尚未创建业务虚拟库', '创建业务库后，可将多个来源映射到不同 Schema。'));
 }
 function databaseForm(database = null) {

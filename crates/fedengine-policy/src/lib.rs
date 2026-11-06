@@ -6,7 +6,7 @@ use modorch::{prelude::*, *};
 use std::sync::Arc;
 pub const POLICY_TOPIC: &str = "policy/authorize/v1";
 
-/// Metadata is visible only through existing SELECT grants and the effective registry.
+/// Describe the current database independently of its object's data privileges.
 pub fn metadata_scope(
     config: &Config,
     principal: &str,
@@ -34,6 +34,15 @@ pub fn session_metadata_scope(
     effective: &[DataSourceDefinition],
 ) -> Result<fedengine_contract::MetadataScope> {
     let database = session.database.as_str();
+    if effective
+        .iter()
+        .any(|d| d.organization.is_some() && d.catalog_alias == database)
+    {
+        return Err(EngineError::new(
+            "3D000",
+            "internal execution catalog is not a connectable database",
+        ));
+    }
     use fedengine_contract::{MetadataScope, VisibleCatalog};
     if !config.users.iter().any(|u| u.name == principal) {
         return Err(EngineError::denied("unknown principal"));
@@ -96,16 +105,17 @@ pub fn session_metadata_scope(
             .iter()
             .filter(|g| {
                 g.principal == principal
-                    && g.source == source.id
-                    && g.actions.contains("SELECT")
+                    && (g.source == source.id
+                        || definition
+                            .organization
+                            .as_ref()
+                            .is_some_and(|o| g.source == o.connection_id))
                     && (g.schema == "*" || definition.allowed_schemas.contains(&g.schema))
             })
             .cloned()
             .collect();
-        if grants.is_empty() {
-            continue;
-        }
         catalogs.push(VisibleCatalog {
+            internal: definition.organization.is_some(),
             id: source.id.clone(),
             catalog: source.catalog_alias.clone(),
             snapshot_id: snapshot.id.clone(),
@@ -139,10 +149,8 @@ pub fn session_metadata_scope(
                     g
                 })
                 .collect::<Vec<_>>();
-            if grants.is_empty() {
-                continue;
-            }
             catalogs.push(VisibleCatalog {
+                internal: false,
                 id: source.id.clone(),
                 catalog: db.config.name.clone(),
                 snapshot_id: snapshot_id.clone(),
@@ -154,7 +162,11 @@ pub fn session_metadata_scope(
                 mapping: Some(binding.config.clone()),
             });
         }
-    } else if !catalogs.iter().any(|c| c.catalog == database) {
+    } else if !catalogs.iter().any(|c| {
+        c.catalog == database
+            && (session.database_oid.is_some()
+                || c.grants.iter().any(|g| g.actions.contains("SELECT")))
+    }) {
         if let Some(h) = headers
             .sources
             .iter()
@@ -176,16 +188,17 @@ pub fn session_metadata_scope(
             format!("database {} does not exist", quote_identifier(database)),
         ));
     }
+    catalogs.sort_by(|a, b| {
+        a.id.cmp(&b.id)
+            .then_with(|| a.snapshot_id.cmp(&b.snapshot_id))
+    });
     Ok(MetadataScope {
         database: database.into(),
         principal: principal.into(),
         catalogs,
         virtual_database,
-        databases: headers
-            .databases
-            .into_iter()
-            .filter(|d| can_connect(d) || session.database_oid == Some(d.oid))
-            .collect(),
+        // pg_database describes the cluster; CONNECT is checked separately.
+        databases: headers.databases,
     })
 }
 #[derive(Clone)]
@@ -216,7 +229,11 @@ pub fn authorize(config: &Config, request: &Authorize) -> Result<()> {
         };
         let allowed = config.grants.iter().any(|g| {
             g.principal == request.principal
-                && g.source == object.source
+                && (g.source == object.source
+                    || source
+                        .organization
+                        .as_ref()
+                        .is_some_and(|o| g.source == o.connection_id))
                 && (g.schema == "*" || g.schema == object.schema)
                 && (g.object == "*" || g.object == object.name)
                 && g.actions.contains(action)

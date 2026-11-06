@@ -6,6 +6,7 @@
   <meta name="color-scheme" content="light">
   <title>FedEngine · 数据源管理</title>
   <link rel="stylesheet" href="/manage/style.css">
+  <link rel="stylesheet" href="/manage/browser.css">
   <script type="module" src="/manage/app.js"></script>
 </head>
 <body>
@@ -17,16 +18,24 @@
       <button type="button" data-page="databases" class="nav"><span>▦</span>业务虚拟库</button>
       <button type="button" data-page="operations" class="nav"><span>◷</span>操作记录</button>
     </nav>
-    <div class="sidebar-bottom"><span class="live-dot"></span>内置管理端<small>与管理 API 共用可信访问边界</small></div>
+    <div class="sidebar-bottom">管理控制台</div>
   </aside>
   <div class="workspace">
-    <header class="topbar"><span>工作空间 <span class="separator">/</span> <strong id="breadcrumb">数据源</strong></span><span id="connection" role="status">正在连接…</span></header>
+    <header class="topbar"><button type="button" id="toggle-database-tree" aria-controls="database-navigation" aria-expanded="false" hidden>☰ 数据库树</button><span>工作空间 <span class="separator">/</span> <strong id="breadcrumb">数据源</strong></span><span id="connection" role="status">正在连接…</span></header>
+    <div class="workspace-body">
+    <aside id="database-navigation" class="database-navigation" aria-label="数据库目录" hidden>
+      <div class="database-tree-heading"><strong>数据库</strong><button type="button" id="reload-database-tree" class="small" aria-label="刷新数据库树" title="刷新目录">↻</button></div>
+      <input id="database-search" type="search" placeholder="筛选数据库" aria-label="筛选数据库">
+      <label class="system-toggle"><input type="checkbox" id="database-system">显示系统 Schema</label>
+      <div id="database-tree" aria-label="数据库树"></div>
+    </aside>
     <main id="main" tabindex="-1">
-      <div class="page-heading"><div><div class="eyebrow">DATA WORKSPACE</div><h1 id="page-title">数据源</h1><p id="page-description">统一管理远端连接、元数据与业务访问入口。</p></div><div id="page-actions" class="actions"></div></div>
+      <div class="page-heading"><h1 id="page-title">数据源</h1><div id="page-actions" class="actions"></div></div>
       <div id="pending" class="notice warning" hidden></div>
       <section id="stats" class="stats" aria-label="管理概览"></section>
       <div id="content" aria-live="polite"><div class="empty">正在读取管理状态…</div></div>
     </main>
+    </div>
     <footer>FedEngine <span>PostgreSQL 协议 · 在线数据源管理</span></footer>
   </div>
   <div id="toast" role="status" hidden></div>

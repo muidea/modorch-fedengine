@@ -214,13 +214,16 @@ impl ExecutionPort for DuckdbRuntime {
 }
 
 impl DuckdbRuntime {
-    async fn isolated(
+    async fn isolated_io<T, F>(
         &self,
-        revision: SourceRevision,
         cancel: CancellationToken,
         ownership: Box<dyn Send>,
-        inspect: bool,
-    ) -> Result<ControlOutcome> {
+        operation: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Connection, &Config, &CancellationToken) -> Result<T> + Send + 'static,
+    {
         let mut config = (*self.config).clone();
         config.duckdb.database_path = ":memory:".into();
         config.duckdb.threads = 1;
@@ -262,41 +265,7 @@ impl DuckdbRuntime {
                     let conn =
                         crate::instance::initialize_local(&config).map_err(framework_error)?;
                     *handle.lock().unwrap() = Some(conn.interrupt_handle());
-                    crate::control::attach(&conn, &config, &revision.effective_definition())?;
-                    if inspect {
-                        let schemas =
-                            crate::catalog::discover(&conn, &revision.effective_definition())?;
-                        return Ok(ControlOutcome {
-                            schemas,
-                            catalog: None,
-                            restored_previous: false,
-                            error: None,
-                        });
-                    }
-                    let mut revision = revision;
-                    if !config.management.enabled {
-                        // Static allowlists may include not-yet-created schemas.
-                        // A confirmed DROP SCHEMA must still refresh the remaining catalog.
-                        let available =
-                            crate::catalog::discover(&conn, &revision.effective_definition())?;
-                        revision
-                            .bindings
-                            .retain(|b| available.contains(&b.remote_schema));
-                    }
-                    let snapshot = crate::catalog::capture_bounded(
-                        &conn,
-                        &revision,
-                        (config.management.metadata_operation_memory_mb as usize) * 1024 * 1024 / 8,
-                    )?;
-                    if cancel.is_cancelled() {
-                        return Err(EngineError::new("57014", "metadata capture canceled"));
-                    }
-                    Ok(ControlOutcome {
-                        schemas: vec![],
-                        catalog: Some(snapshot),
-                        restored_previous: false,
-                        error: None,
-                    })
+                    operation(&conn, &config, &cancel)
                 })())
             })
             .map_err(framework_error)?
@@ -304,9 +273,64 @@ impl DuckdbRuntime {
             .await
             .map_err(framework_error)?
     }
+    async fn isolated(
+        &self,
+        revision: SourceRevision,
+        cancel: CancellationToken,
+        ownership: Box<dyn Send>,
+        inspect: bool,
+    ) -> Result<ControlOutcome> {
+        self.isolated_io(cancel, ownership, move |conn, config, cancel| {
+            crate::control::attach(conn, config, &revision.effective_definition())?;
+            if inspect {
+                let schemas = crate::catalog::discover(conn, &revision.effective_definition())?;
+                return Ok(ControlOutcome {
+                    schemas,
+                    catalog: None,
+                    restored_previous: false,
+                    error: None,
+                });
+            }
+            let mut revision = revision;
+            if !config.management.enabled {
+                // Static allowlists may include not-yet-created schemas.
+                // A confirmed DROP SCHEMA must still refresh the remaining catalog.
+                let available = crate::catalog::discover(conn, &revision.effective_definition())?;
+                revision
+                    .bindings
+                    .retain(|b| available.contains(&b.remote_schema));
+            }
+            let snapshot = crate::catalog::capture_bounded(
+                conn,
+                &revision,
+                (config.management.metadata_operation_memory_mb as usize) * 1024 * 1024 / 8,
+            )?;
+            if cancel.is_cancelled() {
+                return Err(EngineError::new("57014", "metadata capture canceled"));
+            }
+            Ok(ControlOutcome {
+                schemas: vec![],
+                catalog: Some(snapshot),
+                restored_previous: false,
+                error: None,
+            })
+        })
+        .await
+    }
 }
 #[async_trait]
 impl RuntimeControlPort for DuckdbRuntime {
+    async fn discover_databases(
+        &self,
+        connection: SourceConnection,
+        cancel: CancellationToken,
+        ownership: Box<dyn Send>,
+    ) -> Result<Vec<DatabaseCandidate>> {
+        self.isolated_io(cancel, ownership, move |conn, config, cancel| {
+            crate::discovery::discover(conn, config, &connection, cancel)
+        })
+        .await
+    }
     async fn capture(
         &self,
         revision: SourceRevision,

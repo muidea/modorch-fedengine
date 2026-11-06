@@ -68,16 +68,7 @@ pub fn encode_row(row: &[Cell], columns: &[ColumnMeta], format: &Format) -> Resu
         let value = if format.format_for(i) == FieldFormat::Binary {
             binary(cell, col.data_type)?
         } else {
-            match catalog_codec::text(cell, col.data_type)? {
-                Some(v) => v.into_bytes(),
-                None => {
-                    let mut value = text(cell)?;
-                    if col.data_type == PgType::Timestamptz {
-                        value.push_str("+00");
-                    }
-                    value.into_bytes()
-                }
-            }
+            text_value(cell, col.data_type)?.unwrap().into_bytes()
         };
         if value.len() > i32::MAX as usize {
             return Err(EngineError::new(
@@ -89,6 +80,20 @@ pub fn encode_row(row: &[Cell], columns: &[ColumnMeta], format: &Format) -> Resu
         data.extend_from_slice(&value);
     }
     Ok(DataRow::new(data, row.len() as i16))
+}
+/// PostgreSQL text representation shared by wire and HTTP consumers. NULL remains distinct.
+pub fn text_value(cell: &Cell, data_type: PgType) -> Result<Option<String>> {
+    if matches!(cell, Cell::Null) {
+        return Ok(None);
+    }
+    if let Some(value) = catalog_codec::text(cell, data_type)? {
+        return Ok(Some(value));
+    }
+    let mut value = text(cell)?;
+    if data_type == PgType::Timestamptz {
+        value.push_str("+00");
+    }
+    Ok(Some(value))
 }
 fn invalid() -> EngineError {
     EngineError::new("22P02", "invalid parameter representation")
@@ -463,3 +468,6 @@ mod tests {
         }
     }
 }
+
+mod privileges;
+pub use privileges::parse_privileges;

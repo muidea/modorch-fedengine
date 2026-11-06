@@ -536,7 +536,9 @@ pub(super) fn capture(
             version
                 .parse()
                 .map_err(|_| EngineError::new("55000", "invalid PostgreSQL capability version"))?,
-            &format!("n.nspname IN ({scope})"),
+            &format!(
+                "n.nspname IN ({scope}) AND has_schema_privilege(n.oid,'USAGE') AND has_table_privilege(c.oid,'SELECT')"
+            ),
         )
     } else {
         let capability = "SELECT upper(table_name),upper(column_name) FROM information_schema.columns WHERE table_schema='information_schema' AND upper(table_name) IN ('CHECK_CONSTRAINTS','STATISTICS')";

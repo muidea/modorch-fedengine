@@ -21,5 +21,7 @@ export FEDENGINE_POSTGRES_DSN="host=127.0.0.1 port=${FEDENGINE_TEST_POSTGRES_POR
 export FEDENGINE_MYSQL_DSN="host=127.0.0.1 port=${FEDENGINE_TEST_MYSQL_PORT:-23306} database=erp user=root password=fedengine-test-only"
 cargo test --locked --test pg_alignment -- --ignored --nocapture --test-threads=1
 cargo test --locked --test engine_control -- --ignored --nocapture --test-threads=1
+cargo test --locked --test browser -- --ignored --nocapture --test-threads=1
+cargo test --locked --test organization -- --ignored --nocapture --test-threads=1
 cargo test --locked --test federation -- --ignored --nocapture --test-threads=1
 cargo test --locked --test management -- --ignored --nocapture --test-threads=1 --skip metadata_scale_refresh

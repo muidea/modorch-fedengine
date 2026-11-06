@@ -27,6 +27,8 @@ pub(super) fn initialize(conn: &Connection, config: &Config) -> Result<()> {
     conn.execute_batch("CREATE TABLE IF NOT EXISTS _fedengine.virtual_databases(name VARCHAR PRIMARY KEY,payload VARCHAR NOT NULL);
         CREATE TABLE IF NOT EXISTS _fedengine.virtual_database_overrides(name VARCHAR PRIMARY KEY,config VARCHAR);
         CREATE TABLE IF NOT EXISTS _fedengine.virtual_database_receipts(key VARCHAR PRIMARY KEY,request VARCHAR NOT NULL,payload VARCHAR NOT NULL)").map_err(engine_error)?;
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS _fedengine.native_database_identity(key VARCHAR PRIMARY KEY,epoch VARCHAR NOT NULL,tokens VARCHAR NOT NULL,strict BOOLEAN NOT NULL); CREATE TABLE IF NOT EXISTS _fedengine.organization_identity_policy(id INTEGER PRIMARY KEY,strict BOOLEAN NOT NULL)").map_err(engine_error)?;
+    conn.execute("INSERT INTO _fedengine.organization_identity_policy VALUES (1,?) ON CONFLICT(id) DO UPDATE SET strict=excluded.strict",[config.management.mysql_identity_policy == MysqlIdentityPolicy::Strict]).map_err(engine_error)?;
     let mut definitions = config
         .virtual_databases
         .iter()
@@ -57,7 +59,16 @@ pub(super) fn initialize(conn: &Connection, config: &Config) -> Result<()> {
     }
     let users = config.users.iter().map(|u| u.name.clone()).collect();
     validate_definitions(&definitions.values().cloned().collect::<Vec<_>>(), &users)?;
-    reconcile(conn, &definitions.into_values().collect::<Vec<_>>())
+    // Automatic definitions are reconciled from applied source heads during publication.
+    let managed = read(conn)?
+        .into_iter()
+        .filter(|d| d.managed)
+        .collect::<Vec<_>>();
+    let names = managed.iter().map(|d| d.config.name.clone()).collect();
+    for db in managed {
+        definitions.insert(db.config.name.clone(), db.config);
+    }
+    reconcile(conn, &definitions.into_values().collect::<Vec<_>>(), &names)
 }
 fn validate_definitions(
     definitions: &[VirtualDatabaseConfig],
@@ -75,7 +86,11 @@ fn validate_definitions(
     }
     Ok(())
 }
-fn reconcile(conn: &Connection, definitions: &[VirtualDatabaseConfig]) -> Result<()> {
+fn reconcile(
+    conn: &Connection,
+    definitions: &[VirtualDatabaseConfig],
+    managed: &BTreeSet<String>,
+) -> Result<()> {
     let previous = read(conn)?;
     for old in &previous {
         let new = definitions.iter().find(|d| d.name == old.config.name);
@@ -84,7 +99,13 @@ fn reconcile(conn: &Connection, definitions: &[VirtualDatabaseConfig]) -> Result
             retire.extend([old.oid, old.public_oid]);
         }
         for schema in &old.schemas {
-            if new.is_none_or(|d| !d.schemas.contains(&schema.config)) {
+            if new.is_none_or(|d| {
+                if old.managed {
+                    !d.schemas.iter().any(|b| b.name == schema.config.name)
+                } else {
+                    !d.schemas.contains(&schema.config)
+                }
+            }) {
                 retire.push(schema.oid);
             }
         }
@@ -114,14 +135,22 @@ fn reconcile(conn: &Connection, definitions: &[VirtualDatabaseConfig]) -> Result
             let oid = identity::oid(
                 conn,
                 &epoch,
-                &[
-                    "schema",
-                    &binding.name,
-                    &binding.source.0,
-                    &binding.remote_schema,
-                ],
+                &if managed.contains(&definition.name) {
+                    vec!["schema", &binding.name]
+                } else {
+                    vec![
+                        "schema",
+                        &binding.name,
+                        &binding.source.0,
+                        &binding.remote_schema,
+                    ]
+                },
             )?;
             schemas.push(VirtualSchema {
+                object_epoch: old
+                    .and_then(|db| db.schemas.iter().find(|s| s.config == *binding))
+                    .map(|s| s.object_epoch.clone())
+                    .unwrap_or_else(|| format!("virtual-schema:{oid}")),
                 config: binding.clone(),
                 oid,
                 snapshot_id: None,
@@ -131,9 +160,15 @@ fn reconcile(conn: &Connection, definitions: &[VirtualDatabaseConfig]) -> Result
             conn,
             &VirtualDatabase {
                 config: definition.clone(),
+                managed: managed.contains(&definition.name),
                 revision,
                 oid: identity::oid(conn, &epoch, &["database"])?,
-                public_oid: identity::oid(conn, &epoch, &["public"])?,
+                public_oid: if let Some(public) = schemas.iter().find(|s| s.config.name == "public")
+                {
+                    public.oid
+                } else {
+                    identity::oid(conn, &epoch, &["public"])?
+                },
                 schemas,
             },
         )?;
@@ -206,6 +241,11 @@ pub(super) fn mutate(
             VirtualDatabaseMutation::Delete { name, target } => (name.clone(), Some(target), None),
         };
         let old = current.iter().find(|d| d.config.name == name);
+        if old.is_some_and(|d| d.managed) {
+            return Err(EngineError::config(
+                "automatic database scope is managed through its source registrations",
+            ));
+        }
         if let Some(target) = target {
             let old =
                 old.ok_or_else(|| EngineError::new("3D000", "virtual database does not exist"))?;
@@ -229,8 +269,29 @@ pub(super) fn mutate(
         if let Some(definition) = &definition {
             definitions.push(definition.clone());
         }
-        validate_definitions(&definitions, &users)?;
+        validate_definitions(
+            &definitions
+                .iter()
+                .filter(|d| !current.iter().any(|c| c.managed && c.config.name == d.name))
+                .cloned()
+                .collect::<Vec<_>>(),
+            &users,
+        )?;
         let state = crate::storage::read_heads(conn)?;
+        if definition.as_ref().is_some_and(|d| {
+            state.sources.values().filter(|s| !s.deleted).any(|s| {
+                state
+                    .revision(&s.incarnation, s.desired_revision)
+                    .ok()
+                    .and_then(|r| r.definition.organization.as_ref())
+                    .is_some_and(|target| target.virtual_database.eq_ignore_ascii_case(&d.name))
+            })
+        }) {
+            return Err(EngineError::new(
+                "40001",
+                "virtual database name is reserved by an automatic source target",
+            ));
+        }
         if let Some(definition) = &definition {
             for binding in &definition.schemas {
                 let source = state.source(&binding.source)?;
@@ -272,7 +333,12 @@ pub(super) fn mutate(
             .transpose()
             .map_err(|_| EngineError::config("invalid virtual database definition"))?;
         conn.execute("INSERT INTO _fedengine.virtual_database_overrides VALUES (?,?) ON CONFLICT(name) DO UPDATE SET config=excluded.config",params![name,value]).map_err(engine_error)?;
-        reconcile(conn, &definitions)?;
+        let managed = current
+            .iter()
+            .filter(|d| d.managed)
+            .map(|d| d.config.name.clone())
+            .collect();
+        reconcile(conn, &definitions, &managed)?;
         publish(conn, &state)?;
         let next = read(conn)?.into_iter().find(|d| d.config.name == name);
         let (oid, revision) = match next {
@@ -337,7 +403,174 @@ fn empty_snapshot(
         objects: vec![],
     }
 }
+/// A Strict MySQL lifetime reset invalidates every projection of the same native target.
+/// Removing a contributor alone does not reset the shared lifetime.
+fn native_epochs(conn: &Connection, state: &ManagementState) -> Result<BTreeMap<String, String>> {
+    let strict: bool = conn
+        .query_row(
+            "SELECT strict FROM _fedengine.organization_identity_policy WHERE id=1",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(engine_error)?;
+    let mut groups: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+    for source in state.sources.values().filter(|s| {
+        !s.deleted
+            && s.kind == DataSourceKind::Mysql
+            && s.applied_revision.is_some()
+            && s.catalog_snapshot.is_some()
+    }) {
+        let revision = state.revision(&source.incarnation, source.applied_revision.unwrap())?;
+        let Some(target) = &revision.definition.organization else {
+            continue;
+        };
+        let epoch: String = conn
+            .query_row(
+                "SELECT epoch FROM _fedengine.metadata_identity_epochs WHERE revision_key=?",
+                [revision.key()],
+                |r| r.get(0),
+            )
+            .map_err(engine_error)?;
+        groups
+            .entry(target.native_key(source.kind))
+            .or_default()
+            .insert(source.id.0.clone(), epoch);
+    }
+    let mut result = BTreeMap::new();
+    for (key, tokens) in groups {
+        let old: Option<(String, String, bool)> = conn
+            .query_row(
+                "SELECT epoch,tokens,strict FROM _fedengine.native_database_identity WHERE key=?",
+                [&key],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()
+            .map_err(engine_error)?;
+        let (mut epoch, mut known, previous_strict) = match old {
+            Some((epoch, tokens, previous_strict)) => (
+                epoch,
+                serde_json::from_str::<BTreeMap<String, String>>(&tokens)
+                    .map_err(|_| EngineError::new("XX000", "invalid native identity tokens"))?,
+                previous_strict,
+            ),
+            None => (uuid::Uuid::new_v4().to_string(), BTreeMap::new(), strict),
+        };
+        if strict
+            && (!previous_strict
+                || tokens
+                    .iter()
+                    .any(|(id, token)| known.get(id).is_some_and(|old| old != token)))
+        {
+            epoch = uuid::Uuid::new_v4().to_string();
+        }
+        known.extend(tokens);
+        conn.execute("INSERT INTO _fedengine.native_database_identity VALUES (?,?,?,?) ON CONFLICT(key) DO UPDATE SET epoch=excluded.epoch,tokens=excluded.tokens,strict=excluded.strict",params![key,epoch,serde_json::to_string(&known).unwrap(),strict]).map_err(engine_error)?;
+        result.insert(key, epoch);
+    }
+    Ok(result)
+}
+/// Rebuild only lightweight schema bindings; relation facts stay indexed in source snapshots.
+fn organize(conn: &Connection, state: &ManagementState) -> Result<()> {
+    let current = read(conn)?;
+    let mut definitions = current
+        .iter()
+        .filter(|d| !d.managed)
+        .map(|d| (d.config.name.clone(), d.config.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let mut automatic = BTreeSet::new();
+    let mut sources = state
+        .sources
+        .values()
+        .filter(|s| !s.deleted && s.catalog_snapshot.is_some())
+        .collect::<Vec<_>>();
+    sources.sort_by(|a, b| a.id.cmp(&b.id));
+    for source in sources {
+        let Some(revision) = source.applied_revision else {
+            continue;
+        };
+        let definition = state
+            .revision(&source.incarnation, revision)?
+            .effective_definition();
+        let Some(target) = &definition.organization else {
+            continue;
+        };
+        validate_organization(state, &definition)?;
+        if definitions.keys().any(|name| {
+            name.eq_ignore_ascii_case(&target.virtual_database) && !automatic.contains(name)
+        }) {
+            return Err(EngineError::new(
+                "40001",
+                "automatic database name conflicts with an explicit database",
+            ));
+        }
+        automatic.insert(target.virtual_database.clone());
+        let database = definitions
+            .entry(target.virtual_database.clone())
+            .or_insert_with(|| VirtualDatabaseConfig {
+                name: target.virtual_database.clone(),
+                owner: target.owner.clone(),
+                connect: target.connect.clone(),
+                allow_connections: true,
+                schemas: vec![],
+            });
+        let snapshot = &state.catalogs[source.catalog_snapshot.as_ref().unwrap()];
+        for schema in &snapshot.schemas {
+            if !definition.allowed_schemas.contains(schema) {
+                continue;
+            }
+            database.schemas.push(VirtualSchemaConfig {
+                name: schema.clone(),
+                source: source.id.clone(),
+                remote_schema: schema.clone(),
+            });
+        }
+        if database.schemas.len() > 1024 {
+            return Err(EngineError::new(
+                "54000",
+                "automatic database contribution limit exceeded",
+            ));
+        }
+    }
+    if definitions.len() > 256 {
+        return Err(EngineError::new("54000", "virtual database limit exceeded"));
+    }
+    reconcile(
+        conn,
+        &definitions.into_values().collect::<Vec<_>>(),
+        &automatic,
+    )?;
+    let epochs = native_epochs(conn, state)?;
+    for mut db in read(conn)?.into_iter().filter(|d| d.managed) {
+        for schema in &mut db.schemas {
+            let source = state.source(&schema.config.source)?;
+            let definition = &state
+                .revision(&source.incarnation, source.applied_revision.unwrap())?
+                .definition;
+            if let Some(target) = &definition.organization
+                && let Some(epoch) = epochs.get(&target.native_key(definition.kind))
+            {
+                schema.object_epoch = format!("virtual-schema:{}:{epoch}", schema.oid);
+            }
+        }
+        if let Some(old) = current.iter().find(|d| d.oid == db.oid)
+            && old.config == db.config
+            && old.schemas.iter().any(|schema| {
+                db.schemas
+                    .iter()
+                    .any(|s| s.config == schema.config && s.object_epoch != schema.object_epoch)
+            })
+        {
+            db.revision = db
+                .revision
+                .checked_add(1)
+                .ok_or_else(|| EngineError::new("54000", "virtual database revision exhausted"))?;
+        }
+        save(conn, &db)?;
+    }
+    Ok(())
+}
 pub(super) fn publish(conn: &Connection, state: &ManagementState) -> Result<()> {
+    organize(conn, state)?;
     let mut keep = BTreeSet::new();
     for mut db in read(conn)? {
         if state
@@ -350,7 +583,23 @@ pub(super) fn publish(conn: &Connection, state: &ManagementState) -> Result<()> 
             ));
         }
         let base = format!("virtual:{}:public", db.oid);
-        let snapshot = empty_snapshot(base.clone(), &db, [("public".into(), db.public_oid)].into());
+        let schemas = if db.schemas.iter().any(|s| {
+            s.config.name == "public"
+                && state.sources.values().any(|source| {
+                    !source.deleted
+                        && source.id == s.config.source
+                        && source.status != SourceStatus::Disabled
+                        && source.catalog_snapshot.is_some()
+                })
+        }) {
+            BTreeMap::new()
+        } else {
+            [("public".into(), db.public_oid)].into()
+        };
+        let snapshot = empty_snapshot(base.clone(), &db, schemas);
+        // This small base projection changes when the last mapped public contributor
+        // is disabled or resumed. Replace it in the same publication transaction.
+        projection::remove(conn, &base)?;
         projection::publish(conn, &snapshot, &db.config.name)?;
         // Owner identities are resolved for the caller by the catalog planner.
         conn.execute(
@@ -361,10 +610,9 @@ pub(super) fn publish(conn: &Connection, state: &ManagementState) -> Result<()> 
         keep.insert(base);
         for index in 0..db.schemas.len() {
             let binding = &db.schemas[index];
-            let source = state
-                .sources
-                .values()
-                .find(|s| s.id == binding.config.source && !s.deleted);
+            let source = state.sources.values().find(|s| {
+                s.id == binding.config.source && !s.deleted && s.status != SourceStatus::Disabled
+            });
             let source_snapshot = source
                 .and_then(|s| s.catalog_snapshot.as_ref())
                 .and_then(|id| state.catalogs.get(id));
@@ -372,7 +620,10 @@ pub(super) fn publish(conn: &Connection, state: &ManagementState) -> Result<()> 
                 db.schemas[index].snapshot_id = None;
                 continue;
             };
-            let id = format!("virtual:{}:{}", binding.oid, source_snapshot.id);
+            let id = format!(
+                "virtual:{}:{}:{}",
+                binding.oid, binding.object_epoch, source_snapshot.id
+            );
             let exists:bool=conn.query_row("SELECT count(*)>0 FROM _fedengine.metadata_projection_state WHERE snapshot_id=?",[&id],|r|r.get(0)).map_err(engine_error)?;
             if !exists {
                 let snapshot = empty_snapshot(
@@ -380,13 +631,14 @@ pub(super) fn publish(conn: &Connection, state: &ManagementState) -> Result<()> 
                     &db,
                     [(binding.config.name.clone(), binding.oid)].into(),
                 );
-                let epoch = format!("virtual-schema:{}", binding.oid);
+                let epoch = binding.object_epoch.clone();
                 let mut oids = identity::OidBatch::load(conn, std::slice::from_ref(&epoch))?;
                 projection::ForeignProjection {
                     snapshot: &snapshot,
                     source: source_snapshot,
                     alias: &db.config.name,
                     binding,
+                    native_identity: db.managed,
                 }
                 .publish(conn, &mut oids)?;
                 oids.flush()?;

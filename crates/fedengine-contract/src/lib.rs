@@ -299,6 +299,7 @@ pub struct MetadataExecution {
 }
 #[derive(Debug, Clone)]
 pub struct VisibleCatalog {
+    pub internal: bool,
     pub id: DataSourceId,
     pub catalog: String,
     pub snapshot_id: String,
@@ -472,6 +473,15 @@ pub trait ManagementStore: Send + Sync {
             "catalog directory reader is unavailable",
         ))
     }
+    /// Indexed names and source kinds only; never decompresses column payloads.
+    async fn directory_summaries(
+        &self,
+        _request: DirectorySummaryRequest,
+    ) -> Result<Vec<DirectorySummary>> {
+        Err(EngineError::unsupported(
+            "catalog summary reader is unavailable",
+        ))
+    }
 }
 #[derive(Debug, Clone, Default)]
 pub struct CatalogHeads {
@@ -507,6 +517,31 @@ pub struct DirectoryRequest {
     pub snapshot_id: Option<String>,
     pub offset: usize,
     pub limit: usize,
+    /// Optional decompressed per-object budget for interactive consumers.
+    pub object_bytes_limit: Option<usize>,
+}
+#[derive(Debug, Clone)]
+pub struct DirectorySummaryRequest {
+    /// Ordered, authorized source scopes. The first contributor wins per relation.
+    pub scopes: Vec<DirectorySummaryScope>,
+    pub search: String,
+    pub kind: String,
+    pub offset: usize,
+    pub limit: usize,
+}
+#[derive(Debug, Clone)]
+pub struct DirectorySummaryScope {
+    pub snapshot_id: String,
+    pub schema: String,
+    pub names: Option<Vec<String>>,
+}
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DirectorySummary {
+    pub name: String,
+    pub object_type: String,
+    pub snapshot_id: String,
+    pub contributors: Vec<String>,
+    pub conflict: bool,
 }
 #[derive(Clone)]
 pub struct RuntimeControl {
@@ -530,6 +565,17 @@ pub struct ControlOutcome {
 }
 #[async_trait::async_trait]
 pub trait RuntimeControlPort: Send + Sync {
+    async fn discover_databases(
+        &self,
+        _connection: fedengine_core::SourceConnection,
+        _cancel: CancellationToken,
+        _ownership: Box<dyn Send>,
+    ) -> Result<Vec<fedengine_core::DatabaseCandidate>> {
+        Err(EngineError::unsupported(
+            "instance discovery is not available",
+        ))
+    }
+
     /// Isolated remote collection; never changes live attachments or extension caches.
     async fn capture(
         &self,
@@ -584,8 +630,27 @@ pub struct VirtualDatabaseReceipt {
     pub revision: u64,
     pub deleted: bool,
 }
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DiscoveryJob {
+    pub id: String,
+    pub status: String,
+    pub connection: fedengine_core::SourceConnection,
+    pub candidates: Vec<fedengine_core::DatabaseCandidate>,
+    pub error: Option<String>,
+}
+#[derive(Clone)]
+pub enum DiscoveryRequest {
+    Start {
+        id: String,
+        issued_at: i64,
+        connection: fedengine_core::SourceConnection,
+    },
+    Get(String),
+    Cancel(String),
+}
 #[derive(Clone)]
 pub enum ManagementRequest {
+    Discovery(DiscoveryRequest),
     VirtualDatabases,
     VirtualDatabase(String),
     MutateVirtualDatabase {
@@ -635,6 +700,7 @@ pub struct CatalogPage {
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(untagged)]
 pub enum ManagementReply {
+    Discovery(DiscoveryJob),
     VirtualDatabases(Vec<fedengine_core::VirtualDatabase>),
     VirtualDatabase(fedengine_core::VirtualDatabase),
     VirtualDatabaseReceipt(VirtualDatabaseReceipt),

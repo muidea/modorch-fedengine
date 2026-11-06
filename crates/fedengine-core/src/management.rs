@@ -341,6 +341,24 @@ pub fn allowed_namespace(value: &str) -> bool {
         && !value.to_ascii_lowercase().starts_with("pg_temp")
 }
 pub fn validate_source(source: &DataSourceDefinition) -> Result<()> {
+    if let Some(target) = &source.organization {
+        target.validate(source.kind)?;
+        if target
+            .virtual_database
+            .eq_ignore_ascii_case(&source.catalog_alias)
+        {
+            return Err(EngineError::config(
+                "internal execution alias must differ from the virtual database name",
+            ));
+        }
+        if source.kind == DataSourceKind::Mysql
+            && source.allowed_schemas.iter().any(|s| s != &target.database)
+        {
+            return Err(EngineError::config(
+                "MySQL schemas must match the native target database",
+            ));
+        }
+    }
     let mut schemas = BTreeSet::new();
     if source.id.0.is_empty()
         || source.id.0.len() > 128

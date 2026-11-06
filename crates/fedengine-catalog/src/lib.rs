@@ -17,11 +17,13 @@ pub enum CatalogRequest {
     Headers,
     Names(String),
     Directory(DirectoryRequest),
+    Summaries(DirectorySummaryRequest),
 }
 pub enum CatalogReply {
     Snapshot(BTreeMap<DataSourceId, SourceVersion>),
     Indexes(Vec<IndexOwner>),
     Directory(CatalogPage),
+    Summaries(Vec<DirectorySummary>),
     Headers(CatalogHeads),
     Names(Arc<BTreeSet<(String, String)>>),
 }
@@ -142,6 +144,17 @@ impl ConcurrentHandler for CatalogHandler {
                 None => Ok(CatalogReply::Headers(CatalogHeads::default())),
             },
             CatalogRequest::Directory(r) => self.directory(r).await.map(CatalogReply::Directory),
+            CatalogRequest::Summaries(r) => match &self.storage {
+                Some(handle) => handle
+                    .acquire()?
+                    .port
+                    .directory_summaries(r.clone())
+                    .await
+                    .map(CatalogReply::Summaries),
+                None => Err(EngineError::unsupported(
+                    "catalog summaries require management storage",
+                )),
+            },
             CatalogRequest::Indexes(id) => {
                 let runtime = self.runtime.acquire()?;
                 runtime

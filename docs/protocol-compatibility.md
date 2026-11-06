@@ -6,7 +6,7 @@ pgwire 锁定 0.42.1。实现 Startup、SCRAM-SHA-256、SSLRequest/TLS、CancelR
 
 Startup database 可对应有效且授权的数据源 catalog_alias 或显式配置的业务虚拟库。未提供或显式传空字符串时使用 Startup user；非空名称精确保留，不重定向到 postgres 或其他源。凭据验证后校验数据库：不存在返回 FATAL/3D000，无 CONNECT 权限返回 FATAL/42501，禁止连接返回 FATAL/55000；错误密码/未知认证用户返回 FATAL/28P01。失败后关闭连接，不发送 ReadyForQuery。
 
-账号库独立持久化，拥有空 public 与显式配置的 schema 映射；CONNECT 不授予源对象权限，映射对象仍取绑定和现有 SELECT grants 的交集。原数据源 database 保留独立入口。零数据源且未配置虚拟库时无可连接 PG database；显式配置的空业务虚拟库可以连接。内部管理库不公开，标准 pg_catalog/information_schema 保留系统查询能力，由客户端默认关闭的“显示系统对象”控制导航展示。
+账号库独立持久化，拥有空 public 与显式配置的 schema 映射；CONNECT 不授予源对象权限，映射的数据读取仍取绑定和现有 SELECT grants 的交集；对象目录描述与数据读取权限分开。原数据源 database 保留独立入口。零数据源且未配置虚拟库时无可连接 PG database；显式配置的空业务虚拟库可以连接。内部管理库不公开，标准 pg_catalog/information_schema 保留系统查询能力，由客户端默认关闭的“显示系统对象”控制导航展示。
 
 两段名称表示当前库的 schema.table；单段名称按当前有效 search_path 解析；当前数据库.schema.table 同样有效。跨 database 引用默认返回 0A000，显式启用 pgwire.allow_cross_database 才提供原联邦三段扩展。账号库默认 search_path 为 "$user", public，不把所有业务 schema 自动放入路径。原源 database 保留其配置默认 schema。支持引号精确匹配。SET/RESET search_path 推进命名空间版本，使旧 Prepared Statement 返回 0A000，需重新 Parse/Bind；Parse/Describe 不执行 SET，Execute 才生效。切库通过重新连接，不提供 USE。
 
@@ -22,7 +22,11 @@ Startup database 可对应有效且授权的数据源 catalog_alias 或显式配
 
 regclass 名称按当前库、有效 search_path 和权限解析，支持引号和当前库三段名称。文本参数在 Bind 完成前解析成 OID，Execute 保留代际校验；文本结果输出可见简写名或正确引用的限定名，二进制输出 OID。不存在的必需关系名返回 42P01；to_regclass 对名称不存在、无效名称和数值 OID 越界返回 NULL，跨库仍返回 0A000。显式 regclass::text 使用同一作用域规则。regproc/regtype 的完整名称解析、重载和文本显示仍未完成，不能由 regclass 或目录 OID 编解码推断。
 
-目录由统一已发布快照本地读取，并按 principal、database、授权对象过滤。不可见 FK 目标和不安全定义不会从标准目录或定义函数暴露。快照时间、stale 与分类状态仅通过管理 API 提供，不创建 PG 状态 schema；读取旧目录发送有界去重 Notice，业务查询仍服从 stale 阻断。管理 HTTP 位于既有可信部署边界，可展示全部登记状态。
+目录由统一已发布快照本地读取。`pg_database` 列出已发布数据库，CONNECT 单独判断；当前库的 `pg_namespace/pg_class/pg_attribute` 等目录描述有效绑定中的已采集对象，不因当前账号缺少 SELECT 而隐藏其存在。`information_schema.schemata/tables/columns` 按逻辑 owner 或现有授权过滤。目录只描述源采集凭据已获得并发布的事实，不能枚举未采集到的远端对象。`pg_stats`、统计辅助函数和定义函数仍要求来源 SELECT，返回定义前，其依赖对象及 FK 目标还须通过授权检查。
+
+配置账号在 `pg_roles` 中具有不同且跨重启稳定的 OID。虚拟库的 database/schema/relation/type owner 使用该库配置的 owner；系统对象使用不可登录的保留角色 `fedengine_system`（OID 10），不能把当前访问者当成 owner。源 catalog 独立入口的逻辑 owner 为该系统角色，不从远端连接用户名推断本地所有权。SQL 中的标准系统 schema、表和列正常出现在 `information_schema`，catalog 名为当前数据库；客户端默认隐藏系统对象仅影响导航。
+
+`pg_table_is_visible` 按有效 search_path 及同名遮蔽判断，不把目录中存在等同于无需 schema 限定即可访问。生成子查询先在调用者作用域求值参数，外层别名或未限定列名不会被内部别名捕获。快照时间、stale 与分类状态仅通过管理 API 提供，不创建 PG 状态 schema；读取旧目录发送有界去重 Notice，业务查询仍服从 stale 阻断。管理 HTTP 位于既有可信部署边界，可展示全部登记状态。
 
 系统查询使用 AST 受控规划。直接访问 `_fedengine`、任意系统/业务混合、危险函数及 SELECT INTO 明确拒绝；未知系统目录/表达式不自动透传远端。
 
@@ -36,7 +40,7 @@ PostgreSQL 源端未声明精度和 scale 的 `numeric`（包括生成列）存�
 
 `decode(text,text)` 支持不区分大小写的 hex/base64/escape，返回 bytea（OID 17），NULL 参数返回 NULL；非法编码名及 hex/base64 内容返回 `22023`，非法 escape 内容返回 `22P02`。函数在授权后改写到私有实现，嵌套表达式与参数执行沿用同一路径；私有函数不能由用户 SQL 直接调用。
 
-已收口的常见失败路径：非法整数字符串返回 `22P02`，数值越界返回 `22003`，不支持的 JSONB cast 返回 `0A000`；错误消息不透出原始 DuckDB SQL 或连接信息。数据库权限辅助函数的权限名按不区分大小写处理。
+已收口的常见失败路径：非法整数字符串返回 `22P02`，数值越界返回 `22003`，不支持的 JSONB cast 返回 `0A000`；错误消息不透出原始 DuckDB SQL 或连接信息。`has_database_privilege/has_schema_privilege/has_table_privilege` 当前支持查询当前账号的双参数形式，目标支持名称或 OID；权限列表不区分大小写，支持逗号分隔及 `WITH GRANT OPTION` 语法，非法权限名返回 `22023`。未知 OID 返回 NULL，不存在的数据库/schema/表名称分别返回 `3D000/3F000/42P01`。当前虚拟对象权限模型提供 CONNECT、隐式 schema USAGE 和已授予的源 SELECT；虚拟库的 CREATE、TEMPORARY、映射写权限及转授权返回 false；源 catalog 独立入口的表权限反映配置的对应动作授权，不表示实现了完整 PG ACL、GRANT/REVOKE、角色继承或指定其他账号的三参数重载。逻辑 owner 不自动获得远端 SELECT。
 
 目录补充 unsigned oid/regclass/regproc、name、char、pg_node_tree、int2vector/oidvector 及所需的一维数组编码。vector 下标从 0 开始，普通数组编解码保留下界；尚不能忠实执行的非 1 下界返回 0A000。覆盖 NULL、空数组、转义、文本/二进制和非法输入。目录结果类型根据字段及表达式来源推导；无法证明类型的表达式要求显式 cast。任意业务数组、结构和多维复杂结果不因此获得全面支持。JSONB OID 仍明确拒绝。
 

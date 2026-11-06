@@ -63,12 +63,21 @@ impl Analyzer {
                 _ => None,
             };
             if let Some((schema, object)) = local {
-                let (id, remote_schema) = ns.bindings.get(&schema).ok_or_else(|| {
-                    EngineError::new(
-                        "42P01",
-                        "relation is outside the available database schemas",
-                    )
-                })?;
+                let route = if !schema_object {
+                    ns.routes
+                        .as_ref()
+                        .map(|routes| routes.get(&(schema.clone(), object.clone())))
+                } else {
+                    None
+                };
+                let (id, remote_schema) = route
+                    .unwrap_or_else(|| ns.bindings.get(&schema))
+                    .ok_or_else(|| {
+                        EngineError::new(
+                            "42P01",
+                            "relation is outside the available database schemas",
+                        )
+                    })?;
                 let source = enabled
                     .iter()
                     .find(|s| &s.id == id)

@@ -15,6 +15,12 @@ pub(super) fn engine_error(e: duckdb::Error) -> EngineError {
         )
     } else if text.starts_with("invalid input error: __fed_pg_oid_range") {
         ("22003", "value is out of range for type oid")
+    } else if text.starts_with("invalid input error: __fed_pg_database_missing") {
+        ("3D000", "database does not exist")
+    } else if text.starts_with("invalid input error: __fed_pg_schema_missing") {
+        ("3F000", "schema does not exist")
+    } else if text.starts_with("invalid input error: __fed_pg_invalid_privilege") {
+        ("22023", "unrecognized privilege type")
     } else if text.starts_with("invalid input error: __fed_pg_invalid_fork") {
         ("22023", "invalid fork name")
     } else if text.starts_with("invalid input error: __fed_pg_relation_name") {
@@ -45,6 +51,10 @@ pub(super) fn engine_error(e: duckdb::Error) -> EngineError {
         ("22P02", "invalid input syntax for the requested type")
     } else if text.contains("interrupt") {
         ("57014", "query canceled")
+    } else if text.contains("password authentication failed")
+        || text.contains("authentication failed")
+    {
+        ("28P01", "source authentication failed")
     } else if text.contains("permission denied")
         || text.contains("access denied")
         || text.contains("command denied")

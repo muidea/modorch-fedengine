@@ -181,6 +181,7 @@ fn user_database_connect_and_mapped_objects_have_independent_authorization() {
     use fedengine_contract::CatalogHeads;
     let (mut config, header, definition) = fixture();
     let db = VirtualDatabase {
+        managed: false,
         revision: 1,
         config: VirtualDatabaseConfig {
             name: "fedengine".into(),
@@ -192,6 +193,7 @@ fn user_database_connect_and_mapped_objects_have_independent_authorization() {
         oid: 210000000,
         public_oid: 210000001,
         schemas: vec![VirtualSchema {
+            object_epoch: "virtual-schema:210000002".into(),
             config: VirtualSchemaConfig {
                 name: "business".into(),
                 source: definition.id.clone(),
@@ -229,7 +231,8 @@ fn user_database_connect_and_mapped_objects_have_independent_authorization() {
         std::slice::from_ref(&definition),
     )
     .unwrap();
-    assert!(empty.catalogs.is_empty()); // Owner/CONNECT is not SELECT.
+    assert!(!empty.catalogs.is_empty()); // CONNECT admits directory descriptions, never source reads.
+    assert!(empty.catalogs.iter().all(|c| c.grants.is_empty()));
     let mut disabled = heads;
     disabled.sources[0].source.status = SourceStatus::Disabled;
     assert!(

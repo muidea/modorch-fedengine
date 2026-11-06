@@ -9,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 #[derive(Clone)]
 pub(super) struct Coordinator {
     pub config: Arc<Config>,
+    pub discovery: crate::discovery::DiscoveryJobs,
     pub tasks: TaskScheduler,
     pub storage: ServiceHandle<ManagementStorage>,
     pub registry: ServiceHandle<DataSourceRegistry>,
@@ -140,17 +141,12 @@ impl Coordinator {
             ManagementAction::Register { .. }
                 | ManagementAction::Patch { .. }
                 | ManagementAction::Schemas { .. }
-                | ManagementAction::Delete { .. }
         ) {
             let id = id.to_owned();
             storage
                 .port
                 .update(Box::new(move |state| {
                     let operation = state.operations.get_mut(&id).unwrap();
-                    if matches!(operation.action, ManagementAction::Delete { .. }) {
-                        let source = state.sources.get_mut(&operation.incarnation).unwrap();
-                        source.deleted = true;
-                    }
                     operation.status = OperationStatus::Succeeded;
                     operation.phase = "Complete".into();
                     operation.updated_at = chrono::Utc::now().to_rfc3339();
@@ -168,6 +164,7 @@ impl Coordinator {
             operation.action,
             ManagementAction::Apply { .. }
                 | ManagementAction::Disable { .. }
+                | ManagementAction::Delete { .. }
                 | ManagementAction::Refresh { .. }
         );
         if changing
@@ -175,7 +172,10 @@ impl Coordinator {
         {
             registry.close(&source.id);
             let incarnation = source.incarnation.clone();
-            let disabling = matches!(operation.action, ManagementAction::Disable { .. });
+            let disabling = matches!(
+                operation.action,
+                ManagementAction::Disable { .. } | ManagementAction::Delete { .. }
+            );
             storage
                 .port
                 .update(Box::new(move |state| {
@@ -199,7 +199,8 @@ impl Coordinator {
         let is_apply = matches!(operation.action, ManagementAction::Apply { .. }) || strict_refresh;
         let is_refresh =
             matches!(operation.action, ManagementAction::Refresh { .. }) && !strict_refresh;
-        let is_disable = matches!(operation.action, ManagementAction::Disable { .. });
+        let is_delete = matches!(operation.action, ManagementAction::Delete { .. });
+        let is_disable = is_delete || matches!(operation.action, ManagementAction::Disable { .. });
         let mut outcome = ControlOutcome {
             schemas: vec![],
             catalog: None,
@@ -456,6 +457,9 @@ impl Coordinator {
                             ));
                         }
                         source.status = status;
+                        if succeeded && is_delete {
+                            source.deleted = true;
+                        }
                         source.last_error = reason.clone();
                         source.generation = generation;
                         if succeeded && is_apply {

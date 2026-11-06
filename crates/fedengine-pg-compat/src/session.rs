@@ -50,7 +50,20 @@ pub fn effective_path(session: &SessionContext, scope: &MetadataScope) -> Vec<St
         .catalogs
         .iter()
         .filter(|c| c.catalog == session.database)
-        .flat_map(|c| c.schemas.clone())
+        .flat_map(|c| {
+            c.schemas
+                .iter()
+                .filter(|schema| {
+                    scope
+                        .virtual_database
+                        .as_ref()
+                        .is_some_and(|db| db.config.owner == scope.principal)
+                        || c.grants.iter().any(|g| {
+                            !g.actions.is_empty() && (g.schema == "*" || &g.schema == *schema)
+                        })
+                })
+                .cloned()
+        })
         .collect::<Vec<_>>();
     schemas.extend(["pg_catalog".into(), "information_schema".into()]);
     if scope.virtual_database.is_some() {

@@ -89,6 +89,7 @@ async fn division_errors_and_privileges_match_postgres() {
         ("SELECT 1::double precision/0::double precision", "22012"),
         ("SELECT 'a'::integer", "22P02"),
         ("SELECT '__fed_pg_division_by_zero'::integer", "22P02"),
+        ("SELECT '__fed_pg_invalid_privilege'::integer", "22P02"),
         (
             "SELECT 'Invalid Input Error: __fed_pg_division_by_zero'::integer",
             "22P02",
@@ -812,6 +813,56 @@ async fn metadata_parameters_and_regclass_match_native_postgres() {
             .simple_query(sql)
             .await
             .map(execute)
+            .map_err(|e| e.code().unwrap().code().to_owned());
+        assert_eq!(actual, expected, "{sql}");
+    }
+    native
+        .batch_execute("SET ROLE pg_read_all_settings")
+        .await
+        .unwrap();
+    for sql in [
+        "SELECT has_schema_privilege('public','USAGE')",
+        "SELECT has_schema_privilege('public','CREATE, USAGE')",
+        "SELECT has_schema_privilege('public','USAGE WITH GRANT OPTION')",
+        "SELECT has_schema_privilege('public','NOT_USAGE')",
+        "SELECT has_schema_privilege('public','')",
+        "SELECT has_schema_privilege(0::oid,'USAGE')",
+        "SELECT has_schema_privilege(NULL::oid,'BAD')",
+        "SELECT has_schema_privilege('no_such_fed_schema','USAGE')",
+        "SELECT has_database_privilege(0::oid,'CONNECT')",
+        "SELECT has_database_privilege(current_database(),'INVALID')",
+        "SELECT has_database_privilege('no_such_fed_database','CONNECT')",
+        "SELECT has_table_privilege('pg_catalog.pg_class','SELECT')",
+        "SELECT has_table_privilege('pg_catalog.pg_class','INSERT, SELECT')",
+        "SELECT has_table_privilege('pg_catalog.pg_class','SELECT WITH GRANT OPTION')",
+        "SELECT has_table_privilege('pg_catalog.pg_class','INVALID')",
+        "SELECT has_table_privilege(0::oid,'SELECT')",
+        "SELECT has_table_privilege(NULL::oid,'BAD')",
+        "SELECT has_table_privilege('no_such_fed_table','SELECT')",
+        "SELECT pg_table_is_visible(c.oid) FROM pg_class c WHERE c.relname='pg_class'",
+        "SELECT pg_table_is_visible(oid) FROM pg_class c WHERE c.relname='pg_class'",
+    ] {
+        let values = |messages: Vec<SimpleQueryMessage>| {
+            messages
+                .into_iter()
+                .filter_map(|message| {
+                    if let SimpleQueryMessage::Row(row) = message {
+                        Some(row.get(0).map(str::to_owned))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let actual = client
+            .simple_query(sql)
+            .await
+            .map(values)
+            .map_err(|e| e.code().unwrap().code().to_owned());
+        let expected = native
+            .simple_query(sql)
+            .await
+            .map(values)
             .map_err(|e| e.code().unwrap().code().to_owned());
         assert_eq!(actual, expected, "{sql}");
     }

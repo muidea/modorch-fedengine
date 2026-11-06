@@ -2,7 +2,7 @@
 use duckdb::{
     Connection,
     arrow::{
-        array::{Array, BinaryBuilder, RecordBatch, StringArray, StringBuilder},
+        array::{Array, BinaryBuilder, BooleanBuilder, RecordBatch, StringArray, StringBuilder},
         datatypes::DataType,
     },
     vscalar::{ArrowFunctionSignature, VArrowScalar},
@@ -10,6 +10,7 @@ use duckdb::{
 use std::{error::Error, sync::Arc};
 
 pub(super) fn register(conn: &Connection) -> duckdb::Result<()> {
+    conn.register_scalar_function::<Privilege>("__fed_pg_privilege")?;
     conn.register_scalar_function::<Decode>("__fed_pg_decode")?;
     conn.register_scalar_function::<NameInput<true>>("__fed_pg_regclass_input")?;
     conn.register_scalar_function::<NameInput<false>>("__fed_pg_relation_parts")?;
@@ -204,5 +205,48 @@ fn decode(text: &str, format: &str) -> Option<Vec<u8>> {
             Some(out)
         }
         _ => None,
+    }
+}
+
+struct Privilege;
+impl VArrowScalar for Privilege {
+    type State = ();
+    fn invoke(_: &(), input: RecordBatch) -> Result<Arc<dyn Array>, Box<dyn Error>> {
+        let columns = (0..3)
+            .map(|i| {
+                input
+                    .column(i)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or("__fed_pg_invalid_privilege")
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut output = BooleanBuilder::new();
+        for i in 0..input.num_rows() {
+            if columns[0].is_null(i) || columns[1].is_null(i) {
+                output.append_null();
+                continue;
+            }
+            let privileges =
+                fedengine_pg_compat::parse_privileges(columns[1].value(i), columns[0].value(i))
+                    .map_err(|_| "__fed_pg_invalid_privilege")?;
+            if columns[2].is_null(i) {
+                output.append_null();
+                continue;
+            }
+            let allowed = columns[2].value(i).split(',').collect::<Vec<_>>();
+            output.append_value(
+                privileges
+                    .iter()
+                    .any(|privilege| allowed.contains(&privilege.as_str())),
+            );
+        }
+        Ok(Arc::new(output.finish()))
+    }
+    fn signatures() -> Vec<ArrowFunctionSignature> {
+        vec![ArrowFunctionSignature::exact(
+            vec![DataType::Utf8, DataType::Utf8, DataType::Utf8],
+            DataType::Boolean,
+        )]
     }
 }

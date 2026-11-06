@@ -131,8 +131,18 @@ fn permission(
     schema_field: &str,
     object_field: &str,
 ) -> String {
+    permission_for_action(alias, grants, schema_field, object_field, "SELECT")
+}
+fn permission_for_action(
+    alias: &str,
+    grants: &[fedengine_core::Grant],
+    schema_field: &str,
+    object_field: &str,
+    action: &str,
+) -> String {
     let cases = grants
         .iter()
+        .filter(|g| g.actions.contains(action))
         .map(|g| {
             format!(
                 "({} AND {})",
@@ -168,34 +178,85 @@ fn where_scope(name: &str, scope: &MetadataScope) -> Result<String> {
             quote_literal(&format!("virtual:{}:public", db.oid))
         ));
     }
-    for c in &scope.catalogs {
-        if name == "pg_database" && c.mapping.is_some() {
+    for (index, c) in scope.catalogs.iter().enumerate() {
+        if name == "pg_database" && (c.mapping.is_some() || c.internal) {
             continue;
         }
         if name != "pg_database" && c.catalog != scope.database {
             continue;
         }
-        let visible = if name == "pg_database" {
+        let owner = scope
+            .virtual_database
+            .as_ref()
+            .is_some_and(|db| db.config.owner == scope.principal);
+        let structural = !name.starts_with("information_schema.") && name != "pg_stats";
+        let visible = if structural || (owner && name != "pg_stats") {
             "true".into()
         } else if matches!(
             name,
-            "pg_namespace"
-                | "information_schema.schemata"
-                | "pg_foreign_server"
-                | "pg_foreign_data_wrapper"
+            "information_schema.schemata" | "pg_foreign_server" | "pg_foreign_data_wrapper"
         ) {
             let schema_grants:Vec<_>=c.grants.iter().map(|g|{
                 let schema=if g.schema=="*"{"true".into()}else{format!("p._schema={}",quote_literal(&g.schema))};
                 let object=if g.object=="*"{"true".into()}else{format!("EXISTS(SELECT 1 FROM {} q WHERE q._snapshot_id=p._snapshot_id AND q._schema=p._schema AND q._object={} AND q.relkind IN ('r','v','m','f','p'))",physical_catalog("pg_class")?,quote_literal(&g.object))};
                 Ok(format!("({schema} AND {object})"))
             }).collect::<Result<_>>()?;
-            format!("({})", schema_grants.join(" OR "))
+            if schema_grants.is_empty() {
+                "false".into()
+            } else {
+                format!("({})", schema_grants.join(" OR "))
+            }
+        } else if name.starts_with("information_schema.") && c.mapping.is_none() {
+            let checks = [
+                "SELECT",
+                "INSERT",
+                "UPDATE",
+                "DELETE",
+                "TRUNCATE",
+                "REFERENCES",
+                "TRIGGER",
+            ]
+            .iter()
+            .map(|action| permission_for_action("p", &c.grants, "_schema", "_object", action))
+            .collect::<Vec<_>>();
+            format!("({})", checks.join(" OR "))
         } else {
             permission("p", &c.grants, "_schema", "_object")
         };
-        let target = permission("p", &c.grants, "_target_schema", "_target_object");
+        let target = if structural || (owner && name != "pg_stats") {
+            "true".into()
+        } else {
+            permission("p", &c.grants, "_target_schema", "_target_object")
+        };
+        // Pick the first authorized contributor per relation, independently of refresh order.
+        let mut canonical = String::new();
+        if c.mapping.is_some()
+            && !matches!(
+                name,
+                "pg_database"
+                    | "pg_namespace"
+                    | "information_schema.schemata"
+                    | "pg_foreign_server"
+                    | "pg_foreign_data_wrapper"
+            )
+        {
+            for earlier in &scope.catalogs[..index] {
+                if earlier.catalog != c.catalog
+                    || earlier.mapping.is_none()
+                    || earlier.schemas != c.schemas
+                {
+                    continue;
+                }
+                let grants = if structural || (owner && name != "pg_stats") {
+                    "true".into()
+                } else {
+                    permission("q", &earlier.grants, "_schema", "_object")
+                };
+                canonical.push_str(&format!(" AND NOT EXISTS (SELECT 1 FROM {} q WHERE q._snapshot_id={} AND q._schema=p._schema AND q._object=p._object AND {grants})", physical_catalog("pg_class")?, quote_literal(&earlier.snapshot_id)));
+            }
+        }
         cases.push(format!(
-            "(p._snapshot_id={} AND {visible} AND (p._target_schema IS NULL OR ({target})))",
+            "(p._snapshot_id={} AND {visible} AND (p._target_schema IS NULL OR ({target})){canonical})",
             quote_literal(&c.snapshot_id)
         ));
     }
@@ -204,9 +265,20 @@ fn where_scope(name: &str, scope: &MetadataScope) -> Result<String> {
 pub fn scoped_catalog(name: &str, scope: &MetadataScope) -> Result<String> {
     let fields = &catalog_schema()[name];
     let columns=fields.iter().map(|f|{
+        let owner_name = scope.virtual_database.as_ref().map(|db| db.config.owner.as_str()).unwrap_or("fedengine_system");
+        let role_oid = |owner: &str| format!("(SELECT r.oid FROM {} r WHERE r._snapshot_id='' AND r.rolname={} LIMIT 1)", physical_catalog("pg_roles").expect("role catalog"),quote_literal(owner));
         if name=="pg_database" && f.attname=="datdba" {
-            let owned=scope.databases.iter().filter(|d|d.config.owner==scope.principal).map(|d|quote_literal(&d.config.name)).collect::<Vec<_>>();
-            return if owned.is_empty() { "p.datdba".into() } else { format!("CASE WHEN p.datname IN ({}) THEN 10::UINTEGER ELSE p.datdba END AS datdba",owned.join(",")) };
+            let cases=scope.databases.iter().map(|d|format!("WHEN p.datname={} THEN {}",quote_literal(&d.config.name),role_oid(&d.config.owner))).collect::<Vec<_>>();
+            return format!("CASE {} ELSE 10::UINTEGER END AS datdba",if cases.is_empty(){"WHEN false THEN 10::UINTEGER".into()}else{cases.join(" ")});
+        }
+        if matches!(f.attname.as_str(),"nspowner"|"relowner"|"typowner") {
+            return format!("CASE WHEN p._snapshot_id='' THEN 10::UINTEGER ELSE {} END AS {}",role_oid(owner_name),quote_identifier(&f.attname));
+        }
+        if matches!(f.attname.as_str(),"schema_owner"|"tableowner"|"viewowner"|"matviewowner") {
+            return format!("CASE WHEN p._snapshot_id='' THEN 'fedengine_system' ELSE {} END AS {}",quote_literal(owner_name),quote_identifier(&f.attname));
+        }
+        if name.starts_with("information_schema.") && matches!(f.attname.as_str(),"catalog_name"|"table_catalog"|"udt_catalog"|"constraint_catalog"|"unique_constraint_catalog"|"specific_catalog") {
+            return format!("{} AS {}",quote_literal(&scope.database),quote_identifier(&f.attname));
         }
         if matches!(name,"pg_views"|"pg_matviews"|"information_schema.views") && matches!(f.attname.as_str(),"definition"|"view_definition") {
             format!("(SELECT d.definition FROM ({}) d WHERE d.snapshot_id=p._snapshot_id AND d.schema_name=p._schema AND d.object_name=p._object AND d.kind='view' LIMIT 1) AS {}",scoped_definitions(scope),quote_identifier(&f.attname))
@@ -217,27 +289,6 @@ pub fn scoped_catalog(name: &str, scope: &MetadataScope) -> Result<String> {
         physical_catalog(name)?,
         where_scope(name, scope)?
     );
-    if name == "pg_roles" {
-        let user = fields
-            .iter()
-            .map(|f| {
-                format!(
-                    "CAST({} AS {})",
-                    match f.attname.as_str() {
-                        "oid" => "10".into(),
-                        "rolname" => quote_literal(&scope.principal),
-                        "rolcanlogin" => "true".into(),
-                        "rolsuper" | "rolinherit" | "rolcreaterole" | "rolcreatedb"
-                        | "rolreplication" | "rolbypassrls" => "false".into(),
-                        _ => "NULL".into(),
-                    },
-                    f.duckdb_type()
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(",");
-        sql.push_str(&format!(" UNION ALL SELECT {user}"));
-    }
     if name == "pg_settings" {
         let values = fields
             .iter()
@@ -260,6 +311,192 @@ pub fn scoped_catalog(name: &str, scope: &MetadataScope) -> Result<String> {
     }
     Ok(sql)
 }
+/// The current virtual object model exposes CONNECT, schema USAGE and foreign-table
+/// SELECT. Source grants remain authoritative; logical ownership never grants remote reads.
+fn privilege_expression(
+    scope: &MetadataScope,
+    session: &SessionContext,
+    kind: &str,
+    target: &str,
+    requested: &str,
+    numeric: bool,
+) -> Result<String> {
+    let owner = scope
+        .virtual_database
+        .as_ref()
+        .is_some_and(|db| db.config.owner == scope.principal);
+    let input_target = target;
+    let (relation, key, allowed, target) = match kind {
+        "database" => {
+            let mut clauses = scope
+                .databases
+                .iter()
+                .filter(|db| {
+                    db.config.owner == scope.principal
+                        || db.config.connect.contains(&scope.principal)
+                })
+                .map(|db| format!("p.datname={}", quote_literal(&db.config.name)))
+                .collect::<Vec<_>>();
+            clauses.extend(
+                scope
+                    .catalogs
+                    .iter()
+                    .filter(|c| {
+                        !c.internal
+                            && c.mapping.is_none()
+                            && c.grants.iter().any(|g| g.actions.contains("SELECT"))
+                    })
+                    .map(|c| format!("p.datname={}", quote_literal(&c.catalog))),
+            );
+            (
+                "pg_database",
+                if numeric { "oid" } else { "datname" },
+                format!(
+                    "CASE WHEN {} THEN 'CONNECT' ELSE '' END",
+                    if clauses.is_empty() {
+                        "false".into()
+                    } else {
+                        clauses.join(" OR ")
+                    }
+                ),
+                target.to_string(),
+            )
+        }
+        "schema" => {
+            let mut clauses = vec!["p._snapshot_id=''".into()];
+            if let Some(db) = &scope.virtual_database {
+                clauses.push(format!("p.oid={}", db.public_oid));
+            }
+            for c in scope
+                .catalogs
+                .iter()
+                .filter(|c| c.catalog == scope.database)
+            {
+                let schemas = c
+                    .schemas
+                    .iter()
+                    .filter(|schema| {
+                        owner
+                            || c.grants.iter().any(|g| {
+                                !g.actions.is_empty() && (g.schema == "*" || &g.schema == *schema)
+                            })
+                    })
+                    .map(|schema| quote_literal(schema))
+                    .collect::<Vec<_>>();
+                if !schemas.is_empty() {
+                    clauses.push(format!(
+                        "(p._snapshot_id={} AND p.nspname IN ({}))",
+                        quote_literal(&c.snapshot_id),
+                        schemas.join(",")
+                    ));
+                }
+            }
+            (
+                "pg_namespace",
+                if numeric { "oid" } else { "nspname" },
+                format!(
+                    "CASE WHEN {} THEN 'USAGE' ELSE '' END",
+                    clauses.join(" OR ")
+                ),
+                target.to_string(),
+            )
+        }
+        "table" => {
+            let permissions = [
+                "SELECT",
+                "INSERT",
+                "UPDATE",
+                "DELETE",
+                "TRUNCATE",
+                "REFERENCES",
+                "TRIGGER",
+            ]
+            .iter()
+            .map(|action| {
+                let mut clauses = if *action == "SELECT" {
+                    vec!["p._snapshot_id=''".into()]
+                } else {
+                    vec![]
+                };
+                for c in scope.catalogs.iter().filter(|c| {
+                    c.catalog == scope.database && (c.mapping.is_none() || *action == "SELECT")
+                }) {
+                    clauses.push(format!(
+                        "(p._snapshot_id={} AND {})",
+                        quote_literal(&c.snapshot_id),
+                        permission_for_action("p", &c.grants, "_schema", "_object", action)
+                    ));
+                }
+                format!(
+                    "CASE WHEN {} THEN {} ELSE NULL END",
+                    if clauses.is_empty() {
+                        "false".into()
+                    } else {
+                        clauses.join(" OR ")
+                    },
+                    quote_literal(action)
+                )
+            })
+            .collect::<Vec<_>>();
+            let target = if numeric {
+                target.to_string()
+            } else {
+                regclass_expression(target, session, scope, true, false)?
+            };
+            (
+                "pg_class",
+                "oid",
+                format!("concat_ws(',',{})", permissions.join(",")),
+                target,
+            )
+        }
+        _ => unreachable!(),
+    };
+    // Do not apply canonical contributor filtering: authorization may come from any contributor.
+    let mut visible = vec!["p._snapshot_id=''".into()];
+    let databases = if kind == "database" {
+        scope.databases.iter().collect::<Vec<_>>()
+    } else {
+        scope.virtual_database.iter().collect()
+    };
+    visible.extend(databases.into_iter().map(|db| {
+        format!(
+            "p._snapshot_id={}",
+            quote_literal(&format!("virtual:{}:public", db.oid))
+        )
+    }));
+    visible.extend(
+        scope
+            .catalogs
+            .iter()
+            .filter(|c| {
+                if kind == "database" {
+                    !c.internal && c.mapping.is_none()
+                } else {
+                    c.catalog == scope.database
+                }
+            })
+            .map(|c| format!("p._snapshot_id={}", quote_literal(&c.snapshot_id))),
+    );
+    let lookup = format!(
+        "(SELECT string_agg({allowed}, ',') FROM {} p WHERE ({}) AND CAST(p.{key} AS VARCHAR)=CAST(({target}) AS VARCHAR))",
+        physical_catalog(relation)?,
+        visible.join(" OR ")
+    );
+    // PostgreSQL distinguishes missing names (error) from unknown OIDs (NULL).
+    let lookup = if numeric || kind == "table" {
+        lookup
+    } else {
+        format!(
+            "CASE WHEN ({target}) IS NULL THEN NULL::VARCHAR ELSE coalesce({lookup},error('__fed_pg_{kind}_missing')) END"
+        )
+    };
+    Ok(format!(
+        "CASE WHEN ({input_target}) IS NULL OR ({requested}) IS NULL THEN NULL::BOOLEAN ELSE __fed_pg_privilege(CAST({requested} AS VARCHAR),{}, {lookup}) END",
+        quote_literal(kind)
+    ))
+}
+
 fn scoped_definitions(scope: &MetadataScope) -> String {
     let cases=scope.catalogs.iter().filter(|c|c.catalog==scope.database).map(|c|{
         let schemas=c.schemas.iter().map(|s|quote_literal(s)).collect::<Vec<_>>().join(",");
@@ -618,6 +855,7 @@ pub fn plan_with_parameters(
         pid,
         parameter_types: &parameter_types,
         regclass_text_casts: vec![],
+        argument_types: vec![],
         ctes: vec![],
         bindings: vec![],
         depth: 0,
@@ -751,6 +989,7 @@ struct Rewrite<'a> {
     pid: i32,
     parameter_types: &'a BTreeMap<usize, PgType>,
     regclass_text_casts: Vec<bool>,
+    argument_types: Vec<Vec<Option<PgType>>>,
     ctes: Vec<BTreeSet<String>>,
     bindings: Vec<crate::result_types::Bindings>,
     depth: usize,
@@ -949,6 +1188,32 @@ impl VisitorMut for Rewrite<'_> {
         ControlFlow::Continue(())
     }
     fn pre_visit_expr(&mut self, e: &mut Expr) -> ControlFlow<Self::Break> {
+        let argument_types = if let Expr::Function(f) = e {
+            args(f)
+                .unwrap_or_default()
+                .iter()
+                .map(|arg| {
+                    self.bindings
+                        .last()
+                        .and_then(|b| crate::result_types::infer(arg, b))
+                        .map(|c| c.data_type)
+                        .or_else(|| {
+                            if let Expr::Value(v) = arg
+                                && let Value::Placeholder(p) = &v.value
+                            {
+                                p.strip_prefix('$')
+                                    .and_then(|p| p.parse::<usize>().ok())
+                                    .and_then(|p| self.parameter_types.get(&p).copied())
+                            } else {
+                                None
+                            }
+                        })
+                })
+                .collect()
+        } else {
+            vec![]
+        };
+        self.argument_types.push(argument_types);
         let text_cast = if let Expr::Cast {
             expr, data_type, ..
         } = e
@@ -975,17 +1240,19 @@ impl VisitorMut for Rewrite<'_> {
         ControlFlow::Continue(())
     }
     fn post_visit_expr(&mut self, e: &mut Expr) -> ControlFlow<Self::Break> {
+        let argument_types = self.argument_types.pop().unwrap_or_default();
         if self.regclass_text_casts.pop().unwrap_or(false)
             && let Expr::Cast { expr, .. } = e
         {
-            *e = attempt!(parse_expr(&attempt!(regclass_text_expression(
-                &expr.to_string(),
+            let sql = attempt!(regclass_text_expression(
+                "__fed_argument_0()",
                 self.session,
                 self.scope
-            ))));
+            ));
+            *e = attempt!(parse_expr(&bind_generated_arguments(sql, &[expr.as_ref()])));
             return ControlFlow::Continue(());
         }
-        let replaced = attempt!(self.expression(e));
+        let replaced = attempt!(self.expression(e, &argument_types));
         if let Some(sql) = replaced {
             *e = attempt!(parse_expr(&sql));
         }
@@ -993,7 +1260,11 @@ impl VisitorMut for Rewrite<'_> {
     }
 }
 impl Rewrite<'_> {
-    fn expression(&self, e: &mut Expr) -> Result<Option<String>> {
+    fn expression(
+        &self,
+        e: &mut Expr,
+        original_types: &[Option<PgType>],
+    ) -> Result<Option<String>> {
         if let Expr::CompoundFieldAccess { root, access_chain } = e {
             let vector = self
                 .bindings
@@ -1114,13 +1385,16 @@ impl Rewrite<'_> {
                         }
                     });
                 if matches!(source_type, Some(PgType::Text | PgType::Catalog(19))) {
-                    return Ok(Some(regclass_expression(
-                        &expr.to_string(),
-                        self.session,
-                        self.scope,
-                        true,
-                        true,
-                    )?));
+                    return Ok(Some(bind_generated_arguments(
+                        regclass_expression(
+                            "__fed_argument_0()",
+                            self.session,
+                            self.scope,
+                            true,
+                            true,
+                        )?,
+                        &[expr.as_ref()],
+                    )));
                 }
             }
             let duck = match ty.as_str() {
@@ -1149,9 +1423,11 @@ impl Rewrite<'_> {
             return Ok(Some(sql));
         }
         let p = |i: usize| -> Result<String> {
-            a.get(i).map(ToString::to_string).ok_or_else(|| {
-                EngineError::new("42883", "metadata function signature is unsupported")
-            })
+            a.get(i)
+                .map(|_| format!("__fed_argument_{i}()"))
+                .ok_or_else(|| {
+                    EngineError::new("42883", "metadata function signature is unsupported")
+                })
         };
         let sql = match (name.as_str(), a.len()) {
             ("to_regclass", 1) => {
@@ -1293,15 +1569,30 @@ impl Rewrite<'_> {
                 format!("CASE WHEN {}=6 THEN 'UTF8' ELSE NULL::VARCHAR END", p(0)?)
             }
             ("pg_get_userbyid", 1) => format!(
-                "CASE WHEN {}=10 THEN {} ELSE NULL::VARCHAR END",
-                p(0)?,
-                quote_literal(&self.scope.principal)
-            ),
-            ("_pg_expandarray", 1) => format!(
-                "unnest(list_transform(range(1,array_length({})+1),__fed_n -> struct_pack(x := list_extract({},__fed_n), n := __fed_n)))",
+                "coalesce((SELECT r.rolname FROM ({}) r WHERE r.oid={} LIMIT 1), 'unknown (OID='||CAST({} AS VARCHAR)||')')",
+                scoped_catalog("pg_roles", self.scope)?,
                 p(0)?,
                 p(0)?
             ),
+            ("_pg_expandarray", 1) => {
+                // Keep this set-returning expression at query level; wrapping unnest
+                // in a scalar subquery changes its cardinality. Its lambda binder
+                // must still avoid capturing identifiers in the caller's argument.
+                let text = a[0].to_string();
+                let mut index = 0;
+                let parameter = loop {
+                    let candidate = format!("__fed_n_{index}");
+                    if !text.contains(&candidate) {
+                        break candidate;
+                    }
+                    index += 1;
+                };
+                format!(
+                    "unnest(list_transform(range(1,array_length({})+1),{parameter} -> struct_pack(x := list_extract({},{parameter}), n := {parameter})))",
+                    p(0)?,
+                    p(0)?
+                )
+            }
             ("array_upper" | "array_lower", 2) => {
                 let vector = self
                     .bindings
@@ -1336,26 +1627,19 @@ impl Rewrite<'_> {
                     p(0)?
                 )
             }
-            ("has_database_privilege", 2) => format!(
-                "(upper({})='CONNECT' AND EXISTS(SELECT 1 FROM ({}) d WHERE d.datname=CAST({} AS VARCHAR) OR CAST(d.oid AS VARCHAR)=CAST({} AS VARCHAR)))",
-                p(1)?,
-                scoped_catalog("pg_database", self.scope)?,
-                p(0)?,
-                p(0)?
-            ),
-            ("has_schema_privilege", 2) => format!(
-                "(contains(upper({}),'USAGE') AND EXISTS(SELECT 1 FROM ({}) n WHERE n.nspname=CAST({} AS VARCHAR) OR CAST(n.oid AS VARCHAR)=CAST({} AS VARCHAR)))",
-                p(1)?,
-                scoped_catalog("pg_namespace", self.scope)?,
-                p(0)?,
-                p(0)?
-            ),
-            ("has_table_privilege", 2) => format!(
-                "(upper({})='SELECT' AND EXISTS(SELECT 1 FROM ({}) c WHERE c.oid={}))",
-                p(1)?,
-                scoped_catalog("pg_class", self.scope)?,
-                p(0)?
-            ),
+            ("has_database_privilege" | "has_schema_privilege" | "has_table_privilege", 2) => {
+                let kind = name
+                    .strip_prefix("has_")
+                    .unwrap()
+                    .strip_suffix("_privilege")
+                    .unwrap();
+                let typ = original_types.first().copied().flatten();
+                let numeric = matches!(
+                    typ,
+                    Some(PgType::Int2 | PgType::Int4 | PgType::Int8 | PgType::Catalog(26 | 2205))
+                );
+                privilege_expression(self.scope, self.session, kind, &p(0)?, &p(1)?, numeric)?
+            }
             _ => {
                 const SAFE: &[&str] = &[
                     "coalesce",
@@ -1397,7 +1681,44 @@ impl Rewrite<'_> {
                 return Ok(None);
             }
         };
-        Ok(Some(sql))
+        Ok(Some(bind_generated_arguments(sql, &a)))
+    }
+}
+
+/// Evaluate caller expressions in their original scope before entering generated queries.
+/// A fixed replacement alias alone is insufficient: unqualified arguments can be captured too.
+fn bind_generated_arguments(mut sql: String, arguments: &[&Expr]) -> String {
+    if arguments.is_empty() {
+        return sql;
+    }
+    let texts = arguments
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    if sql.to_ascii_uppercase().contains("SELECT ") {
+        let mut sequence = 0;
+        let alias = loop {
+            let candidate = format!("__fed_arguments_{sequence}");
+            if !sql.contains(&candidate) && texts.iter().all(|text| !text.contains(&candidate)) {
+                break candidate;
+            }
+            sequence += 1;
+        };
+        for i in 0..arguments.len() {
+            sql = sql.replace(&format!("__fed_argument_{i}()"), &format!("{alias}.a{i}"));
+        }
+        let values = texts
+            .iter()
+            .enumerate()
+            .map(|(i, text)| format!("({text}) AS a{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!("(SELECT {sql} FROM LATERAL (SELECT {values}) {alias})")
+    } else {
+        for (i, text) in texts.iter().enumerate() {
+            sql = sql.replace(&format!("__fed_argument_{i}()"), &format!("({text})"));
+        }
+        sql
     }
 }
 

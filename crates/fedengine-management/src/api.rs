@@ -36,9 +36,13 @@ struct ApiInitiator {
     status: Arc<ManagementListenerStatus>,
     listener: Option<TcpListener>,
     stop: CancellationToken,
+    registry: Option<ServiceHandle<fedengine_datasource::DataSourceRegistry>>,
 }
 fn descriptor() -> ComponentDescriptor {
-    ComponentDescriptor::new(ComponentRef::initiator("management-api"))
+    let mut d = ComponentDescriptor::new(ComponentRef::initiator("management-api"));
+    d.requires
+        .push(ComponentRef::initiator("datasource-registry"));
+    d
 }
 impl InitiatorFactory for ManagementApiFactory {
     fn descriptor(&self) -> ComponentDescriptor {
@@ -50,12 +54,17 @@ impl InitiatorFactory for ManagementApiFactory {
             status: self.status.clone(),
             listener: None,
             stop: CancellationToken::new(),
+            registry: None,
         }))
     }
 }
 #[async_trait]
 impl Lifecycle for ApiInitiator {
-    async fn setup(&mut self, _: &SetupContext) -> FrameworkResult<()> {
+    async fn setup(&mut self, ctx: &SetupContext) -> FrameworkResult<()> {
+        self.registry = Some(
+            ctx.services
+                .get(&ComponentRef::initiator("datasource-registry"), "registry")?,
+        );
         let listener = TcpListener::bind(&self.config.management.listen)
             .await
             .map_err(|_| FrameworkError::InvalidConfig("cannot bind management listener".into()))?;
@@ -79,6 +88,7 @@ impl Lifecycle for ApiInitiator {
 struct ApiState {
     hub: ExternalEventHub,
     timeout: Duration,
+    browser: crate::browser::Browser,
 }
 #[async_trait]
 impl Initiator for ApiInitiator {
@@ -88,6 +98,12 @@ impl Initiator for ApiInitiator {
     async fn activate_ingress(&mut self, ctx: &RuntimeContext) -> FrameworkResult<()> {
         let listener = self.listener.take().unwrap();
         let state = ApiState {
+            browser: crate::browser::Browser::new(
+                self.config.clone(),
+                ctx.event_hub.external(),
+                self.registry.clone().unwrap(),
+                ctx.tasks.clone(),
+            ),
             hub: ctx.event_hub.external(),
             timeout: Duration::from_millis(self.config.management.request_timeout_ms),
         };
@@ -96,6 +112,16 @@ impl Initiator for ApiInitiator {
             .route("/manage", get(crate::web::index))
             .route("/manage/", get(crate::web::index))
             .route("/manage/app.js", get(crate::web::javascript))
+            .route(
+                "/manage/organization.js",
+                get(crate::web::organization_javascript),
+            )
+            .route("/manage/browser.js", get(crate::web::browser_javascript))
+            .route(
+                "/manage/navigator.js",
+                get(crate::web::navigator_javascript),
+            )
+            .route("/manage/browser.css", get(crate::web::browser_stylesheet))
             .route("/manage/style.css", get(crate::web::stylesheet))
             .route("/api/v1/{*path}", any(dispatch))
             .layer(DefaultBodyLimit::max(65_536))
@@ -128,6 +154,12 @@ async fn dispatch(
             axum::Json(json!({"error":"cross-origin management writes are not allowed"})),
         )
             .into_response();
+    }
+    if uri.path().starts_with("/api/v1/browser/") {
+        return match state.browser.route(&method, &uri, &body).await {
+            Ok(value) => (StatusCode::OK, axum::Json(value)).into_response(),
+            Err(error) => error_response(error),
+        };
     }
     let (request, writing) = match decode(&method, &uri, &headers, &body) {
         Ok(request) => request,
@@ -173,6 +205,8 @@ async fn dispatch(
 }
 fn error_response(error: EngineError) -> Response {
     let status = match error.sqlstate {
+        "42501" => StatusCode::FORBIDDEN,
+        "0A000" | "42601" | "57014" => StatusCode::BAD_REQUEST,
         "22023" => StatusCode::BAD_REQUEST,
         "42704" | "3D000" => StatusCode::NOT_FOUND,
         "40001" | "55000" | "55P03" => StatusCode::CONFLICT,
@@ -201,6 +235,7 @@ fn decode(
     let route = parts.get(2..).unwrap_or_default();
     if *method == Method::GET {
         let request = match route {
+            ["discovery", id] => ManagementRequest::Discovery(DiscoveryRequest::Get((*id).into())),
             ["virtual-databases"] => ManagementRequest::VirtualDatabases,
             ["virtual-databases", name] => ManagementRequest::VirtualDatabase((*name).into()),
             ["sources"] => ManagementRequest::List,
@@ -224,6 +259,35 @@ fn decode(
             _ => return Err(EngineError::new("42704", "management route does not exist")),
         };
         return Ok((request, false));
+    }
+    if let ["discovery", id] = route {
+        uuid::Uuid::parse_str(id).map_err(|_| EngineError::config("invalid discovery id"))?;
+        if method == Method::POST {
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Start {
+                issued_at: i64,
+                connection: SourceConnection,
+            }
+            let start: Start = serde_json::from_slice(body)
+                .map_err(|_| EngineError::config("invalid instance discovery request"))?;
+            return Ok((
+                ManagementRequest::Discovery(DiscoveryRequest::Start {
+                    id: (*id).into(),
+                    issued_at: start.issued_at,
+                    connection: start.connection,
+                }),
+                true,
+            ));
+        }
+    }
+    if let ["discovery", id, "cancel"] = route
+        && method == Method::POST
+    {
+        return Ok((
+            ManagementRequest::Discovery(DiscoveryRequest::Cancel((*id).into())),
+            true,
+        ));
     }
     let key = headers
         .get("Idempotency-Key")

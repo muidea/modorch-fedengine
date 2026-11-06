@@ -776,6 +776,7 @@ mod tests {
         conn.execute_batch("CREATE SCHEMA _fedengine").unwrap();
         initialize(&conn).unwrap();
         let definition = DataSourceDefinition {
+            organization: None,
             id: DataSourceId("crm".into()),
             kind: DataSourceKind::Postgres,
             catalog_alias: "pg_crm".into(),

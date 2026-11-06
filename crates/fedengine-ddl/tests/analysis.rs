@@ -166,6 +166,7 @@ fn custom_types_nested_writes_and_fake_builtin_tables_are_rejected() {
 fn virtual_schema_bindings_keep_current_database_and_physical_source_distinct() {
     let mut a = analyzer();
     a.namespace = Some(BindingNamespace {
+        routes: None,
         catalog: "fedengine".into(),
         allow_cross_database: false,
         search_path: vec!["missing".into(), "b".into(), "a".into()],

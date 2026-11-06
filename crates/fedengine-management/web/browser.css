@@ -1,0 +1,75 @@
+[hidden] { display: none !important; }
+.database-entry { font-size: 18px; font-weight: 600; padding: 0; }
+.browser-tabs { display: flex; gap: 6px; padding: 10px 16px; border-bottom: 1px solid #f0f0f0; flex-wrap: wrap; }
+.browser-tabs button { border: none; background: transparent; border-radius: 0; }
+.browser-tabs button.active { color: #1677ff; box-shadow: 0 2px #1677ff; background: #e6f4ff; }
+.workspace-tabs { background: white; border: 1px solid #f0f0f0; margin-bottom: 16px; }
+.system-toggle { display: flex; gap: 8px; font-size: 12px; align-items: center; }
+.system-toggle input { width: auto; }
+.tree-toggle { padding: 4px 7px; border: none; }
+#object-area { min-width: 0; }
+#object-area > .notice { margin: 12px 16px; }
+.metadata-facts { display: grid; grid-template-columns: 150px minmax(0,1fr); gap: 10px 18px; }
+.metadata-facts dt { color: #8c8c8c; }
+.metadata-facts dd { margin: 0; overflow-wrap: anywhere; }
+.metadata-code { background: #fafafa; border: 1px solid #f0f0f0; border-radius: 6px; padding: 14px; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 360px; overflow: auto; }
+.browser-pager { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 10px; padding: 14px; color: #8c8c8c; font-size: 12px; }
+.sql-editor { display: block; width: 100%; min-height: 240px; resize: vertical; border: 1px solid #d9d9d9; border-radius: 6px; padding: 16px; line-height: 1.65; font: 14px/1.65 ui-monospace,SFMono-Regular,Consolas,monospace; tab-size: 2; color: #1f1f1f; background: #fafcff; }
+.sql-editor:focus { outline: 2px solid #91caff; border-color: #1677ff; }
+.sql-toolbar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; padding: 14px 0; }
+.sql-toolbar span { font-size: 12px; color: #8c8c8c; }
+.sql-selection { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding-bottom: 12px; }
+.sql-selected-object { flex: 1; min-width: 100px; font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+.sql-help { font-size: 12px; color: var(--muted); flex-basis: 100%; }
+.sql-help summary { cursor: pointer; width: fit-content; }
+.sql-help p { margin: 8px 0 0; }
+.sql-empty { padding: 26px 0; text-align: center; color: var(--tertiary); }
+.sql-status { padding: 12px 0; font-size: 13px; color: #595959; }
+.sql-result { min-width: 0; }
+.metadata-help { padding: 10px 22px; color: var(--muted); font-size: 12px; }
+.metadata-help summary { cursor: pointer; }
+.sql-result td { max-width: 400px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.sql-null { color: #8c8c8c; font-style: italic; background: #fafafa; }
+@media(max-width:760px) {
+  .metadata-facts { grid-template-columns: 100px minmax(0,1fr); gap: 8px; }
+  .sql-editor { padding: 10px; min-height: 210px; }
+  #object-area .toolbar { width: 100%; }
+}
+
+.workspace-body { display: flex; align-items: flex-start; flex: 1; min-width: 0; }
+.workspace-body main { min-width: 0; flex: 1; }
+.database-navigation { flex: 0 0 250px; width: 250px; min-width: 0; padding: 20px 12px; position: sticky; top: 0; background: var(--surface); border-right: 1px solid var(--split); }
+.database-tree-heading { display: flex; align-items: center; justify-content: space-between; padding: 0 4px 12px; }
+#database-search { width: 100%; min-width: 0; margin-bottom: 12px; }
+.database-navigation .system-toggle { margin: 0 4px 12px; color: var(--muted); }
+#database-tree { max-height: calc(100vh - 180px); overflow: auto; scrollbar-gutter: stable; }
+.directory-row { display: flex; gap: 5px; align-items: center; min-width: 0; padding: 3px 4px; border-radius: 4px; }
+.directory-row.selected { background: var(--primary-bg); }
+.database-row.current > .directory-name { font-weight: 600; color: var(--primary); }
+.directory-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+button.directory-name { color: var(--text); }
+.directory-icon { flex: 0 0 14px; color: var(--tertiary); text-align: center; }
+.directory-schemas { margin-left: 10px; }
+.directory-objects { margin-left: 10px; }
+.directory-columns { margin-left: 33px; }
+.directory-columns .directory-name { font-family: ui-monospace,monospace; }
+.column-type { max-width: 65px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; color: var(--tertiary); }
+.directory-stale { color: var(--warning-text); font-size: 10px; }
+.directory-error { padding: 8px; font-size: 12px; overflow-wrap: anywhere; color: var(--error-text); }
+.directory-error button { display: block; }
+#toggle-database-tree { display: none; }
+@media(max-width:1200px) {
+  .database-navigation { flex-basis: 220px; width: 220px; }
+  .database-workspace main { padding-left: 20px; padding-right: 20px; }
+}
+@media(max-width:900px) {
+  .workspace-body { display: block; }
+  #toggle-database-tree { display: inline-block; padding: 5px 7px; font-size: 12px; }
+  .database-navigation { display: none; position: static; width: 100%; border-right: none; border-bottom: 1px solid var(--split); }
+  .directory-open .database-navigation { display: block; }
+  #database-tree { max-height: 40vh; }
+  .topbar { gap: 8px; }
+  .topbar .separator { margin: 0 4px; }
+  .topbar > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .topbar #connection { flex-shrink: 0; max-width: 120px; font-size: 10px; }
+}

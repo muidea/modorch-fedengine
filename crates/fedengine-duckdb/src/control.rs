@@ -63,7 +63,17 @@ pub(super) fn attach(
     let kind = source.kind;
     let extension = kind.extension();
     load_extension(conn, config, kind)?;
-    let secret = resolve(&source.secret_ref, &config.management.credentials_directory)?;
+    let secret = if let Some(target) = &source.organization {
+        crate::credentials::target_dsn(
+            &source.secret_ref,
+            &config.management.credentials_directory,
+            kind,
+            &target.instance,
+            Some(&target.database),
+        )?
+    } else {
+        resolve(&source.secret_ref, &config.management.credentials_directory)?
+    };
     conn.execute_batch(&format!(
         "ATTACH {} AS {} (TYPE {extension}{})",
         quote_literal(&secret),

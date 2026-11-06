@@ -72,6 +72,9 @@ jobs:
       - name: Check management JavaScript
         run: |
           node --check crates/fedengine-management/web/app.js
+          node --check crates/fedengine-management/web/browser.js
+          node --check crates/fedengine-management/web/navigator.js
+          node --check crates/fedengine-management/web/organization.js
           node --check scripts/web-smoke.mjs
       - uses: Swatinem/rust-cache@v2
         with:

@@ -19,6 +19,7 @@ impl ProtocolEngine {
     ) -> std::result::Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         config.validate()?;
         let fixture = DataSourceDefinition {
+            organization: None,
             id: DataSourceId("protocol_fixture".into()),
             kind: DataSourceKind::Postgres,
             catalog_alias: "protocol_db".into(),

@@ -4,6 +4,8 @@
 
 状态：P0–P4 已实现。本文细化[详细设计 v1.1](FedEngine_详细设计文档_v1.1.md)第 7 节，保留在线管理的行为约束；实现落点与验证覆盖见第 11 节，调用方式见[管理 API](management-api.md)。
 
+本轮新增的实例级接入、虚拟库自定义命名、同源数据库合并及 MySQL database→Schema 规则见[数据源与虚拟数据库组织调整](source-database-organization-plan.md)。该调整已接入当前代码；本文后续的数据源指单个受管执行目标，实例登记可展开多个目标，自动虚拟库的身份、合并与权限规则以该组织文档为准。
+
 ## 1. 已确认的范围
 
 - 支持 PostgreSQL、MySQL 数据源，以及外部 schema 的在线接入、刷新、停用和移除，无需重启 FedEngine。
@@ -11,7 +13,7 @@
 - 暂不建设数据权限管理，不新增角色、授权、行列权限或权限管理接口。
 - 直接使用 DuckDB 持久化管理数据，不引入 SQLite 或独立数据库服务。
 - 复用一个进程内 DuckDB 实例和本地数据库文件；查询与管理使用不同连接、不同执行入口。
-- 第一版提供管理 HTTP API，业务 SQL 继续使用 PGWire。管理入口默认监听 loopback；本阶段不提供管理 UI。
+- 第一版提供管理 HTTP API，业务 SQL 继续使用 PGWire。管理入口默认监听 loopback；提供内置轻量 Web 管理端。
 - 保留 `catalog.schema.object` 命名，不提供任意 schema 重命名，不自动纳入新发现的 schema。
 - 移除登记不执行远端 `DROP DATABASE`、`DROP SCHEMA` 或 `DROP TABLE`。
 
@@ -40,15 +42,15 @@
 - `id`：稳定的管理标识。
 - `incarnation`：本次登记的唯一身份；删除重建不得沿用旧身份。
 - `kind`：`postgres` 或 `mysql`。
-- `catalog_alias`：SQL 使用的 catalog 名称，在当前应用中唯一。
-- `secret_ref`：完整连接串的凭据引用，保持与现有配置兼容。
+- `catalog_alias`：执行层唯一别名；自动组织目标不将其作为对外数据库名。
+- `secret_ref`：凭据引用；自动组织目标解析为结构化凭据 JSON，显式执行目标可直接引用完整连接串。
 - `default_schema`：默认绑定 schema，必须属于已纳入且启用的范围。
 - `desired_revision`、`applied_revision`：期望版本和实际生效版本。
 - `desired_enabled`：期望启停状态；实际连接状态单独表示。
 
 第一版不支持修改 `id`、`kind` 和 `catalog_alias`；需要变更时先停用旧源，再登记新源。连接引用及 schema 范围可以在线修改。
 
-PostgreSQL 的一个数据源对应一个 database，可纳入其中多个 schema。第一版 MySQL 的一个数据源限定为一个明确 database，不因数据库位于同一服务器就合并源身份。MySQL schema/database 的实际映射必须通过目标扩展版本的集成验证。
+PostgreSQL 的一个数据源对应一个 database，可纳入其中多个 schema。MySQL 的一个执行目标限定为一个明确 database；同一连接登记可展开多个目标，并按源库名映射为同一虚拟库下的 Schema。不同贡献继续保留独立执行身份。MySQL schema/database 的实际映射必须通过目标扩展版本的集成验证。
 
 ### 3.2 Schema 绑定
 

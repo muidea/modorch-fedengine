@@ -27,6 +27,7 @@ pub struct BindingNamespace {
     pub catalog: String,
     pub allow_cross_database: bool,
     pub bindings: std::collections::BTreeMap<String, (DataSourceId, String)>,
+    pub routes: Option<std::collections::BTreeMap<(String, String), (DataSourceId, String)>>,
     pub search_path: Vec<String>,
     pub relations: RelationNames,
 }

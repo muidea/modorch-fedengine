@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 /// Hash serialized facts without retaining a second full JSON payload.
-fn fact_digest(value: &impl serde::Serialize) -> String {
+pub(super) fn fact_digest(value: &impl serde::Serialize) -> String {
     struct HashWriter(Sha256);
     impl std::io::Write for HashWriter {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -24,6 +24,110 @@ fn fact_digest(value: &impl serde::Serialize) -> String {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
+}
+
+/// Comparable source definitions, independent of local OIDs, counters and scan timestamps.
+/// Only borrowed per-object fields are staged; do not clone a catalog graph.
+pub(super) fn object_definition_digest(object: &CatalogObject) -> String {
+    let metadata = &object.metadata;
+    let columns = metadata
+        .columns
+        .iter()
+        .map(|(name, p)| {
+            (
+                name,
+                &p.source_id,
+                p.type_modifier,
+                &p.default,
+                &p.identity,
+                &p.generated,
+                &p.comment,
+            )
+        })
+        .collect::<Vec<_>>();
+    let constraints = metadata
+        .constraints
+        .iter()
+        .map(|c| {
+            (
+                &c.source_id,
+                &c.name,
+                &c.kind,
+                &c.columns,
+                &c.backing_index,
+                c.foreign_key.as_ref().map(|f| {
+                    (
+                        &f.schema,
+                        &f.table,
+                        &f.columns,
+                        &f.on_update,
+                        &f.on_delete,
+                        &f.match_type,
+                    )
+                }),
+                &c.definition,
+                c.enforced,
+                c.validated,
+                c.deferrable,
+                c.initially_deferred,
+            )
+        })
+        .collect::<Vec<_>>();
+    let indexes = metadata
+        .indexes
+        .iter()
+        .map(|i| {
+            (
+                &i.source_id,
+                &i.name,
+                &i.method,
+                i.unique,
+                i.primary,
+                i.valid,
+                i.enabled,
+                i.nulls_not_distinct,
+                &i.keys,
+                &i.include,
+                &i.predicate,
+                &i.definition,
+            )
+        })
+        .collect::<Vec<_>>();
+    let statuses = metadata
+        .status
+        .iter()
+        .filter(|(name, _)| {
+            !matches!(
+                name.as_str(),
+                "statistics" | "storage" | "activity" | "column_statistics"
+            )
+        })
+        .map(|(name, s)| {
+            (
+                name,
+                s.support,
+                s.scan_state,
+                s.complete,
+                s.stale,
+                &s.error_code,
+                &s.unsupported_fields,
+            )
+        })
+        .collect::<Vec<_>>();
+    fact_digest(&(
+        &object.schema,
+        &object.name,
+        &object.object_type,
+        &metadata.source_id,
+        &object.columns,
+        &metadata.comment,
+        columns,
+        constraints,
+        indexes,
+        &metadata.view_definition,
+        &metadata.view_dependencies,
+        statuses,
+    ))
 }
 
 /// Bound accounted metadata payload without allocating another serialized copy.
@@ -261,7 +365,7 @@ fn read_core(
 ) -> Result<CoreObjects> {
     let mut objects = BTreeMap::new();
     let query = if source.kind == DataSourceKind::Postgres {
-        "SELECT n.nspname AS table_schema,c.relname AS table_name,CASE c.relkind WHEN 'v' THEN 'VIEW' WHEN 'm' THEN 'MATERIALIZED VIEW' WHEN 'f' THEN 'FOREIGN TABLE' ELSE 'BASE TABLE' END AS table_type,c.oid::text AS source_id FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind IN ('r','v','m','f','p') ORDER BY n.nspname,c.relname"
+        "SELECT n.nspname AS table_schema,c.relname AS table_name,CASE c.relkind WHEN 'v' THEN 'VIEW' WHEN 'm' THEN 'MATERIALIZED VIEW' WHEN 'f' THEN 'FOREIGN TABLE' ELSE 'BASE TABLE' END AS table_type,c.oid::text AS source_id FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind IN ('r','v','m','f','p') AND has_schema_privilege(current_user,n.oid,'USAGE') AND has_table_privilege(current_user,c.oid,'SELECT') ORDER BY n.nspname,c.relname"
     } else {
         "SELECT table_schema, table_name, table_type,NULL AS source_id FROM information_schema.tables WHERE table_schema=DATABASE() ORDER BY table_schema, table_name"
     };
@@ -295,7 +399,7 @@ fn read_core(
         }
     }
     let query = if source.kind == DataSourceKind::Postgres {
-        "SELECT n.nspname AS table_schema,c.relname AS table_name,a.attname AS column_name,a.attnum AS ordinal_position,pg_catalog.format_type(a.atttypid,a.atttypmod) AS data_type,CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END AS is_nullable FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace JOIN pg_catalog.pg_attribute a ON a.attrelid=c.oid WHERE a.attnum>0 AND NOT a.attisdropped AND c.relkind IN ('r','v','m','f','p') ORDER BY n.nspname,c.relname,a.attnum"
+        "SELECT n.nspname AS table_schema,c.relname AS table_name,a.attname AS column_name,a.attnum AS ordinal_position,pg_catalog.format_type(a.atttypid,a.atttypmod) AS data_type,CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END AS is_nullable FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace JOIN pg_catalog.pg_attribute a ON a.attrelid=c.oid WHERE a.attnum>0 AND NOT a.attisdropped AND c.relkind IN ('r','v','m','f','p') AND has_schema_privilege(current_user,n.oid,'USAGE') AND has_table_privilege(current_user,c.oid,'SELECT') ORDER BY n.nspname,c.relname,a.attnum"
     } else {
         "SELECT table_schema,table_name,column_name,ordinal_position,column_type AS data_type,is_nullable FROM information_schema.columns WHERE table_schema=DATABASE() ORDER BY table_schema,table_name,ordinal_position"
     };
@@ -361,6 +465,57 @@ fn scoped_query(source: &DataSourceDefinition, query: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn merged_object_digest_ignores_local_identity_and_scan_counters() {
+        let page: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/metadata/published-pg16-directory.json"
+        ))
+        .unwrap();
+        let mut objects: Vec<CatalogObject> =
+            serde_json::from_value(page["objects"].clone()).unwrap();
+        let original = objects.pop().unwrap();
+        let expected = object_definition_digest(&original);
+        let mut local = original.clone();
+        local.metadata.oid += 1;
+        local.metadata.storage.main_bytes = Some(12345);
+        local.metadata.activity.seq_scan = Some(99);
+        local.metadata.statistics.pages = Some(100);
+        local
+            .metadata
+            .status
+            .insert("statistics".into(), MetadataStatus::success());
+        for status in local.metadata.status.values_mut() {
+            status.last_attempt_at = None;
+            status.last_success_at = None;
+        }
+        for column in local.metadata.columns.values_mut() {
+            column.default_oid += 1;
+            column.type_oid += 1;
+            column.attnum += 1;
+        }
+        for constraint in &mut local.metadata.constraints {
+            constraint.oid += 1;
+            if let Some(foreign_key) = &mut constraint.foreign_key {
+                foreign_key.reference_state = MetadataReferenceState::OutsideScope;
+            }
+        }
+        for index in &mut local.metadata.indexes {
+            index.oid += 1;
+            index.storage.main_bytes = Some(23456);
+            index.activity.idx_scan = Some(88);
+        }
+        assert_eq!(object_definition_digest(&local), expected);
+        let mut changed = original.clone();
+        changed.metadata.columns.get_mut("amount").unwrap().default =
+            MetadataExpression::source("42".into(), DataSourceKind::Postgres);
+        assert_ne!(object_definition_digest(&changed), expected);
+        let mut changed = original.clone();
+        changed.metadata.constraints[0].validated = Some(false);
+        assert_ne!(object_definition_digest(&changed), expected);
+        let mut changed = original;
+        changed.metadata.indexes[0].valid = Some(false);
+        assert_ne!(object_definition_digest(&changed), expected);
+    }
     #[test]
     fn definition_digest_tracks_binding_changes_but_not_statistics() {
         let page: serde_json::Value = serde_json::from_str(include_str!(

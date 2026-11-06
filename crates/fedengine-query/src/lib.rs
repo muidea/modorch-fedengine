@@ -254,6 +254,8 @@ impl QueryHandler {
         };
         let mut relations = fedengine_ddl::RelationNames::default();
         let mut bindings = std::collections::BTreeMap::new();
+        let mut routes = std::collections::BTreeMap::new();
+        let mut authorized_routes = std::collections::BTreeSet::new();
         for catalog in scope
             .catalogs
             .iter()
@@ -279,7 +281,29 @@ impl QueryHandler {
                 );
             }
             match names.as_ref() {
-                Ok(CatalogReply::Names(names)) => relations.extend_shared(names.clone()),
+                Ok(CatalogReply::Names(names)) => {
+                    for (schema, object) in names.iter() {
+                        let allowed = catalog.grants.iter().any(|g| {
+                            g.actions.contains("SELECT")
+                                && (g.schema == "*" || &g.schema == schema)
+                                && (g.object == "*" || &g.object == object)
+                        });
+                        let remote = catalog
+                            .mapping
+                            .as_ref()
+                            .map(|m| m.remote_schema.clone())
+                            .unwrap_or_else(|| schema.clone());
+                        let key = (schema.clone(), object.clone());
+                        // Resolve an existing object even without SELECT, so policy
+                        // returns 42501. Prefer the first authorized contribution.
+                        if (allowed && authorized_routes.insert(key.clone()))
+                            || !routes.contains_key(&key)
+                        {
+                            routes.insert(key, (catalog.id.clone(), remote));
+                        }
+                    }
+                    relations.extend_shared(names.clone());
+                }
                 Err(e) => return Err(e.clone()),
                 _ => return Err(EngineError::new("XX000", "invalid catalog names reply")),
             }
@@ -307,6 +331,7 @@ impl QueryHandler {
             search_path: fedengine_pg_compat::effective_path(&r.session, &scope),
             relations,
             bindings,
+            routes: scope.virtual_database.as_ref().map(|_| routes),
         });
         // Inspect the actual AST to discover DROP INDEX ownership; never trust textual prefixes.
         let statements = Analyzer::parse(&business_sql)?;

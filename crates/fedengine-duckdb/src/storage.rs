@@ -28,6 +28,21 @@ fn decode_object(payload: &[u8]) -> Result<(String, CatalogObject)> {
     let reader = flate2::read::ZlibDecoder::new(payload).take(512 * 1024 * 1024 + 1);
     serde_json::from_reader(std::io::BufReader::new(reader)).map_err(|_| storage_error())
 }
+fn decode_interactive_object(payload: &[u8], limit: usize) -> Result<(String, CatalogObject)> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    flate2::read::ZlibDecoder::new(payload)
+        .take(limit.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| storage_error())?;
+    if bytes.len() > limit {
+        return Err(EngineError::new(
+            "54000",
+            "object metadata exceeds browser decompression budget",
+        ));
+    }
+    serde_json::from_slice(&bytes).map_err(|_| storage_error())
+}
 
 #[derive(Default)]
 pub(super) struct CatalogViews {
@@ -267,6 +282,40 @@ impl ManagementStore for DuckdbStore {
             .await
             .map_err(framework_error)?
     }
+    async fn directory_summaries(
+        &self,
+        r: DirectorySummaryRequest,
+    ) -> Result<Vec<DirectorySummary>> {
+        if r.limit == 0 || r.limit > 1000 || r.offset > 1_000_000 || r.scopes.len() > 128 {
+            return Err(EngineError::config(
+                "invalid summary pagination or scope bounds",
+            ));
+        }
+        if r.scopes.is_empty() {
+            return Ok(vec![]);
+        }
+        let root = self.root.clone();
+        self.tasks.spawn_blocking_io(move |_| {
+            let conn = root.lock().unwrap().try_clone().map_err(engine_error).map_err(fw)?;
+            Ok(local_read(&conn, |conn| {
+                let selections = r.scopes.iter().enumerate().map(|(rank,scope)| {
+                    let names = scope.names.as_ref().map(|names| format!(" AND object_name IN (SELECT unnest(CAST({} AS VARCHAR[])))", quote_literal(&serde_json::to_string(names).unwrap()))).unwrap_or_default();
+                    format!("SELECT object_name,object_type,snapshot_id,fact_digest,{rank} AS rank FROM _fedengine.catalog_objects WHERE snapshot_id={} AND schema_name={}{names}",quote_literal(&scope.snapshot_id),quote_literal(&scope.schema))
+                }).collect::<Vec<_>>().join(" UNION ALL ");
+                // Canonicalize before filtering kind; contradictory source snapshots cannot make a second copy visible.
+                let sql = format!("WITH eligible AS ({selections}), merged AS (SELECT object_name,arg_min(object_type,rank) AS object_type,arg_min(snapshot_id,rank) AS snapshot_id,to_json(list(DISTINCT snapshot_id ORDER BY snapshot_id))::VARCHAR AS contributors,count(DISTINCT fact_digest)>1 AS conflict FROM eligible GROUP BY object_name) SELECT object_name,object_type,snapshot_id,contributors,conflict FROM merged WHERE strpos(lower(object_name),lower(?))>0 AND (?='' OR (?='view' AND upper(object_type) LIKE '%VIEW%') OR (?='table' AND upper(object_type) NOT LIKE '%VIEW%')) ORDER BY object_name LIMIT ? OFFSET ?");
+                let mut stmt = conn.prepare(&sql).map_err(engine_error)?;
+                let mut rows = stmt.query(params![r.search,r.kind,r.kind,r.kind,r.limit as i64,r.offset as i64]).map_err(engine_error)?;
+                let mut result = Vec::new();
+                while let Some(row) = rows.next().map_err(engine_error)? {
+                    let contributors: String = row.get(3).map_err(engine_error)?;
+                    result.push(DirectorySummary{name:row.get(0).map_err(engine_error)?,object_type:row.get(1).map_err(engine_error)?,snapshot_id:row.get(2).map_err(engine_error)?,contributors:serde_json::from_str(&contributors).map_err(|_|storage_error())?,conflict:row.get(4).map_err(engine_error)?});
+                }
+                Ok(result)
+            }))
+        }).map_err(framework_error)?.wait_finished().await.map_err(framework_error)?
+    }
+
     async fn read(&self) -> Result<ManagementState> {
         let root = self.root.clone();
         self.tasks
@@ -415,7 +464,10 @@ fn read_directory(conn: &Connection, r: &DirectoryRequest) -> Result<CatalogPage
         let mut objects = Vec::new();
         while let Some(row) = rows.next().map_err(engine_error)? {
             let payload: Vec<u8> = row.get(0).map_err(engine_error)?;
-            let (_, object) = decode_object(&payload)?;
+            let (_, object) = match r.object_bytes_limit {
+                Some(limit) => decode_interactive_object(&payload, limit)?,
+                None => decode_object(&payload)?,
+            };
             objects.push(object);
         }
         Ok(CatalogPage {
@@ -727,6 +779,13 @@ fn write_catalogs(
                 V::Text(object.schema.clone()),
                 V::Text(object.name.clone()),
                 V::Text(object.object_type.clone()),
+                object
+                    .metadata
+                    .source_id
+                    .clone()
+                    .map(V::Text)
+                    .unwrap_or(V::Null),
+                V::Text(crate::catalog::object_definition_digest(object)),
                 V::Blob(encode_object(id, object)?),
             ]))
             .map_err(engine_error)?;
@@ -852,6 +911,10 @@ fn write_changes(
     after: &ManagementState,
 ) -> Result<()> {
     validate_state(after)?;
+    // Native identity columns must be available to virtual projections, including
+    // first publication. Both indexed facts and projections remain unpublished
+    // until this transaction commits.
+    write_catalogs(conn, before, after)?;
     for snapshot in after.catalogs.values() {
         let source = after
             .sources
@@ -882,7 +945,6 @@ fn write_changes(
         &before.operations,
         &after.operations,
     )?;
-    write_catalogs(conn, before, after)?;
     Ok(())
 }
 fn reuse_unchanged_snapshots(
@@ -982,7 +1044,7 @@ pub(super) fn initialize(conn: &Connection, config: &Config) -> Result<()> {
             |r| r.get(0),
         )
         .map_err(engine_error)?;
-    if version != 0 && version != 6 {
+    if version != 0 && version != 7 {
         return Err(EngineError::config(
             "management schema version does not match this program",
         ));
@@ -1000,13 +1062,14 @@ pub(super) fn initialize(conn: &Connection, config: &Config) -> Result<()> {
         ] {
             conn.execute_batch(&format!("CREATE TABLE IF NOT EXISTS _fedengine.{table}(key VARCHAR PRIMARY KEY, payload VARCHAR NOT NULL)")).map_err(engine_error)?;
         }
-        conn.execute_batch("CREATE TABLE IF NOT EXISTS _fedengine.catalog_objects(key VARCHAR PRIMARY KEY,snapshot_id VARCHAR NOT NULL,schema_name VARCHAR NOT NULL,object_name VARCHAR NOT NULL,object_type VARCHAR NOT NULL,payload BLOB NOT NULL)").map_err(engine_error)?;
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS _fedengine.catalog_objects(key VARCHAR PRIMARY KEY,snapshot_id VARCHAR NOT NULL,schema_name VARCHAR NOT NULL,object_name VARCHAR NOT NULL,object_type VARCHAR NOT NULL,native_id VARCHAR,fact_digest VARCHAR NOT NULL,payload BLOB NOT NULL)").map_err(engine_error)?;
         crate::identity::initialize(conn)?;
         crate::projection::initialize(conn)?;
+        crate::projection::initialize_roles(conn, &config.users)?;
         crate::virtuals::initialize(conn, config)?;
         if version == 0 {
             conn.execute(
-                "INSERT INTO _fedengine.schema_migrations VALUES (6, ?)",
+                "INSERT INTO _fedengine.schema_migrations VALUES (7, ?)",
                 [chrono::Utc::now().to_rfc3339()],
             )
             .map_err(engine_error)?;
@@ -1025,6 +1088,18 @@ pub(super) fn initialize(conn: &Connection, config: &Config) -> Result<()> {
                 .map(|b| format!("{b:02x}"))
                 .collect::<String>();
             for definition in &config.datasources {
+                validate_organization(&after, definition)?;
+                if definition.organization.as_ref().is_some_and(|target| {
+                    !config.users.iter().any(|u| u.name == target.owner)
+                        || target
+                            .connect
+                            .iter()
+                            .any(|name| !config.users.iter().any(|u| &u.name == name))
+                }) {
+                    return Err(EngineError::config(
+                        "unknown automatic database owner or CONNECT principal",
+                    ));
+                }
                 let incarnation = uuid::Uuid::new_v4().to_string();
                 let revision = SourceRevision {
                     incarnation: incarnation.clone(),
@@ -1107,6 +1182,33 @@ pub(super) fn initialize(conn: &Connection, config: &Config) -> Result<()> {
 mod tests {
     use super::*;
     #[test]
+    fn interactive_metadata_bounds_decompression_before_json_materialization() {
+        let object = CatalogObject {
+            schema: "public".into(),
+            name: "wide".into(),
+            object_type: "TABLE".into(),
+            columns: vec![],
+            indexes: vec![],
+            metadata: ObjectMetadata {
+                comment: Some("x".repeat(16384)),
+                ..Default::default()
+            },
+        };
+        let payload = encode_object("snapshot", &object).unwrap();
+        assert!(payload.len() < 1024);
+        assert_eq!(
+            decode_interactive_object(&payload, 1024)
+                .unwrap_err()
+                .sqlstate,
+            "54000"
+        );
+        assert_eq!(
+            decode_interactive_object(&payload, 32768).unwrap().1,
+            object
+        );
+    }
+
+    #[test]
     fn snapshot_name_cache_shares_indexes_and_bounds_retained_entries() {
         let mut cache = CatalogViews::default();
         let large: SnapshotNames = Arc::new(
@@ -1132,6 +1234,7 @@ mod tests {
         )
         .unwrap();
         config.datasources = vec![DataSourceDefinition {
+            organization: None,
             id: DataSourceId("source".into()),
             kind: DataSourceKind::Postgres,
             catalog_alias: "source".into(),
@@ -1206,7 +1309,7 @@ mod tests {
         initialize(&conn, &config).unwrap();
         // Poisoned payload makes any accidental full-state read fail deterministically.
         conn.execute(
-            "INSERT INTO _fedengine.catalog_objects VALUES ('unrelated','unrelated','public','poison','BASE TABLE','not compressed'::BLOB)",
+            "INSERT INTO _fedengine.catalog_objects VALUES ('unrelated','unrelated','public','poison','BASE TABLE',NULL,'test','not compressed'::BLOB)",
             [],
         )
         .unwrap();
@@ -1249,8 +1352,9 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
         let source = DataSourceDefinition {
+            organization: None,
             id: DataSourceId("must_not_reappear".into()),
             kind: DataSourceKind::Postgres,
             catalog_alias: "pg_test".into(),

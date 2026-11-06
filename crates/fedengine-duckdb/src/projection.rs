@@ -197,12 +197,21 @@ pub(super) fn initialize(conn: &Connection) -> Result<()> {
             "",
             "",
             "",
-            json!({"oid":oid,"nspname":name,"nspowner":0}),
+            json!({"oid":oid,"nspname":name,"nspowner":10}),
+        );
+        push(
+            &mut rows,
+            "information_schema.schemata",
+            "",
+            "",
+            "",
+            "",
+            json!({"catalog_name":"","schema_name":name,"schema_owner":"fedengine_system"}),
         );
     }
     for value in builtin_types() {
         let mut value = value.clone();
-        value["typowner"] = json!(0);
+        value["typowner"] = json!(10);
         value["typacl"] = Value::Null;
         push(&mut rows, "pg_type", "", "", "", "", value);
     }
@@ -213,6 +222,23 @@ pub(super) fn initialize(conn: &Connection) -> Result<()> {
         } else {
             (11, name.as_str())
         };
+        let kind = if name.contains('.')
+            || matches!(
+                name.as_str(),
+                "pg_roles"
+                    | "pg_settings"
+                    | "pg_tables"
+                    | "pg_views"
+                    | "pg_matviews"
+                    | "pg_indexes"
+                    | "pg_stats"
+            )
+            || name.starts_with("pg_stat_")
+        {
+            "v"
+        } else {
+            "r"
+        };
         push(
             &mut rows,
             "pg_class",
@@ -220,7 +246,21 @@ pub(super) fn initialize(conn: &Connection) -> Result<()> {
             "",
             "",
             "",
-            json!({"oid":oid,"relname":relname,"relnamespace":schema,"relkind":"r","relpersistence":"p","relowner":0,"relnatts":fields.len(),"relhasindex":false,"relchecks":0,"relispartition":false,"relrowsecurity":false,"relforcerowsecurity":false,"relispopulated":true}),
+            json!({"oid":oid,"relname":relname,"relnamespace":schema,"relkind":kind,"relpersistence":"p","relowner":10,"relnatts":fields.len(),"relhasindex":false,"relchecks":0,"relispartition":false,"relrowsecurity":false,"relforcerowsecurity":false,"relispopulated":true}),
+        );
+        let schema_name = if schema == 11 {
+            "pg_catalog"
+        } else {
+            "information_schema"
+        };
+        push(
+            &mut rows,
+            "information_schema.tables",
+            "",
+            "",
+            "",
+            "",
+            json!({"table_catalog":"","table_schema":schema_name,"table_name":relname,"table_type":if kind == "v" {"VIEW"}else{"BASE TABLE"},"is_insertable_into":"NO","is_typed":"NO"}),
         );
         for f in fields {
             push(
@@ -231,6 +271,15 @@ pub(super) fn initialize(conn: &Connection) -> Result<()> {
                 "",
                 "",
                 json!({"attrelid":oid,"attname":f.attname,"atttypid":f.atttypid,"attnum":f.attnum,"atttypmod":f.atttypmod,"attnotnull":false,"attisdropped":false,"attidentity":"","attgenerated":"","attndims":if f.duckdb_type().ends_with("[]"){1}else{0},"atthasdef":false,"attislocal":true,"attinhcount":0,"attlen":type_len(f.atttypid)}),
+            );
+            push(
+                &mut rows,
+                "information_schema.columns",
+                "",
+                "",
+                "",
+                "",
+                json!({"table_catalog":"","table_schema":schema_name,"table_name":relname,"column_name":f.attname,"ordinal_position":f.attnum,"is_nullable":"YES","data_type":if f.pg_type.ends_with("[]") || matches!(f.atttypid,22|30|2277) { "ARRAY" } else { &f.pg_type },"udt_catalog":"","udt_schema":"pg_catalog","udt_name":builtin_types().iter().find(|t|t["oid"]==f.atttypid).and_then(|t|t["typname"].as_str()),"is_identity":"NO","is_generated":"NEVER","is_updatable":"NO"}),
             );
         }
     }
@@ -255,6 +304,34 @@ pub(super) fn initialize(conn: &Connection) -> Result<()> {
     }
     insert(conn, rows)?;
     Ok(())
+}
+
+/// Configured login roles use the same durable, non-recycled OID allocator as objects.
+pub(super) fn initialize_roles(conn: &Connection, users: &[UserConfig]) -> Result<()> {
+    let mut rows = Rows::new();
+    for (name, oid, login) in std::iter::once(("fedengine_system".to_string(), 10, false)).chain(
+        users
+            .iter()
+            .map(|user| {
+                Ok((
+                    user.name.clone(),
+                    crate::identity::oid(conn, "login-role", &[&user.name])?,
+                    true,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?,
+    ) {
+        push(
+            &mut rows,
+            "pg_roles",
+            "",
+            "",
+            "",
+            "",
+            json!({"oid":oid,"rolname":name,"rolcanlogin":login,"rolsuper":false,"rolinherit":true,"rolcreaterole":false,"rolcreatedb":false,"rolreplication":false,"rolbypassrls":false,"rolconnlimit":-1}),
+        );
+    }
+    insert(conn, rows)
 }
 fn type_len(oid: u32) -> i16 {
     builtin_types()
@@ -1072,6 +1149,7 @@ mod tests {
         conn.execute_batch("CREATE SCHEMA _fedengine; SET lambda_syntax='ENABLE_SINGLE_ARROW'")
             .unwrap();
         initialize(&conn).unwrap();
+        crate::functions::register(&conn).unwrap();
         let session = SessionContext {
             database: "pg_baseline".into(),
             ..Default::default()
@@ -1114,6 +1192,7 @@ mod tests {
             database: session.database.clone(),
             principal: "test".into(),
             catalogs: vec![VisibleCatalog {
+                internal: false,
                 id: DataSourceId("baseline".into()),
                 catalog: "pg_baseline".into(),
                 snapshot_id: "fixture".into(),
@@ -1217,6 +1296,122 @@ mod tests {
                 .is_some()
             {}
         }
+        // Raw catalogs describe existence; information_schema and SELECT privileges
+        // remain sensitive to grants. System objects are part of both SQL directories.
+        let mut unprivileged = scope.clone();
+        unprivileged.catalogs[0].grants.clear();
+        let query = |sql: &str, session: &SessionContext, scope: &MetadataScope| {
+            let CompatibilityPlan::Metadata(plan) =
+                plan_compatibility(sql, session, scope, 1).unwrap()
+            else {
+                panic!("not metadata")
+            };
+            plan.sql
+        };
+        for (sql, expected) in [
+            ("SELECT count(*) FROM pg_namespace WHERE nspname='sales'", 1),
+            ("SELECT count(*) FROM pg_class WHERE relname='customers'", 1),
+            (
+                "SELECT count(*) FROM information_schema.schemata WHERE schema_name='sales'",
+                0,
+            ),
+            (
+                "SELECT count(*) FROM information_schema.tables WHERE table_schema='sales'",
+                0,
+            ),
+            (
+                "SELECT count(*) FROM information_schema.columns WHERE table_schema='sales'",
+                0,
+            ),
+            (
+                "SELECT count(*) FROM information_schema.schemata WHERE schema_name IN ('pg_catalog','information_schema')",
+                2,
+            ),
+            (
+                "SELECT count(*) FROM information_schema.tables WHERE table_schema='pg_catalog' AND table_name='pg_class'",
+                1,
+            ),
+            (
+                "SELECT count(*) FROM information_schema.columns WHERE table_schema='pg_catalog' AND table_name='pg_class' AND column_name='oid'",
+                1,
+            ),
+        ] {
+            let actual: i64 = conn
+                .query_row(&query(sql, &session, &unprivileged), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(actual, expected, "{sql}");
+        }
+        for (sql, scope, expected) in [
+            (
+                "SELECT has_schema_privilege('sales','USAGE')",
+                &unprivileged,
+                false,
+            ),
+            ("SELECT has_schema_privilege('sales','USAGE')", &scope, true),
+            (
+                "SELECT has_schema_privilege('sales','CREATE,usage')",
+                &scope,
+                true,
+            ),
+            (
+                "SELECT has_schema_privilege('sales','USAGE WITH GRANT OPTION')",
+                &scope,
+                false,
+            ),
+            (
+                "SELECT has_table_privilege('sales.orders','SELECT')",
+                &unprivileged,
+                false,
+            ),
+            (
+                "SELECT has_table_privilege('sales.orders','SELECT')",
+                &scope,
+                true,
+            ),
+            (
+                "SELECT has_table_privilege('pg_catalog.pg_class','SELECT')",
+                &unprivileged,
+                true,
+            ),
+        ] {
+            let actual: bool = conn
+                .query_row(&query(sql, &session, scope), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(actual, expected, "{sql}");
+        }
+        for sql in [
+            "SELECT has_schema_privilege('sales','NOT_USAGE')",
+            "SELECT has_table_privilege('sales.orders','BAD')",
+        ] {
+            let error = conn
+                .query_row(&query(sql, &session, &scope), [], |r| r.get::<_, bool>(0))
+                .unwrap_err();
+            assert_eq!(engine_error(error).sqlstate, "22023");
+        }
+        let parameterized = query("SELECT has_schema_privilege($1,$2)", &session, &scope);
+        let error = conn
+            .query_row(&parameterized, ["sales", "NOT_USAGE"], |r| {
+                r.get::<_, bool>(0)
+            })
+            .unwrap_err();
+        assert_eq!(engine_error(error).sqlstate, "22023");
+        let outside_path = SessionContext {
+            search_path: Some(vec![]),
+            ..session.clone()
+        };
+        for (column, alias) in [("c.oid", "c"), ("r.oid", "r"), ("oid", "c")] {
+            let sql = format!(
+                "SELECT pg_table_is_visible({column}) FROM pg_class {alias} WHERE {alias}.relname='orders'"
+            );
+            let actual: bool = conn
+                .query_row(&query(&sql, &outside_path, &scope), [], |r| r.get(0))
+                .unwrap();
+            assert!(!actual, "{sql}");
+            let actual: bool = conn
+                .query_row(&query(&sql, &session, &scope), [], |r| r.get(0))
+                .unwrap();
+            assert!(actual, "{sql}");
+        }
         let mut limited = scope.clone();
         limited.catalogs[0].grants[0].schema = "sales".into();
         limited.catalogs[0].grants[0].object = "orders".into();
@@ -1284,7 +1479,6 @@ mod tests {
         );
         for (sql, check_scope) in [
             ("SELECT pg_total_relation_size('sales.missing')", &scope),
-            ("SELECT pg_total_relation_size('sales.customers')", &limited),
             ("SELECT 'sales.missing'::regclass", &scope),
         ] {
             let CompatibilityPlan::Metadata(plan) =
@@ -1346,14 +1540,14 @@ mod tests {
                 "SELECT count(*) FROM pg_class WHERE relname='customers'",
                 &limited
             ),
-            0
+            1
         );
         assert_eq!(
             scalar(
                 "SELECT count(*) FROM pg_constraint WHERE contype='f'",
                 &limited
             ),
-            0
+            1
         );
         assert_eq!(
             scalar(
@@ -1535,6 +1729,7 @@ mod tests {
             database: "scale".into(),
             principal: "bench".into(),
             catalogs: vec![VisibleCatalog {
+                internal: false,
                 id: DataSourceId("scale".into()),
                 catalog: "scale".into(),
                 snapshot_id: "scale".into(),

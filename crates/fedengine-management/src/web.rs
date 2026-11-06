@@ -64,3 +64,30 @@ pub(crate) fn same_origin(headers: &HeaderMap) -> bool {
             .any(|scheme| origin.strip_prefix(scheme) == Some(host))
     })
 }
+
+pub(crate) async fn browser_javascript() -> Response {
+    asset(
+        "text/javascript; charset=utf-8",
+        include_str!("../web/browser.js"),
+    )
+}
+pub(crate) async fn browser_stylesheet() -> Response {
+    asset(
+        "text/css; charset=utf-8",
+        include_str!("../web/browser.css"),
+    )
+}
+
+pub(crate) async fn organization_javascript() -> Response {
+    asset(
+        "text/javascript; charset=utf-8",
+        include_str!("../web/organization.js"),
+    )
+}
+
+pub(crate) async fn navigator_javascript() -> Response {
+    asset(
+        "text/javascript; charset=utf-8",
+        include_str!("../web/navigator.js"),
+    )
+}

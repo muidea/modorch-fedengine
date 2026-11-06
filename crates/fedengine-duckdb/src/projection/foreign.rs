@@ -8,6 +8,7 @@ pub(crate) struct ForeignProjection<'a> {
     pub source: &'a CatalogSnapshot,
     pub alias: &'a str,
     pub binding: &'a VirtualSchema,
+    pub native_identity: bool,
 }
 
 impl ForeignProjection<'_> {
@@ -18,22 +19,28 @@ impl ForeignProjection<'_> {
             source,
             alias,
             binding,
+            native_identity,
         } = self;
         super::publish(conn, snapshot, alias)?;
         conn.execute_batch("CREATE OR REPLACE TEMP TABLE __fed_foreign_relations(remote_oid UINTEGER,local_oid UINTEGER,object VARCHAR)").map_err(engine_error)?;
         {
-            let mut statement = conn.prepare("SELECT oid,relname FROM _fedengine.meta_pg_class WHERE _snapshot_id=? AND _schema=? AND relkind IN ('r','v','m','p','f') ORDER BY relname").map_err(engine_error)?;
+            let mut statement = conn.prepare("SELECT p.oid,p.relname,o.native_id FROM _fedengine.meta_pg_class p LEFT JOIN _fedengine.catalog_objects o ON o.snapshot_id=p._snapshot_id AND o.schema_name=p._schema AND o.object_name=p.relname WHERE p._snapshot_id=? AND p._schema=? AND p.relkind IN ('r','v','m','p','f') ORDER BY p.relname").map_err(engine_error)?;
             let mut rows = statement
                 .query(params![source.id, binding.config.remote_schema])
                 .map_err(engine_error)?;
             let mut app = conn
                 .appender_to_db("__fed_foreign_relations", "main")
                 .map_err(engine_error)?;
-            let epoch = format!("virtual-schema:{}", binding.oid);
+            let epoch = binding.object_epoch.clone();
             while let Some(row) = rows.next().map_err(engine_error)? {
                 let remote: u32 = row.get(0).map_err(engine_error)?;
                 let name: String = row.get(1).map_err(engine_error)?;
-                let local = oids.oid(&epoch, &[&source.incarnation, &remote.to_string()])?;
+                let native: Option<String> = row.get(2).map_err(engine_error)?;
+                let local = if *native_identity {
+                    oids.oid(&epoch, &["relation", native.as_deref().unwrap_or(&name)])?
+                } else {
+                    oids.oid(&epoch, &[&source.incarnation, &remote.to_string()])?
+                };
                 app.append_row(params![remote, local, name])
                     .map_err(engine_error)?;
             }
@@ -88,7 +95,7 @@ impl ForeignProjection<'_> {
             .map_err(|_| EngineError::new("XX000", "invalid activity statistics"))?;
         activity["scan_count"] = Value::Null;
         conn.execute(&format!("INSERT INTO _fedengine.metadata_relation_statistics SELECT {id},local_oid,{schema},object,?,? FROM __fed_foreign_relations"), params![storage, activity.to_string()]).map_err(engine_error)?;
-        let epoch = format!("virtual-schema:{}", binding.oid);
+        let epoch = binding.object_epoch.clone();
         let wrapper = oids.oid(&epoch, &["wrapper"])?;
         let server = oids.oid(&epoch, &["server"])?;
         super::foreign_binding(
@@ -167,6 +174,7 @@ mod tests {
         mapped.schema_oids = [("crm".into(), 200000002)].into();
         mapped.schemas = vec!["crm".into()];
         let binding = VirtualSchema {
+            object_epoch: "virtual-schema:200000002".into(),
             config: VirtualSchemaConfig {
                 name: "crm".into(),
                 source: DataSourceId("remote".into()),
@@ -175,7 +183,7 @@ mod tests {
             oid: 200000002,
             snapshot_id: None,
         };
-        let epoch = format!("virtual-schema:{}", binding.oid);
+        let epoch = binding.object_epoch.clone();
         conn.execute_batch("BEGIN TRANSACTION").unwrap();
         let mut oids = OidBatch::load(&conn, &[epoch]).unwrap();
         ForeignProjection {
@@ -183,6 +191,7 @@ mod tests {
             source: &source,
             alias: "account",
             binding: &binding,
+            native_identity: false,
         }
         .publish(&conn, &mut oids)
         .unwrap();
@@ -219,6 +228,96 @@ mod tests {
                 None
             )
         );
+        {
+            use fedengine_contract::{MetadataScope, SessionContext, VisibleCatalog};
+            use fedengine_pg_compat::{CompatibilityPlan, plan_compatibility};
+            let database = VirtualDatabase {
+                managed: false,
+                oid: 200000010,
+                revision: 1,
+                public_oid: 200000011,
+                schemas: vec![binding.clone()],
+                config: VirtualDatabaseConfig {
+                    name: "account".into(),
+                    owner: config.users[0].name.clone(),
+                    connect: vec![],
+                    allow_connections: true,
+                    schemas: vec![binding.config.clone()],
+                },
+            };
+            let mut scope = MetadataScope {
+                database: "account".into(),
+                principal: config.users[0].name.clone(),
+                virtual_database: Some(database.clone()),
+                databases: vec![database],
+                catalogs: vec![VisibleCatalog {
+                    internal: false,
+                    id: binding.config.source.clone(),
+                    catalog: "account".into(),
+                    snapshot_id: mapped.id.clone(),
+                    database_oid: 200000010,
+                    schemas: vec!["crm".into()],
+                    default_schema: String::new(),
+                    grants: vec![],
+                    stale: false,
+                    mapping: Some(binding.config.clone()),
+                }],
+            };
+            let session = SessionContext {
+                database: scope.database.clone(),
+                ..Default::default()
+            };
+            let plan = |sql: &str, scope: &MetadataScope| {
+                let CompatibilityPlan::Metadata(p) =
+                    plan_compatibility(sql, &session, scope, 1).unwrap()
+                else {
+                    panic!("not metadata")
+                };
+                p.sql
+            };
+            for sql in [
+                "SELECT pg_get_userbyid(nspowner) FROM pg_namespace WHERE nspname='crm'",
+                "SELECT pg_get_userbyid(relowner) FROM pg_class WHERE relname='customers'",
+                "SELECT schema_owner FROM information_schema.schemata WHERE schema_name='crm'",
+                "SELECT pg_get_userbyid(typowner) FROM pg_type WHERE oid=210000000",
+            ] {
+                let owner: String = conn
+                    .query_row(&plan(sql, &scope), [], |r| r.get(0))
+                    .unwrap();
+                assert_eq!(owner, config.users[0].name, "{sql}");
+            }
+            let count:i64=conn.query_row(&plan("SELECT count(*) FROM information_schema.tables WHERE table_name='customers'",&scope),[],|r|r.get(0)).unwrap();
+            assert_eq!(count, 1); // Local owner can describe the object without acquiring remote SELECT.
+            let count: i64 = conn
+                .query_row(
+                    &plan(
+                        "SELECT count(*) FROM pg_stats WHERE tablename='customers'",
+                        &scope,
+                    ),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0);
+            scope.catalogs[0].grants.push(Grant {
+                principal: scope.principal.clone(),
+                source: binding.config.source.clone(),
+                schema: "crm".into(),
+                object: "customers".into(),
+                actions: ["SELECT".into()].into(),
+            });
+            let count: i64 = conn
+                .query_row(
+                    &plan(
+                        "SELECT count(*) FROM pg_stats WHERE tablename='customers'",
+                        &scope,
+                    ),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1);
+        }
         let comments: i64 = conn.query_row("SELECT count(*) FROM _fedengine.meta_pg_description WHERE _snapshot_id='mapped' AND objoid=? AND description IN ('table comment','column comment')", [local], |r|r.get(0)).unwrap();
         assert_eq!(comments, 2);
         let stats: (String,i32,f32) = conn.query_row("SELECT schemaname,avg_width,null_frac FROM _fedengine.meta_pg_stats WHERE _snapshot_id='mapped' AND tablename='customers' AND attname='name'", [], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();

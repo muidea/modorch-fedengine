@@ -163,6 +163,7 @@ async fn embedded_web_assets_and_browser_origin_boundary() {
     for (path, content_type) in [
         ("/manage/app.js", "text/javascript"),
         ("/manage/style.css", "text/css"),
+        ("/manage/navigator.js", "text/javascript"),
     ] {
         let (status, headers, body) = browser_http(address, "GET", path, "", "").await;
         assert_eq!(status, 200);

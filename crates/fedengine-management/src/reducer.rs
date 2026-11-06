@@ -42,6 +42,7 @@ pub(super) fn accept(
     let (incarnation, target_revision) = match &action {
         ManagementAction::Register { definition } => {
             validate_source(definition)?;
+            validate_organization(state, definition)?;
             if state.sources.values().filter(|s| !s.deleted).count() >= 128 {
                 return Err(EngineError::new("54000", "source limit exceeded"));
             }

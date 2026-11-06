@@ -26,12 +26,12 @@ Modorch 0.0.2 的 Topic Name / Filter 采用 MQTT 3.1.1/5.0 语义，`:id` 是�
 `config/application.toml` 是默认本地运行配置；`examples/config/federation.toml` 是包含 PostgreSQL/MySQL 数据源的完整示例，通过 `--config examples/config/federation.toml` 显式选择。程序一次只读取一份配置，不做文件合并。配置内的相对路径以进程工作目录为基准，文档中的启动命令从仓库根目录执行。
 
 - `fedengine-ddl/src/`：`analysis` 负责语句分析，`binding` 负责对象及约束绑定，`model` 定义领域类型，`index` 生成受控模板，`parameters` 处理参数 AST。
-- `fedengine-duckdb/src/`：`instance` 打开唯一实例，`storage` 当前结构初始化与持久化，`control` 受控挂载及恢复，`credentials` 解析引用，`catalog` 扫描结构，`relational` 采集扩展关系事实，`identity` 维护稳定身份，`projection` 发布 PG 目录，`virtuals` 持久化逻辑数据库并同步外部表映射，`init` 装配运行时，`runtime` 管理执行准入，`worker` 执行和输出行批次，`codec` 转换数据，`metadata` 查询元数据，`extensions` 校验扩展，`error` 转换错误。
+- `fedengine-duckdb/src/`：`instance` 打开唯一实例，`storage` 当前结构初始化与持久化，`control` 受控挂载及恢复，`credentials` 解析引用，`catalog` 扫描结构，`discovery` 枚举原生数据库，`relational` 采集扩展关系事实，`identity` 维护稳定身份，`projection` 发布 PG 目录，`virtuals` 持久化逻辑数据库并同步外部表映射，`init` 装配运行时，`runtime` 管理执行准入，`worker` 执行和输出行批次，`codec` 转换数据，`metadata` 查询元数据，`extensions` 校验扩展，`error` 转换错误。
 - `fedengine-pgwire/src/`：监听生命周期、认证、取消分别独立；`session/` 保存连接状态，并拆分游标、解析、Simple 和 Extended 协议实现。
 
 上述适配 crate 的 `lib.rs` 声明内部模块并导出组件接口。内部模块保持私有，模块拆分不改变组件边界或 Modorch 生命周期。
 
-`fedengine-management` 的 `module` 接收 Typed Request，`reducer` 校验意图与版本，`coordinator` 编排受管长任务，`api` 提供生命周期受管 HTTP 入口，`pagination` 绑定目录快照、过滤条件与续页参数。管理配置、凭据引用、首次导入及调用示例见 [管理 API](management-api.md)。
+`fedengine-management` 的 `module` 接收 Typed Request，`reducer` 校验意图与版本，`coordinator` 编排受管长任务，`api` 提供生命周期受管 HTTP 入口，`pagination` 绑定来源目录快照、过滤条件与续页参数；`browser` 提供虚拟库目录与有界调试任务，`browser_query` 通过现有协调器消费只读结果流；`discovery` 使用 source-manager 的受管任务、共享并发和内存许可执行实例枚举，Web 的 `organization.js` 核对逐目标结果后逐项提交持久化登记/激活。管理配置、凭据引用、首次导入及调用示例见 [管理 API](management-api.md)。
 
 SQL 分析、配置和授权测试分别位于 ddl、core、policy 的 `tests/`。通过 `include_str!` 读取仓库配置示例，避免依赖测试进程工作目录。根目录 `tests/` 保留协议、引擎控制和在线管理系统测试；临时目录由作用域守卫自动清理。
 
@@ -113,10 +113,13 @@ Cargo 依赖及编译产物通过 Rust cache 复用，key 包含固定的 Modorc
 ```sh
 cargo build --locked
 node --check crates/fedengine-management/web/app.js
+node --check crates/fedengine-management/web/browser.js
 node scripts/web-smoke.mjs --chrome /opt/google/chrome/chrome
 ```
 
-脚本启动独立临时状态库、随机端口和专用无头浏览器，验证登记、异步状态、失败探测、凭据引用与 Schema 配置、过期表单冲突、响应丢失后的原键重试、业务虚拟库完整映射编辑和删除、源停用/删除、操作记录及窄屏布局。JavaScript 语法检查及默认浏览器回归已接入 CI，使用 Node.js 22 和 runner 预置 Chrome。目录分页、快照冲突和不可信名称渲染使用浏览器层合成 HTTP 响应，不能替代真实远端目录采集验收。可通过 `FEDENGINE_WEB_POSTGRES_DSN` 和 `FEDENGINE_WEB_POSTGRES_SCHEMA` 显式指定含表的 PostgreSQL schema，额外验证只读探测、发现、激活、刷新及实际目录展示；需事先准备匹配扩展，脚本不执行远端业务 DDL。
+`tests/browser.rs` 覆盖真实 HTTP 目录、精度保真的只读结果、只读 AST 拒绝、幂等提交、截断、取消、超时和退出；其 ignored 来源用例由 `scripts/test-federation.sh` 在一次性 PG/MySQL 上执行，核对映射、分页、来源详情、授权与快照变化。
+
+脚本启动独立临时状态库、随机端口和专用无头浏览器，验证数据库树仅在对象浏览/SQL 工作区显示（含退出后的桌面/窄屏隐藏）、库切换和查询取消、各库独立草稿、对象/列按需加载、原生双击与光标/选区插入、标识符转义、目录冲突重载、系统 Schema 默认隐藏、空 public、SQL 选中执行、NULL/int8、错误、截断分页和窄屏，以及登记、异步状态、失败探测、凭据引用与 Schema 配置、过期表单冲突、响应丢失后的原键重试、业务虚拟库完整映射编辑和删除、源停用/删除、操作记录。JavaScript 语法检查及默认浏览器回归已接入 CI，使用 Node.js 22 和 runner 预置 Chrome。目录分页、快照冲突和不可信名称渲染使用浏览器层合成 HTTP 响应，不能替代真实远端目录采集验收。可通过 `FEDENGINE_WEB_POSTGRES_DSN` 和 `FEDENGINE_WEB_POSTGRES_SCHEMA` 显式指定含表的 PostgreSQL schema，额外验证只读探测、发现、激活、刷新及实际目录展示；需事先准备匹配扩展，脚本不执行远端业务 DDL。
 
 可选 `--binary` 指定构建程序，`--screenshot /tmp/页面.png` 生成临时检查截图。服务日志、状态库和浏览器配置退出时清理，截图由调用者验证后删除，不归档。
 
@@ -175,3 +178,19 @@ python3 scripts/metadata-scale.py --disposable-source \
 默认使用 256MB 正式 DuckDB、512MiB 元数据共享额度/单操作额度、128MB 独立采集实例、1024MiB 进程 RSS 上限；一列场景指定 `--columns 1 --operation-mib 256`。每次重复创建独立进程，包含首次 Apply 和十轮 Refresh。核对阶段耗时、内核 VmHWM、查询 p99/最大停顿、末三轮 RSS 平台、对象身份及投影列数，检查查询和操作无错误及正常退出。轮末平台采样等待后台 checkpoint 收尾，峰值保留全程采样；状态成功不等同于资源已归还。预算不因失败上调；工程优化目标为 RSS 800MiB、最大停顿 500ms，外部验收仍为 RSS 1024MiB、停顿 1s、p99 基线+100ms、末三轮波动64MiB。
 
 多源场景可设置 `--sources 2 --objects 5000 --columns 10 --operation-mib 256`，保持远端总量为100k列并并发刷新；`--mappings 2` 验证同一来源的多份逻辑映射。若映射倍增或混合业务需独立容量预算，必须在运行前显式设置并单独报告，不能与默认单映射验收混为一组。查询为闭环并在每轮间隔20ms，不代表开放环吞吐量或24小时耐久。实际部署额度的候选配置与边界见管理 API。
+
+
+## 数据源组织回归
+
+在专用 PostgreSQL/MySQL 测试实例中运行（不要指向业务库）：
+
+```sh
+cargo test --locked --test organization
+cargo test --locked --test organization -- --ignored --nocapture --test-threads=1
+```
+
+第二条需要 `FEDENGINE_POSTGRES_DSN` 和 `FEDENGINE_MYSQL_DSN`，使用 `docker/docker-compose.test.yml` 的一次性实例；测试创建并移除独立源库、角色和表。覆盖实例枚举/系统排除/逐库失败、名称预留、同库合并、重叠 Schema/关系去重、PG public、MySQL 多库和大小写、来源权限、逐表路由、事实冲突、停用/删除贡献和重启 OID。`scripts/test-federation.sh` 包含该测试入口；扩展相关用例仍按既有能力边界处理。
+
+`node scripts/web-smoke.mjs` 检查真实 Chromium 的管理与浏览交互；可额外提供 `FEDENGINE_WEB_POSTGRES_CREDENTIALS`（结构化凭据 JSON）及 `FEDENGINE_WEB_POSTGRES_HOST/PORT/DATABASE` 验证新接入向导、核对后激活、原生 public 和 SQL 上下文。这些参数仅进入一次性服务环境，不写入仓库。默认主机 127.0.0.1、端口 36432、库 crm。
+
+当前管理存储版本 7。新组织模型使用独立状态路径验证，不转换或清空既有版本的开发实例；部署需单独备份并选用匹配存储版本。

@@ -222,6 +222,7 @@ fn postgres_qualified_wildcards_columns_and_correlated_queries_execute_after_bin
         sources: c.datasources,
         indexes: vec![],
         namespace: Some(BindingNamespace {
+            routes: None,
             catalog: "fedengine".into(),
             allow_cross_database: false,
             search_path: vec!["a".into()],
@@ -263,4 +264,116 @@ fn postgres_qualified_wildcards_columns_and_correlated_queries_execute_after_bin
         a.analyze("SELECT a.t.* FROM a.t q").unwrap_err().sqlstate,
         "42P01"
     );
+}
+
+#[tokio::test]
+async fn role_owners_connect_privileges_and_system_catalogs_follow_current_user() {
+    let dir = common::TestDirectory::new();
+    let mut c = config(&dir);
+    c.virtual_databases[0].connect.push("reader".into());
+    c.virtual_databases.push(VirtualDatabaseConfig {
+        name: "reader".into(),
+        owner: "reader".into(),
+        connect: vec![],
+        allow_connections: true,
+        schemas: vec![],
+    });
+    let mut identities = std::collections::BTreeMap::new();
+    for restart in 0..2 {
+        // Configuration order must not change role identity after restart.
+        if restart == 1 {
+            c.users.reverse();
+        }
+        let engine = FedEngine::start(c.clone()).await.unwrap();
+        for user in ["fedengine", "reader"] {
+            let (client, connection) = tokio_postgres::Config::new()
+                .host("127.0.0.1")
+                .port(engine.address().unwrap().port())
+                .user(user)
+                .dbname("fedengine")
+                .password(std::env::var("USER").unwrap())
+                .connect(NoTls)
+                .await
+                .unwrap();
+            let task = tokio::spawn(async move {
+                connection.await.unwrap();
+            });
+            let roles = client
+                .query(
+                    "SELECT oid,rolname,rolcanlogin FROM pg_roles ORDER BY rolname",
+                    &[],
+                )
+                .await
+                .unwrap();
+            assert_eq!(roles.len(), 3);
+            for role in roles {
+                let oid: u32 = role.get(0);
+                let name: String = role.get(1);
+                let login: bool = role.get(2);
+                assert_eq!(login, name != "fedengine_system");
+                assert_eq!(oid == 10, name == "fedengine_system");
+                if let Some(previous) = identities.insert(name.clone(), oid) {
+                    assert_eq!(oid, previous);
+                }
+                assert_eq!(
+                    client
+                        .query_one("SELECT pg_get_userbyid($1)", &[&oid])
+                        .await
+                        .unwrap()
+                        .get::<_, String>(0),
+                    name
+                );
+            }
+            assert_ne!(identities["fedengine"], identities["reader"]);
+            for (schema, owner) in [
+                ("public", "fedengine"),
+                ("pg_catalog", "fedengine_system"),
+                ("information_schema", "fedengine_system"),
+            ] {
+                let row=client.query_one("SELECT nspowner,pg_get_userbyid(nspowner) FROM pg_namespace WHERE nspname=$1::text",&[&schema]).await.unwrap();
+                assert_eq!(row.get::<_, u32>(0), identities[owner]);
+                assert_eq!(row.get::<_, String>(1), owner);
+                let row=client.query_one("SELECT catalog_name,schema_owner FROM information_schema.schemata WHERE schema_name=$1::text",&[&schema]).await.unwrap();
+                assert_eq!(row.get::<_, String>(0), "fedengine");
+                assert_eq!(row.get::<_, String>(1), owner);
+            }
+            let rows=client.query("SELECT datname,pg_get_userbyid(datdba),has_database_privilege(oid,'CONNECT') FROM pg_database ORDER BY datname",&[]).await.unwrap();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].get::<_, String>(1), "fedengine");
+            assert_eq!(rows[1].get::<_, String>(1), "reader");
+            assert!(rows[0].get::<_, bool>(2));
+            assert_eq!(rows[1].get::<_, bool>(2), user == "reader");
+            let row=client.query_one("SELECT has_schema_privilege('public','USAGE'),has_schema_privilege('public','CREATE'),has_schema_privilege(0::oid,'USAGE'),has_table_privilege(0::oid,'SELECT')",&[]).await.unwrap();
+            assert!(row.get::<_, bool>(0));
+            assert!(!row.get::<_, bool>(1));
+            assert_eq!(row.get::<_, Option<bool>>(2), None);
+            assert_eq!(row.get::<_, Option<bool>>(3), None);
+            let row=client.query_one("SELECT table_catalog,table_type FROM information_schema.tables WHERE table_schema='pg_catalog' AND table_name='pg_class'",&[]).await.unwrap();
+            assert_eq!(row.get::<_, String>(0), "fedengine");
+            assert_eq!(row.get::<_, String>(1), "BASE TABLE");
+            for (function, target) in [
+                ("has_schema_privilege", "public"),
+                ("has_database_privilege", "fedengine"),
+                ("has_table_privilege", "pg_catalog.pg_class"),
+            ] {
+                let sql = format!("SELECT {function}($1,$2)");
+                let e = client
+                    .query(&sql, &[&target, &"INVALID"])
+                    .await
+                    .unwrap_err();
+                assert_eq!(e.code().unwrap().code(), "22023");
+            }
+            drop(client);
+            task.await.unwrap();
+        }
+        failure(
+            engine.address().unwrap(),
+            "fedengine",
+            &std::env::var("USER").unwrap(),
+            Some("reader"),
+            "42501",
+        )
+        .await;
+        engine.shutdown().await.unwrap();
+    }
 }

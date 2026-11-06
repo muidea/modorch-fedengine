@@ -71,7 +71,11 @@ try {
     .replace('database_path = "./data/fedengine.duckdb"', `database_path = "${temporary}/management.duckdb"`)
     .replace('temp_directory = "./data/tmp"', `temp_directory = "${temporary}/tmp"`)
     .replace('credentials_directory = "./secrets"', `credentials_directory = "${temporary}"`);
-  if (process.env.FEDENGINE_WEB_POSTGRES_DSN) config = config.replace('[duckdb]', `[duckdb]\nextension_directory = "${resolve('data/extensions')}"`);
+  if (process.env.FEDENGINE_WEB_POSTGRES_DSN || process.env.FEDENGINE_WEB_POSTGRES_CREDENTIALS) {
+    config = config.replace('[duckdb]', `[duckdb]\nextension_directory = "${resolve('data/extensions')}"`);
+    config += '\n[[grants]]\nprincipal="fedengine"\nsource="web_live"\nschema="*"\nobject="*"\nactions=["SELECT"]\n';
+    config += '\n[[grants]]\nprincipal="fedengine"\nsource="web_organization"\nschema="*"\nobject="*"\nactions=["SELECT"]\n';
+  }
   await writeFile(join(temporary, 'application.toml'), config);
   const env = { ...process.env, FEDENGINE_PASSWORD: 'disposable-web-smoke', RUST_LOG: 'fedengine=info', NO_COLOR: '1' };
   const libraries = resolve(dirname(binary), '../duckdb-download');
@@ -114,16 +118,16 @@ try {
   await cdp.send('Emulation.setDeviceMetricsOverride', { width: 1440, height: 1000, deviceScaleFactor: 1, mobile: false });
   await cdp.send('Page.navigate', { url: `${origin}/manage/` });
   const evaluate = expression => cdp.evaluate(expression);
-  async function waitText(text) { await until(() => evaluate(`document.body.innerText.includes(${JSON.stringify(text)})`), text); }
+  async function waitText(text) { try { await until(() => evaluate(`document.body.innerText.includes(${JSON.stringify(text)})`), text); } catch (error) { throw new Error(`${error.message}: ${await evaluate('document.querySelector("#content").innerText')}`); } }
   async function click(text, scope = 'document') {
-    await until(() => evaluate(`[...${scope}.querySelectorAll('button')].some(node => node.textContent === ${JSON.stringify(text)} && !node.disabled && !node.hidden)`), `button enabled: ${text}`);
-    await evaluate(`(() => { const node = [...${scope}.querySelectorAll('button')].find(node => node.textContent === ${JSON.stringify(text)} && !node.disabled && !node.hidden); if (!node) throw new Error('Button unavailable: ' + ${JSON.stringify(text)}); node.click(); })()`);
+    await until(() => evaluate(`[...${scope}.querySelectorAll('button')].some(node => node.textContent === ${JSON.stringify(text)} && !node.disabled && node.getClientRects().length)`), `button enabled: ${text}`);
+    await evaluate(`(() => { const node = [...${scope}.querySelectorAll('button')].find(node => node.textContent === ${JSON.stringify(text)} && !node.disabled && node.getClientRects().length); if (!node) throw new Error('Button unavailable: ' + ${JSON.stringify(text)}); node.click(); })()`);
   }
   async function fill(name, value) {
     await evaluate(`(() => { const node = document.querySelector(${JSON.stringify(name)}); if (!node) throw new Error('Missing input'); node.value = ${JSON.stringify(value)}; node.dispatchEvent(new Event('input', {bubbles:true})); node.dispatchEvent(new Event('change', {bubbles:true})); })()`);
   }
   async function submit() { await evaluate(`document.querySelector('#editor').requestSubmit()`); }
-  async function closed() { await until(() => evaluate(`!document.querySelector('#dialog').open`), 'dialog closed'); }
+  async function closed() { try { await until(() => evaluate(`!document.querySelector('#dialog').open`), 'dialog closed'); } catch (error) { throw new Error(`${error.message}: ${await evaluate('document.querySelector("#dialog-error").textContent')}`); } }
   async function sourceState(predicate) { return until(async () => { const source = await api('sources/web_pg'); return predicate(source) && source; }, 'source state'); }
   async function settleSource() {
     await until(() => evaluate(`document.querySelector('#pending').hidden`), 'request accepted');
@@ -133,13 +137,15 @@ try {
   await waitText('管理服务已连接');
   await waitText('尚未登记数据源');
   await click('＋ 登记数据源');
-  await fill('[name=id]', 'web_pg'); await fill('[name=catalog_alias]', 'web_pg');
+  await fill('[name=connection_id]', 'web_pg'); await fill('[name=host]', '127.0.0.1'); await fill('[name=virtual_name]', 'web_pg');
   await fill('[name=secret_ref]', 'postgresql://invalid:placeholder@localhost/example'); await submit();
   await waitText('不能填写连接串或密码');
   assert.equal(writes.length, 0);
   assert.equal(await evaluate('sessionStorage.getItem("fedengine.pending")'), null);
-  await fill('[name=secret_ref]', 'file:missing.dsn');
-  await submit(); await closed(); await waitText('web_pg');
+  await click('取消', 'document.querySelector("#dialog")');
+  // Exercise the lower-level target API for unavailable-source lifecycle checks.
+  await finished(await api('sources', 'POST', { id:'web_pg',kind:'postgres',catalog_alias:'web_pg',secret_ref:'file:missing.dsn',default_schema:'public',allowed_schemas:['public'],read_only:true,ddl_enabled:false }));
+  await click('↻ 刷新状态'); await waitText('web_pg');
   await sourceState(source => source.status === 'Registered' && !source.current_operation);
   await click('管理 →'); await waitText('凭据引用');
   await click('探测连接'); await settleSource();
@@ -153,10 +159,37 @@ try {
   let dropPatch = true;
   let mockCatalog = false;
   let catalogMode = 'first';
+  let mockDirectory = false, directoryConflict = false;
+  let holdQueryResponse = false, heldQueryResponse = null;
+  const directoryRequests = [];
+  const treeTable = 'odd"table <img src=x onerror=alert(1)>';
+  const treeColumn = 'col"umn <img src=x>';
   const catalogRequests = [];
   const interceptErrors = [];
+  const interceptions = new Set();
+  let stoppingInterception = false;
+  async function stopIntercepting() {
+    stoppingInterception = true;
+    try {
+      await cdp.send('Fetch.disable');
+      // Disabling Fetch releases paused requests; a concurrent continue may then be rejected.
+      while (interceptions.size) await Promise.all([...interceptions]);
+    } finally { stoppingInterception = false; }
+  }
   cdp.on('Fetch.requestPaused', event => {
-    (async () => {
+    const task = (async () => {
+      if (holdQueryResponse && event.request.method === 'POST' && event.responseStatusCode && /\/browser\/queries\/[^/]+$/u.test(new URL(event.request.url).pathname)) {
+        heldQueryResponse = event.requestId; return;
+      }
+      if (mockDirectory && event.request.url.includes('/api/v1/browser/')) {
+        const url = new URL(event.request.url); directoryRequests.push(url);
+        const detail = url.pathname.endsWith('/object');
+        const conflict = !detail && directoryConflict;
+        const page = detail ? { stamp:url.searchParams.get('stamp'), object:{columns:[{name:treeColumn,remote_type:'text'}]} } : {
+          stamp:url.searchParams.get('stamp'), offset:0,has_more:true,objects:[{name:treeTable,kind:'f',source_type:'BASE TABLE',columns:1}] };
+        await cdp.send('Fetch.fulfillRequest',{requestId:event.requestId,responseCode:conflict?409:200,
+          responseHeaders:[{name:'Content-Type',value:'application/json'}],body:Buffer.from(JSON.stringify(conflict?{code:'40001',error:'directory snapshot changed'}:page)).toString('base64')});return;
+      }
       if (event.request.method === 'PATCH' && dropPatch && event.responseStatusCode) {
         dropPatch = false; await cdp.send('Fetch.failRequest', { requestId: event.requestId, errorReason: 'ConnectionReset' }); return;
       }
@@ -174,7 +207,10 @@ try {
           body: Buffer.from(JSON.stringify(conflict ? { code: '40001', error: 'snapshot changed' } : page)).toString('base64') }); return;
       }
       await cdp.send('Fetch.continueRequest', { requestId: event.requestId });
-    })().catch(error => interceptErrors.push(error.message));
+    })().catch(error => {
+      if (!stoppingInterception || !error.message.includes('Fetch domain is not enabled')) interceptErrors.push(error.message);
+    }).finally(() => interceptions.delete(task));
+    interceptions.add(task);
   });
   await cdp.send('Fetch.enable', { patterns: [
     { urlPattern: `${origin}/api/v1/sources/web_pg`, requestStage: 'Response' },
@@ -220,7 +256,7 @@ try {
   catalogMode = 'conflict'; await click('上一页'); await waitText('目录快照已变化');
   catalogMode = 'first'; await click('从第一页重新读取'); await waitText('第 1 页');
   assert.equal(catalogRequests.at(-1).searchParams.has('page_token'), false);
-  mockCatalog = false; await cdp.send('Fetch.disable');
+  mockCatalog = false; await stopIntercepting();
   console.log('Passed: catalog error, pagination, snapshot conflict and untrusted text rendering (synthetic HTTP facts)');
 
   await evaluate('document.querySelector("[data-page=databases]").click()');
@@ -233,6 +269,115 @@ try {
   const database = await api('virtual-databases/web_account');
   assert.deepEqual(database.config.schemas.map(schema => schema.name), ['business', 'second']);
   assert.equal(database.revision, 2);
+  const otherDatabase = await api('virtual-databases','POST',{name:'web_other',owner:'fedengine',connect:[],allow_connections:true,schemas:[]});
+  await click('↻ 刷新状态');
+  for (const page of ['sources','operations','databases']) {
+    await evaluate(`document.querySelector('[data-page=${page}]').click()`);
+    assert.equal(await evaluate(`getComputedStyle(document.querySelector('#database-navigation')).display === 'none' && document.querySelector('#toggle-database-tree').hidden && !document.querySelector('.workspace-body').classList.contains('database-workspace')`),true,`no database tree on ${page}`);
+    assert.equal(await evaluate(`document.querySelector('#main').getBoundingClientRect().left === document.querySelector('.workspace-body').getBoundingClientRect().left`),true,`no reserved tree space on ${page}`);
+  }
+  await click('web_account','document.querySelector("#content")'); await waitText('对象浏览'); await waitText('此 Schema 中没有匹配的可见对象');
+  assert.equal(await evaluate(`getComputedStyle(document.querySelector('#database-navigation')).display !== 'none'`),true,'tree in object browser');
+  assert.equal(await evaluate('document.querySelector("#stats").hidden'), true);
+  assert.equal(await evaluate('document.querySelectorAll("nav button").length'), 3);
+  await evaluate(`(() => { const checkbox=document.querySelector('#database-system'); checkbox.checked=true; checkbox.dispatchEvent(new Event('change',{bubbles:true})); })()`);
+  await waitText('pg_catalog');
+  await evaluate(`[...document.querySelectorAll('button')].find(n=>n.getAttribute('aria-label')==='选择 Schema pg_catalog').click()`);
+  await until(() => evaluate(`document.querySelector('#object-area h3')?.textContent==='pg_catalog' && document.querySelector('#object-rows tbody')`),'browse system schema');
+  assert.equal(await evaluate('document.querySelector("#database-tree").textContent.includes("_fedengine")'), false);
+  await evaluate(`(() => { const checkbox=document.querySelector('#database-system'); checkbox.checked=false; checkbox.dispatchEvent(new Event('change',{bubbles:true})); })()`);
+  await waitText('此 Schema 中没有匹配的可见对象');
+  assert.equal(await evaluate(`document.querySelector('#object-area h3').textContent`),'public');
+  await until(() => evaluate('document.querySelector("#database-tree").textContent.includes("public") && !document.querySelector("#database-tree").textContent.includes("pg_catalog")'), 'system schemas hidden again');
+
+  await click('SQL 调试'); await fill('[aria-label="SQL 编辑器"]', "SELECT 9223372036854775807::BIGINT AS exact_value, NULL::TEXT AS missing, '' AS empty");
+  await click('执行 SQL'); await waitText('执行成功'); await waitText('9223372036854775807');
+  assert.equal(await evaluate('document.querySelector(".sql-null").textContent'), 'NULL');
+  assert.equal(await evaluate('[...document.querySelector("#sql-output").childNodes].some(n => n.nodeType === Node.TEXT_NODE && n.textContent.includes("null"))'), false);
+  await fill('[aria-label="SQL 编辑器"]', 'SELECT 9 AS selected_value; DELETE FROM nowhere;');
+  await evaluate(`(() => { const e = document.querySelector('.sql-editor'); e.setSelectionRange(0,26); e.dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', ctrlKey:true, bubbles:true})); })()`);
+  await waitText('selected_value'); await waitText('执行成功');
+  await fill('[aria-label="SQL 编辑器"]', 'DELETE FROM nowhere'); await click('执行 SQL'); await waitText('SQLSTATE 0A000');
+  await click('消息'); await waitText('SQL debugger accepts one read-only query');
+  await fill('[aria-label="SQL 编辑器"]', 'SELECT i::INTEGER AS row_value FROM range(1001) t(i)'); await click('执行 SQL'); await waitText('执行成功'); await waitText('当前结果不完整');
+  await click('下一页'); await waitText('第 2 页');
+  await fill('[aria-label="SQL 编辑器"]', 'SELECT sum(a.i*b.j) FROM range(1000000000) a(i), range(1000000000) b(j)');
+  await click('执行 SQL'); await waitText('执行中'); await click('停止'); await waitText('SQLSTATE 57014');
+  await fill('[aria-label="SQL 编辑器"]', 'SELECT 42 AS preserved_editor'); await sleep(2800);
+  assert.equal(await evaluate('document.querySelector(".sql-editor").value'), 'SELECT 42 AS preserved_editor');
+  await click('对象浏览'); await waitText('此 Schema 中没有匹配的可见对象'); await click('SQL 调试');
+  assert.equal(await evaluate('document.querySelector(".sql-editor").value'), 'SELECT 42 AS preserved_editor');
+  async function clickAria(label) {
+    await until(() => evaluate(`[...document.querySelectorAll('button')].some(n=>n.getAttribute('aria-label')===${JSON.stringify(label)})`),label);
+    await evaluate(`[...document.querySelectorAll('button')].find(n=>n.getAttribute('aria-label')===${JSON.stringify(label)}).click()`);
+  }
+  await clickAria('打开数据库 web_other'); await until(() => evaluate(`document.querySelector('#page-title').textContent==='web_other' && !!document.querySelector('.sql-editor')`),'SQL database switch');
+  await fill('[aria-label="SQL 编辑器"]','SELECT current_database() AS selected_database'); await click('执行 SQL'); await waitText('selected_database'); await waitText('执行成功');
+  assert.equal(await evaluate(`document.querySelector('#sql-output tbody').textContent`),'web_other');
+  holdQueryResponse = true;
+  await cdp.send('Fetch.enable',{patterns:[{urlPattern:`${origin}/api/v1/browser/queries/*`,requestStage:'Response'}]});
+  await fill('[aria-label="SQL 编辑器"]','SELECT sum(a.i*b.j) FROM range(1000000000) a(i), range(1000000000) b(j)'); await click('执行 SQL');
+  await until(()=>heldQueryResponse,'query accepted but response delayed');
+  const runningQuery = writes.filter(r=>r.method==='POST' && /\/browser\/queries\/[^/]+$/u.test(new URL(r.url).pathname)).at(-1);
+  assert.equal(JSON.parse(runningQuery.postData).database,'web_other');
+  await clickAria('打开数据库 web_account'); await until(() => evaluate(`document.querySelector('#page-title').textContent==='web_account'`),'return to SQL database');
+  assert.equal(await evaluate('document.querySelector(".sql-editor").value'),'SELECT 42 AS preserved_editor');
+  holdQueryResponse = false; await cdp.send('Fetch.continueRequest',{requestId:heldQueryResponse});
+  await until(async () => (await api(`browser/queries/${new URL(runningQuery.url).pathname.split('/').at(-1)}`)).status==='canceled','switch cancels previous query');
+  await stopIntercepting();
+  mockDirectory = true;
+  await cdp.send('Fetch.enable',{patterns:[{urlPattern:`${origin}/api/v1/browser/objects?*`,requestStage:'Request'},{urlPattern:`${origin}/api/v1/browser/object?*`,requestStage:'Request'}]});
+  await clickAria('展开或收起 Schema public'); await clickAria(`选择对象 public.${treeTable}`);
+  assert.equal(directoryRequests.some(u=>u.pathname.endsWith('/object')),false);
+  assert.equal(await evaluate(`document.querySelectorAll('#database-tree img').length`),0);
+  const queryCount = () => writes.filter(r=>r.method==='POST' && /\/browser\/queries\/[^/]+$/u.test(new URL(r.url).pathname)).length;
+  const beforeInsert = queryCount();
+  await fill('[aria-label="SQL 编辑器"]','SELECT '); await evaluate(`document.querySelector('.sql-editor').setSelectionRange(7,7)`);
+  await click('插入名称');
+  assert.equal(await evaluate('document.querySelector(".sql-editor").value'),`SELECT "public"."${treeTable.replaceAll('"','""')}"`);
+  await clickAria(`展开或收起列 public.${treeTable}`); await clickAria(`选择列 public.${treeTable}.${treeColumn}`);
+  await fill('[aria-label="SQL 编辑器"]','SELECT placeholder'); await evaluate(`document.querySelector('.sql-editor').setSelectionRange(7,18)`); await click('插入名称');
+  assert.equal(await evaluate('document.querySelector(".sql-editor").value'),`SELECT "${treeColumn.replaceAll('"','""')}"`);
+  await click('插入 SELECT'); assert.equal(await evaluate('document.querySelector(".sql-editor").value.includes("LIMIT 100;")'),true);
+  await fill('[aria-label="SQL 编辑器"]','SELECT '); await evaluate(`document.querySelector('.sql-editor').setSelectionRange(7,7)`);
+  const columnPoint = await evaluate(`(() => { const n=[...document.querySelectorAll('button')].find(n=>n.getAttribute('aria-label')===${JSON.stringify(`选择列 public.${treeTable}.${treeColumn}`)}); const r=n.getBoundingClientRect(); return {x:r.x+r.width/2,y:r.y+r.height/2}; })()`);
+  for (const clickCount of [1,2]) {
+    await cdp.send('Input.dispatchMouseEvent',{type:'mousePressed',button:'left',clickCount,...columnPoint});
+    await cdp.send('Input.dispatchMouseEvent',{type:'mouseReleased',button:'left',clickCount,...columnPoint});
+  }
+  assert.equal(await evaluate('document.querySelector(".sql-editor").value'),`SELECT "${treeColumn.replaceAll('"','""')}"`,'native double click inserts the selected column');
+  assert.equal(await evaluate(`document.querySelectorAll('#database-tree .directory-row.selected').length`),1);
+  assert.equal(queryCount(),beforeInsert,'tree insertion must not execute SQL');
+  if (values.screenshot) {
+    const screenshot = await cdp.send('Page.captureScreenshot', { format: 'png' });
+    await writeFile(values.screenshot, Buffer.from(screenshot.data, 'base64'));
+  }
+  directoryConflict = true; await click('加载更多对象'); await waitText('directory snapshot changed');
+  directoryConflict = false; await click('重新加载目录'); await clickAria('展开或收起 Schema public'); await clickAria(`选择对象 public.${treeTable}`);
+  mockDirectory = false; await stopIntercepting(); await clickAria('刷新数据库树');
+  await fill('[aria-label="SQL 编辑器"]','SELECT 42 AS preserved_editor');
+  assert.equal(await evaluate(`document.querySelector('#sql-area').innerText.includes('服务端固定 owner') || document.querySelector('#sql-area').innerText.includes('执行只读 SQL 后在此查看结果和消息')`),false);
+  console.log('Passed: database tree limited to object/SQL workspaces, SQL context switching/cancel, per-database drafts, lazy objects/columns, quoted insertion, snapshot retry and untrusted directory names');
+  for (const width of [1024,375,320]) {
+    await cdp.send('Emulation.setDeviceMetricsOverride', {width,height:844,deviceScaleFactor:1,mobile:width<500});
+    assert.equal(await evaluate('document.documentElement.scrollWidth <= window.innerWidth'), true, `SQL viewport ${width}`);
+  }
+  await click('对象浏览'); await click('☰ 数据库树'); await waitText('public'); await waitText('此 Schema 中没有匹配的可见对象');
+  assert.equal(await evaluate('document.documentElement.scrollWidth <= window.innerWidth'), true);
+  assert.equal(await evaluate(`getComputedStyle(document.querySelector('#database-navigation')).display !== 'none'`),true,'expanded mobile workspace tree');
+  for (const page of ['sources','operations','databases']) {
+    await evaluate(`document.querySelector('[data-page=${page}]').click()`);
+    assert.equal(await evaluate(`getComputedStyle(document.querySelector('#database-navigation')).display === 'none' && getComputedStyle(document.querySelector('#toggle-database-tree')).display === 'none' && !document.querySelector('.workspace-body').classList.contains('directory-open')`),true,`no mobile database tree on ${page}`);
+  }
+  await click('web_account','document.querySelector("#content")');
+  assert.equal(await evaluate(`!document.querySelector('#database-navigation').hidden && getComputedStyle(document.querySelector('#toggle-database-tree')).display !== 'none' && document.querySelector('#toggle-database-tree').getAttribute('aria-expanded') === 'false'`),true,'mobile workspace tree can reopen');
+  await cdp.send('Emulation.setDeviceMetricsOverride', {width:1440,height:1000,deviceScaleFactor:1,mobile:false});
+  assert.equal(await evaluate(`getComputedStyle(document.querySelector('#database-navigation')).display !== 'none'`),true,'desktop workspace tree restored');
+  await click('← 业务虚拟库');
+  const otherCurrent = await api('virtual-databases/web_other');
+  assert.equal(otherDatabase.name,'web_other');
+  await api('virtual-databases/web_other','DELETE',{target:{oid:otherCurrent.oid,expected_revision:otherCurrent.revision}}); await click('↻ 刷新状态');
+  console.log('Passed: database entry, empty public schema, read-only SQL, precision/NULL, selection, errors, truncation/paging, cancel, editor persistence and narrow layouts');
   await click('删除'); await click('确认删除业务库', 'document.querySelector("#dialog")'); await closed(); await waitText('尚未创建业务虚拟库');
   console.log('Passed: virtual database creation, full mapping preservation and deletion');
 
@@ -255,11 +400,8 @@ try {
     const schema = process.env.FEDENGINE_WEB_POSTGRES_SCHEMA ?? 'public';
     await cdp.send('Emulation.setDeviceMetricsOverride', { width: 1440, height: 1000, deviceScaleFactor: 1, mobile: false });
     await evaluate('document.querySelector("[data-page=sources]").click()');
-    await click('＋ 登记数据源');
-    await fill('[name=id]', 'web_live'); await fill('[name=catalog_alias]', 'web_live');
-    await fill('[name=secret_ref]', 'FEDENGINE_WEB_POSTGRES_DSN');
-    await fill('[name=schemas]', schema); await fill('[name=default_schema]', schema);
-    await submit(); await closed(); await waitText('web_live'); await click('管理 →');
+    await finished(await api('sources', 'POST', {id:'web_live',kind:'postgres',catalog_alias:'web_live',secret_ref:'FEDENGINE_WEB_POSTGRES_DSN',default_schema:schema,allowed_schemas:[schema],read_only:true,ddl_enabled:false}));
+    await click('↻ 刷新状态'); await waitText('web_live'); await click('管理 →');
     async function completeLive(action) {
       await click(action);
       await until(() => evaluate('document.querySelector("#pending").hidden'), 'live source accepted');
@@ -276,20 +418,55 @@ try {
     const catalog = await api('sources/web_live/catalog?limit=50');
     assert(catalog.total > 0, 'optional source schema must contain at least one table or view');
     await waitText(catalog.objects[0].name);
+    await api('virtual-databases', 'POST', {name:'web_live_db',owner:'fedengine',connect:[],allow_connections:true,schemas:[{name:'mapped',source:'web_live',remote_schema:schema}]});
+    await evaluate('document.querySelector("[data-page=databases]").click()'); await click('↻ 刷新状态'); await click('web_live_db');
+    await waitText('mapped'); await waitText(catalog.objects[0].name); await click(catalog.objects[0].name);
+    await waitText('只读外部对象'); await click('列'); await waitText(catalog.objects[0].columns[0].name);
+    await click('来源约束'); await click('来源索引'); await click('定义'); await click('统计'); await click('来源与状态');
+    await waitText(catalog.snapshot_id); await click('查看来源对象'); await waitText('返回虚拟库对象'); await click('← 返回虚拟库对象');
+    await waitText('web_live_db.mapped.');
+    await click('刷新来源元数据'); await fill('[aria-label="刷新来源"]','web_live'); await submit(); await closed();
+    await until(async () => !(await api('sources/web_live')).current_operation, 'browser source refresh');
+    await click('重新加载目录'); await waitText(catalog.objects[0].name);
+    await click('SQL 调试'); await fill('[aria-label="SQL 编辑器"]', `SELECT * FROM mapped."${catalog.objects[0].name.replaceAll('"','""')}" LIMIT 1`); await click('执行 SQL'); await waitText('执行成功');
     if (values.screenshot) {
       const screenshot = await cdp.send('Page.captureScreenshot', { format: 'png' });
       await writeFile(values.screenshot, Buffer.from(screenshot.data, 'base64'));
     }
+    await click('← 业务虚拟库'); await click('删除'); await click('确认删除业务库', 'document.querySelector("#dialog")'); await closed();
+    await evaluate('document.querySelector("[data-page=sources]").click()'); await click('管理 →');
     await click('停用'); await click('确认停用', 'document.querySelector("#dialog")'); await closed();
     await until(async () => (await api('sources/web_live')).status === 'Disabled', 'live source disabled');
     await click('↻ 刷新状态'); await click('删除登记'); await click('确认删除登记', 'document.querySelector("#dialog")'); await closed();
     await until(async () => (await api('sources')).length === 0, 'live source deleted');
     console.log('Passed: real PostgreSQL probe, discover, activation, refresh, metadata and disable/delete (read-only)');
   }
-  if (values.screenshot && !process.env.FEDENGINE_WEB_POSTGRES_DSN) {
-    await cdp.send('Emulation.setDeviceMetricsOverride', { width: 1440, height: 1000, deviceScaleFactor: 1, mobile: false });
-    const screenshot = await cdp.send('Page.captureScreenshot', { format: 'png' });
-    await writeFile(values.screenshot, Buffer.from(screenshot.data, 'base64'));
+  if (process.env.FEDENGINE_WEB_POSTGRES_CREDENTIALS) {
+    await cdp.send('Emulation.setDeviceMetricsOverride', {width:1440,height:1000,deviceScaleFactor:1,mobile:false});
+    await evaluate('document.querySelector("[data-page=sources]").click()'); await click('＋ 登记数据源');
+    await fill('[name=connection_id]', 'web_organization');
+    await fill('[name=host]', process.env.FEDENGINE_WEB_POSTGRES_HOST ?? '127.0.0.1');
+    await fill('[name=port]', process.env.FEDENGINE_WEB_POSTGRES_PORT ?? '36432');
+    await fill('[name=database]', process.env.FEDENGINE_WEB_POSTGRES_DATABASE ?? 'crm');
+    await fill('[name=virtual_name]', 'web_native');
+    await fill('[name=secret_ref]', 'FEDENGINE_WEB_POSTGRES_CREDENTIALS');
+    await submit(); await waitText('核对映射并激活'); await waitText('新目标');
+    assert.equal((await api('sources')).length,0,'discovery must not register targets');
+    await submit();
+    await until(() => evaluate('document.querySelector("#dialog-body").textContent.includes("已激活")'), 'native UI activation', 45000);
+    const managed=await api('virtual-databases/web_native');assert.equal(managed.managed,true);
+    await click('取消','document.querySelector("#dialog")');
+    await evaluate('document.querySelector("[data-page=databases]").click()'); await click('web_native');
+    await waitText('public'); await click('SQL 调试');
+    await fill('[aria-label="SQL 编辑器"]','SELECT current_database() AS native_database');await click('执行 SQL');await waitText('执行成功');await waitText('web_native');
+    await click('← 业务虚拟库');
+    assert.equal(await evaluate('[...document.querySelectorAll("#content button")].some(b => b.textContent === "编辑定义与映射")'),false);
+    const source=(await api('sources'))[0];
+    await finished(await api(`sources/${source.id}/disable`,'POST',{target:{incarnation:source.incarnation,expected_revision:source.desired_revision}}));
+    const disabled=await api(`sources/${source.id}`);
+    await finished(await api(`sources/${source.id}`,'DELETE',{target:{incarnation:disabled.incarnation,expected_revision:disabled.desired_revision}}));
+    console.log('Passed: real instance wizard discovery, scope review, durable activation, native public mapping, SQL context and source-owned database removal');
+    assert.deepEqual(exceptions,[]);assert.deepEqual(blocked,[]);
   }
   engine.kill('SIGTERM'); await once(engine, 'exit');
   assert.equal(engine.exitCode, 0); assert.match(engine.output, /GracefullyStopped/u);

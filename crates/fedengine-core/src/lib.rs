@@ -1,5 +1,7 @@
 //! Configuration and domain types, independent of orchestration and protocol crates.
 use serde::{Deserialize, Serialize};
+mod organization;
+pub use organization::*;
 mod management;
 pub use management::*;
 mod metadata;
@@ -62,6 +64,8 @@ pub struct DataSourceDefinition {
     pub catalog_alias: String,
     /// Environment variable name or a file: reference under the configured credential directory.
     pub secret_ref: String,
+    #[serde(default)]
+    pub organization: Option<Box<SourceOrganization>>,
     pub default_schema: String,
     #[serde(default)]
     pub read_only: bool,
@@ -174,6 +178,7 @@ pub struct VirtualSchemaConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct VirtualDatabase {
     pub config: VirtualDatabaseConfig,
+    pub managed: bool,
     pub oid: u32,
     pub revision: u64,
     pub public_oid: u32,
@@ -196,7 +201,7 @@ impl VirtualDatabaseConfig {
                 "invalid virtual database name, owner, CONNECT principal or resource bounds",
             ));
         }
-        let mut schemas = BTreeSet::from(["public".to_string()]);
+        let mut schemas = BTreeSet::new();
         for binding in &self.schemas {
             if !identifier(&binding.name)
                 || binding.name.len() > 63
@@ -217,6 +222,7 @@ impl VirtualDatabaseConfig {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct VirtualSchema {
+    pub object_epoch: String,
     pub config: VirtualSchemaConfig,
     pub oid: u32,
     pub snapshot_id: Option<String>,
@@ -323,6 +329,7 @@ impl Config {
         let mut users = BTreeSet::new();
         for u in &self.users {
             if u.name.is_empty()
+                || u.name == "fedengine_system"
                 || !users.insert(u.name.clone())
                 || !identifier(&u.password_secret_ref)
             {
@@ -332,7 +339,10 @@ impl Config {
         if users.is_empty() {
             return Err(EngineError::config("at least one SCRAM user is required"));
         }
-        if !self.virtual_databases.is_empty() && !self.management.enabled {
+        if (!self.virtual_databases.is_empty()
+            || self.datasources.iter().any(|s| s.organization.is_some()))
+            && !self.management.enabled
+        {
             return Err(EngineError::config(
                 "virtual databases require managed storage",
             ));

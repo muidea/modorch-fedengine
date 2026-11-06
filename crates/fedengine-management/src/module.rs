@@ -38,6 +38,7 @@ impl ModuleFactory for SourceManagerFactory {
 impl Lifecycle for SourceManager {
     async fn setup(&mut self, ctx: &SetupContext) -> FrameworkResult<()> {
         self.coordinator = Some(Coordinator {
+            discovery: Default::default(),
             config: self.config.clone(),
             tasks: ctx.tasks.clone(),
             storage: ctx
@@ -95,6 +96,47 @@ impl SerialHandler for ManagerHandler {
 }
 impl ManagerHandler {
     async fn submit(&self, action: ManagementAction, key: String) -> Result<ManagementReply> {
+        if let ManagementAction::Register { definition } = &action
+            && let Some(target) = &definition.organization
+        {
+            if !self
+                .coordinator
+                .config
+                .users
+                .iter()
+                .any(|u| u.name == target.owner)
+                || target.connect.iter().any(|name| {
+                    !self
+                        .coordinator
+                        .config
+                        .users
+                        .iter()
+                        .any(|u| &u.name == name)
+                })
+            {
+                return Err(EngineError::config(
+                    "unknown virtual database owner or CONNECT principal",
+                ));
+            }
+            let heads = self
+                .coordinator
+                .storage
+                .acquire()
+                .map_err(framework_error)?
+                .port
+                .catalog_headers()
+                .await?;
+            if heads
+                .databases
+                .iter()
+                .any(|d| !d.managed && d.config.name.eq_ignore_ascii_case(&target.virtual_database))
+            {
+                return Err(EngineError::new(
+                    "40001",
+                    "name belongs to an explicit virtual database",
+                ));
+            }
+        }
         let digest = Sha256::digest(
             serde_json::to_vec(&action)
                 .map_err(|_| EngineError::config("invalid management action"))?,
@@ -103,7 +145,12 @@ impl ManagerHandler {
         .map(|b| format!("{b:02x}"))
         .collect::<String>();
         let operation_id = uuid::Uuid::new_v4().to_string();
-        let capacity = self.coordinator.config.management.queue_capacity;
+        let capacity = self
+            .coordinator
+            .config
+            .management
+            .queue_capacity
+            .saturating_sub(self.coordinator.discovery.running());
         let identity_policy = self.coordinator.config.management.mysql_identity_policy;
         let update_id = operation_id.clone();
         let update_key = key.clone();
@@ -162,6 +209,13 @@ impl ManagerHandler {
         request: &ManagementRequest,
     ) -> Result<ManagementReply> {
         match request {
+            ManagementRequest::Discovery(request) => {
+                return self
+                    .coordinator
+                    .discovery(request)
+                    .await
+                    .map(ManagementReply::Discovery);
+            }
             ManagementRequest::VirtualDatabases | ManagementRequest::VirtualDatabase(_) => {
                 let storage = self
                     .coordinator
@@ -245,6 +299,7 @@ impl ManagerHandler {
                     fedengine_catalog::CATALOG_TOPIC,
                     Destination::Component(ComponentRef::module("catalog-manager")),
                     fedengine_catalog::CatalogRequest::Directory(DirectoryRequest {
+                        object_bytes_limit: None,
                         object: object.clone(),
                         snapshot_id: snapshot_id.clone(),
                         id: id.clone(),
@@ -369,7 +424,8 @@ impl ManagerHandler {
                 )
                 .await
             }
-            ManagementRequest::Submit { .. }
+            ManagementRequest::Discovery(_)
+            | ManagementRequest::Submit { .. }
             | ManagementRequest::VirtualDatabases
             | ManagementRequest::VirtualDatabase(_)
             | ManagementRequest::MutateVirtualDatabase { .. } => unreachable!(),

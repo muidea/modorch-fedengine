@@ -349,6 +349,65 @@ impl ManagerHandler {
                 state.source(id)?,
                 &registry,
             )?))),
+            ManagementRequest::Operations {
+                offset,
+                limit,
+                search,
+            } => {
+                if !(1..=100).contains(limit) || search.len() > 256 {
+                    return Err(EngineError::config(
+                        "operation limit must be 1..100 and search at most 256 bytes",
+                    ));
+                }
+                let search = search.trim().to_lowercase();
+                let mut operations: Vec<_> = state
+                    .operations
+                    .values()
+                    .filter(|operation| {
+                        let action = match operation.action {
+                            ManagementAction::Register { .. } => "register",
+                            ManagementAction::Patch { .. } => "patch",
+                            ManagementAction::Schemas { .. } => "schemas",
+                            ManagementAction::Apply { .. } => "apply",
+                            ManagementAction::Disable { .. } => "disable",
+                            ManagementAction::Delete { .. } => "delete",
+                            ManagementAction::Probe { .. } => "probe",
+                            ManagementAction::Discover { .. } => "discover",
+                            ManagementAction::Refresh { .. } => "refresh",
+                        };
+                        format!(
+                            "{} {} {} {:?} {}",
+                            operation.id,
+                            operation.action.id().0,
+                            action,
+                            operation.status,
+                            operation.phase
+                        )
+                        .to_lowercase()
+                        .contains(&search)
+                    })
+                    .collect();
+                operations.sort_unstable_by(|a, b| {
+                    b.created_at
+                        .cmp(&a.created_at)
+                        .then_with(|| b.id.cmp(&a.id))
+                });
+                let total = operations.len();
+                let offset = (*offset / limit).min(total.saturating_sub(1) / limit) * limit;
+                Ok(ManagementReply::Operations(
+                    fedengine_contract::OperationPage {
+                        items: operations
+                            .into_iter()
+                            .skip(offset)
+                            .take(*limit)
+                            .cloned()
+                            .collect(),
+                        total,
+                        offset,
+                        limit: *limit,
+                    },
+                ))
+            }
             ManagementRequest::Operation(id) => state
                 .operations
                 .get(id)

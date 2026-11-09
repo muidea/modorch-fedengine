@@ -1,8 +1,16 @@
-//! HTTP continuation binds the published snapshot, source and exact filters.
+//! Management list parameters and snapshot-bound catalog continuation.
 use fedengine_contract::CatalogPage;
 use fedengine_core::{EngineError, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct OperationParameters {
+    pub offset: Option<usize>,
+    pub limit: Option<usize>,
+    pub search: Option<String>,
+}
 
 #[derive(Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]

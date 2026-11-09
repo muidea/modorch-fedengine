@@ -1,8 +1,8 @@
-> Generated snapshot; source: contracts/messaging-contract.md; source sha256: 987a9e84b16c0746f066732de288f964de5d1454d3377bdaffccd0422b1b0e85; revision 1.0.5. Do not edit.
+> Generated snapshot; source: contracts/messaging-contract.md; source sha256: 78225341fc941fc7eaa811f230befdd0be0d53d4ddff21174b896ac308d4882f; revision 1.0.6. Do not edit.
 
 # Messaging Contract
 
-适用于 modorch 0.0.2 当前开发树，Contract revision 1.1.0。维护责任：Framework Maintainer + QA。发布前必须以验证报告确认；规则文本和源码冲突时阻断发布。
+适用于 modorch 0.0.2 当前开发树，Contract revision 1.2.0。维护责任：Framework Maintainer + QA。发布前必须以验证报告确认；规则文本和源码冲突时阻断发布。
 
 ## MSG-EVT-001：Event 入队报告
 
@@ -142,7 +142,7 @@
 ## MSG-TOPIC-001：Name / Filter 校验与字节边界
 
 - Level: MUST
-- Applies to: 0.0.2 开发树；Contract revision 1.1.0
+- Applies to: 0.0.2 开发树；Contract revision 1.2.0
 - Status: Implemented；Verified 范围以本轮日志为准
 - Precondition: 订阅或任意 publish / command / request（含 external / wait）入站。
 - Trigger / Guarantee / Boundaries: Name 与 Filter 分离；二者非空、无 NUL、≤65535 UTF-8 字节（Rust &str 保证有效 UTF-8）。Name 不含 +/#；Filter 的 + 独占层、# 独占末层。非法输入 InvalidConfig；标准合法但超本地 max_topic_bytes 返回 ResourceLimit，默认预算 1024。Destination::Named 独立于 Topic 协议。helper 非法输入 false，不施加本地预算；不 trim、不归一化。

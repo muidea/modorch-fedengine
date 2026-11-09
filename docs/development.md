@@ -31,7 +31,7 @@ Modorch 0.0.2 的 Topic Name / Filter 采用 MQTT 3.1.1/5.0 语义，`:id` 是�
 
 上述适配 crate 的 `lib.rs` 声明内部模块并导出组件接口。内部模块保持私有，模块拆分不改变组件边界或 Modorch 生命周期。
 
-`fedengine-management` 的 `module` 接收 Typed Request，`reducer` 校验意图与版本，`coordinator` 编排受管长任务，`api` 提供生命周期受管 HTTP 入口，`pagination` 绑定来源目录快照、过滤条件与续页参数；`browser` 提供虚拟库目录与有界调试任务，`browser_query` 通过现有协调器消费只读结果流；`discovery` 使用 source-manager 的受管任务、共享并发和内存许可执行实例枚举，Web 的 `organization.js` 核对逐目标结果后逐项提交持久化登记/激活。管理配置、凭据引用、首次导入及调用示例见 [管理 API](management-api.md)。
+`fedengine-management` 的 `module` 接收 Typed Request，`reducer` 校验意图与版本，`coordinator` 编排受管长任务，`api` 提供生命周期受管 HTTP 入口，`pagination` 定义操作记录分页参数并绑定来源目录快照、过滤条件与续页参数；`browser` 提供虚拟库目录与有界调试任务，`browser_query` 通过现有协调器消费只读结果流；`discovery` 使用 source-manager 的受管任务、共享并发和内存许可执行实例枚举，Web 的 `organization.js` 核对逐目标结果后逐项提交持久化登记/激活。管理配置、凭据引用、首次导入及调用示例见 [管理 API](management-api.md)。
 
 SQL 分析、配置和授权测试分别位于 ddl、core、policy 的 `tests/`。通过 `include_str!` 读取仓库配置示例，避免依赖测试进程工作目录。根目录 `tests/` 保留协议、引擎控制和在线管理系统测试；临时目录由作用域守卫自动清理。
 
@@ -119,7 +119,7 @@ node scripts/web-smoke.mjs --chrome /opt/google/chrome/chrome
 
 `tests/browser.rs` 覆盖真实 HTTP 目录、精度保真的只读结果、只读 AST 拒绝、幂等提交、截断、取消、超时和退出；其 ignored 来源用例由 `scripts/test-federation.sh` 在一次性 PG/MySQL 上执行，核对映射、分页、来源详情、授权与快照变化。
 
-脚本启动独立临时状态库、随机端口和专用无头浏览器，验证数据库树仅在对象浏览/SQL 工作区显示（含退出后的桌面/窄屏隐藏）、库切换和查询取消、各库独立草稿、对象/列按需加载、原生双击与光标/选区插入、标识符转义、目录冲突重载、系统 Schema 默认隐藏、空 public、SQL 选中执行、NULL/int8、错误、截断分页和窄屏，以及登记、异步状态、失败探测、凭据引用与 Schema 配置、过期表单冲突、响应丢失后的原键重试、业务虚拟库完整映射编辑和删除、源停用/删除、操作记录。JavaScript 语法检查及默认浏览器回归已接入 CI，使用 Node.js 22 和 runner 预置 Chrome。目录分页、快照冲突和不可信名称渲染使用浏览器层合成 HTTP 响应，不能替代真实远端目录采集验收。可通过 `FEDENGINE_WEB_POSTGRES_DSN` 和 `FEDENGINE_WEB_POSTGRES_SCHEMA` 显式指定含表的 PostgreSQL schema，额外验证只读探测、发现、激活、刷新及实际目录展示；需事先准备匹配扩展，脚本不执行远端业务 DDL。
+脚本启动独立临时状态库、随机端口和专用无头浏览器，验证数据库树仅在对象浏览/SQL 工作区显示（含退出后的桌面/窄屏隐藏）、库切换和查询取消、各库独立草稿、对象/列按需加载、原生双击与光标/选区插入、标识符转义、目录冲突重载、系统 Schema 默认隐藏、空 public、SQL 选中执行、NULL/int8、错误、截断分页和窄屏，以及登记、异步状态、失败探测、凭据引用与 Schema 配置、过期表单冲突、响应丢失后的原键重试、业务虚拟库完整映射编辑和删除、源停用/删除、操作记录。列表回归创建一次性数据源、虚拟库与超过 40 项的持久化操作记录，检查分页、条数切换、跳页、筛选重置、刷新/详情返回保留、删除后页码收缩、新浏览器完整历史及窄屏布局。JavaScript 语法检查及默认浏览器回归已接入 CI，使用 Node.js 22 和 runner 预置 Chrome。目录分页、快照冲突和不可信名称渲染使用浏览器层合成 HTTP 响应，不能替代真实远端目录采集验收。可通过 `FEDENGINE_WEB_POSTGRES_DSN` 和 `FEDENGINE_WEB_POSTGRES_SCHEMA` 显式指定含表的 PostgreSQL schema，额外验证只读探测、发现、激活、刷新及实际目录展示；需事先准备匹配扩展，脚本不执行远端业务 DDL。
 
 可选 `--binary` 指定构建程序，`--screenshot /tmp/页面.png` 生成临时检查截图。服务日志、状态库和浏览器配置退出时清理，截图由调用者验证后删除，不归档。
 

@@ -664,6 +664,11 @@ pub enum ManagementRequest {
     List,
     Get(DataSourceId),
     Operation(String),
+    Operations {
+        offset: usize,
+        limit: usize,
+        search: String,
+    },
     Catalog {
         object: Option<String>,
         snapshot_id: Option<String>,
@@ -698,6 +703,13 @@ pub struct CatalogPage {
     pub objects: Vec<fedengine_core::CatalogObject>,
 }
 #[derive(Debug, Clone, serde::Serialize)]
+pub struct OperationPage {
+    pub items: Vec<fedengine_core::ManagementOperation>,
+    pub total: usize,
+    pub offset: usize,
+    pub limit: usize,
+}
+#[derive(Debug, Clone, serde::Serialize)]
 #[serde(untagged)]
 pub enum ManagementReply {
     Discovery(DiscoveryJob),
@@ -707,5 +719,6 @@ pub enum ManagementReply {
     Sources(Vec<SourceView>),
     Source(Box<SourceView>),
     Operation(fedengine_core::ManagementOperation),
+    Operations(OperationPage),
     Catalog(CatalogPage),
 }

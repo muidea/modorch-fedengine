@@ -133,6 +133,7 @@ MySQL 登记使用 `kind:"mysql"`，连接串必须包含明确的 `database`，
 | `POST /sources/{id}/refresh` | 无 | 清理扩展缓存，保存并发布完整目录 |
 | `GET /sources/{id}/catalog` | 查询参数 `schema`、`object`、`object_type`、`include`、`snapshot_version`/`snapshot_id`、`page_token`、`offset`、`limit`（1–1000） | 分页对象、完整 schema 范围、版本、generation 与 stale 标记 |
 | `DELETE /sources/{id}` | 无 | 删除已停用的登记，保留历史，不执行远端 DROP |
+| `GET /operations?offset=0&limit=10&search=...` | 无 | 全部已保存操作的分页记录，含总数 |
 | `GET /operations/{id}` | 无 | 操作状态、阶段、结果及脱敏错误 |
 
 写请求返回 `202` 前，操作和期望状态已经提交；必须读取操作至 `Succeeded` / `Failed` / `Interrupted` 才能确认结果。读请求返回 `200`；输入错误为 `400`，不存在为 `404`，版本/幂等/状态冲突为 `409`。接口超时或 HTTP 连接断开不代表远端工作已取消，可用原幂等键找回操作。操作完成前，同一源不能接受其他变更或探测。
@@ -140,6 +141,16 @@ MySQL 登记使用 `kind:"mysql"`，连接串必须包含明确的 `database`，
 目录包括表/视图、列序号、远端类型、映射类型、可空性及索引定义；无法映射的类型和特殊索引通过 `supported:false` 明确展示。刷新仅扫描有效绑定范围。结构变化会使旧 Prepared Statement 失效，需要重新 Parse/Bind。服务确认远端 DDL 成功后立即标记旧绑定失效，释放执行 worker 的源锁与实例租约，再等待同一刷新流程发布结果。正常情况下 CommandComplete 后可以立即查询新结构；等待受 management.request_timeout_ms 和语句剩余期限限制。刷新失败或超时仍返回已提交的 DDL 成功，并发送明确 Notice；源保持 stale 或继续后台刷新，可通过管理状态/refresh 恢复，不能重放 DDL。
 
 停用 schema 通过提交完整 bindings 并 apply 完成；移出时从 bindings 删除。停用当前默认 schema 时必须指定另一个启用的默认值或传 null，未指定默认绑定的短名称不会回退到本地 DuckDB。停用/移除仅改变登记和挂载，远端数据保持原样。
+
+### 管理列表分页
+
+Web 数据源、虚拟数据库、操作记录均默认每页 10 项，可选择 20、50、100 项，支持上一页、下一页和页码跳转。筛选或修改每页条数时回到第一页；刷新、进入详情后返回保留列表条件与页码；条目减少时自动收缩到最后一个有效页。数据库树仅显示在对象浏览和 SQL 调试工作区。
+
+数据源和虚拟数据库按名称及稳定 ID 排序，在已有受限完整清单上进行浏览器分页；完整清单仍供数据库树、映射选择和统计使用。数据源可按名称、ID、类型、虚拟库名筛选；虚拟数据库可按名称、Owner、映射 Schema 筛选。
+
+`GET /api/v1/operations` 查询服务端全部已保存操作，与浏览器用于进度通知的最近 40 项缓存独立。返回 `{items,total,offset,limit}`，默认 `offset=0,limit=10`，`limit` 必须为 1–100，`offset` 必须为非负整数。`search` 最多 256 UTF-8 字节，对操作编号、源 ID、动作（如 `register`）、状态（如 `Failed`）、阶段进行不区分大小写的子串匹配；Web 也支持完整中文动作和状态名称。未知参数、重复参数和非法值返回 400。
+
+记录按 `created_at` 降序、操作 ID 降序排列，先筛选再分页。`offset` 向下对齐当前页大小；超过末页则返回最后有效页，空集的 offset 为 0。分页读取当前记录，新增操作可能使页内位置变化；它不是固定历史快照。查看单项的最新状态仍使用 `GET /operations/{id}`。
 
 ## 关系元数据与一致分页
 

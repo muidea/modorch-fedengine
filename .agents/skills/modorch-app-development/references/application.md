@@ -1,4 +1,4 @@
-> Generated snapshot; source: docs/guides/application.md; source sha256: 49fdf55320729cca2e930bc8f8196dfaf3c6a1c4d2fc892a6bb33c5b904dd962; revision 1.0.5. Do not edit.
+> Generated snapshot; source: docs/guides/application.md; source sha256: 49fdf55320729cca2e930bc8f8196dfaf3c6a1c4d2fc892a6bb33c5b904dd962; revision 1.0.6. Do not edit.
 
 # 装配和运行应用
 

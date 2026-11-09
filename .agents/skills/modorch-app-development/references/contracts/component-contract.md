@@ -1,8 +1,8 @@
-> Generated snapshot; source: contracts/component-contract.md; source sha256: 2a2965c60031e29315638f2a5a19bf6ed01cc36a968e23b646b60224591ac5d8; revision 1.0.5. Do not edit.
+> Generated snapshot; source: contracts/component-contract.md; source sha256: 98befb6ecb471d212c9146d1f0721e9f2f1aee7f572212a3acda5829bab3f2fe; revision 1.0.6. Do not edit.
 
 # Component Contract
 
-适用于 modorch 0.0.2 当前开发树，Contract revision 1.1.0。维护责任：Framework Maintainer + QA。发布前必须以验证报告确认；规则文本和源码冲突时阻断发布。
+适用于 modorch 0.0.2 当前开发树，Contract revision 1.2.0。维护责任：Framework Maintainer + QA。发布前必须以验证报告确认；规则文本和源码冲突时阻断发布。
 
 ## COMP-001：选择 Initiator / Module
 
@@ -10,7 +10,7 @@
 - Applies to: 0.0.2 + 本次框架指纹
 - Status: Implemented；Verified 范围由能力矩阵（源码定位：`../docs/reference/capability-matrix.md`；从匹配框架源码查询）与执行日志限定
 - Precondition: 业务暴露共享资源或封装消息行为。
-- Trigger / Guarantee / Boundaries: 共享资源以 Initiator 发布窄接口；Module 可持有私有状态，也可不安装消息端点。只有两种框架角色，不把有无状态作为判定依据。
+- Trigger / Guarantee / Boundaries: 共享资源以 Initiator 发布窄接口；Module 可持有私有状态，也可不安装消息端点。两种角色均可通过可选 activate_ingress 作为网络入口；Module 仍无 ServicePublisher 权限。只有两种框架角色，不把有无状态作为判定依据。
 - Test ID: CT-COMP-001
 - Test: initiator_can_register_an_optional_event_endpoint（源码定位：`../crates/modorch/tests/application.rs`；从匹配框架源码查询）
 - Evidence: 本次验证（源码定位：`../docs/validation/2026-11-04/release-0.0.2/README.md`；从匹配框架源码查询），不得用测试源码存在代替执行。

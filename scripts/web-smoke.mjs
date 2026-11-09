@@ -387,9 +387,10 @@ try {
   await click('删除登记'); await click('确认删除登记', 'document.querySelector("#dialog")'); await closed();
   await until(async () => (await api('sources')).length === 0, 'source deleted');
   await evaluate('document.querySelector("[data-page=operations]").click()'); await waitText('操作记录');
-  assert.equal(await evaluate('document.querySelectorAll("#content tbody tr").length > 0'), true);
-  await fill('[aria-label="操作编号"]', 'partial-operation-id'); await sleep(2800);
-  assert.equal(await evaluate('document.querySelector("[aria-label=操作编号]").value'), 'partial-operation-id');
+  await until(() => evaluate('document.querySelectorAll("#operation-rows tbody tr").length > 0'),'operation history loaded');
+  await fill('[aria-label="搜索操作编号、源 ID、动作或状态"]', 'partial-operation-id'); await sleep(2800);
+  assert.equal(await evaluate(`document.querySelector('[aria-label="搜索操作编号、源 ID、动作或状态"]').value`), 'partial-operation-id');
+  await fill('[aria-label="搜索操作编号、源 ID、动作或状态"]', '');
   assert.deepEqual(exceptions, []); assert.deepEqual(blocked, []); assert.deepEqual(interceptErrors, []);
   await cdp.send('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 1, mobile: true });
   assert.equal(await evaluate('document.documentElement.scrollWidth <= window.innerWidth'), true);
@@ -468,6 +469,78 @@ try {
     console.log('Passed: real instance wizard discovery, scope review, durable activation, native public mapping, SQL context and source-owned database removal');
     assert.deepEqual(exceptions,[]);assert.deepEqual(blocked,[]);
   }
+  // Real, isolated inventories and persisted history, independent of browser progress cache.
+  await cdp.send('Emulation.setDeviceMetricsOverride', {width:1440,height:1000,deviceScaleFactor:1,mobile:false});
+  for (let i=0;i<21;i++) {
+    const name=`paged_${String(i).padStart(2,'0')}`;
+    assert.equal((await finished(await api('sources','POST',{id:name,kind:'postgres',catalog_alias:name,secret_ref:'MISSING_PAGED_DSN',default_schema:'public',allowed_schemas:['public'],read_only:true}))).status,'Succeeded');
+    const source=await api(`sources/${name}`);
+    assert.equal((await finished(await api(`sources/${name}`,'PATCH',{target:{incarnation:source.incarnation,expected_revision:source.desired_revision},secret_ref:'MISSING_PAGED_DSN'}))).status,'Succeeded');
+    await api('virtual-databases','POST',{name:`paged_db_${String(i).padStart(2,'0')}`,owner:'fedengine',connect:[],allow_connections:true,schemas:[]});
+  }
+  const pager='document.querySelector("#content .list-pagination")';
+  async function pageText(text) {
+    await until(() => evaluate(`${pager}?.innerText.includes(${JSON.stringify(text)})`), `pager ${text}`);
+  }
+  async function goto(page) { await fill('[aria-label="跳转页码"]',String(page)); await click('跳转',pager); }
+  for (const page of ['sources','databases']) {
+    await evaluate(`document.querySelector('[data-page=${page}]').click()`); await click('↻ 刷新状态');
+    await pageText('共 21 项');
+    const items=page==='sources'?'#source-rows tbody tr':'#database-rows .database-entry';
+    assert.equal(await evaluate(`document.querySelectorAll('${items}').length`),10);
+    await click('下一页',pager); await pageText('第 2 / 3 页');
+    await click('↻ 刷新状态'); await sleep(300); await pageText('第 2 / 3 页');
+    if (page==='sources') { await click('管理 →'); await click('← 返回数据源列表'); }
+    else { await click('paged_db_10','document.querySelector("#content")'); await click('← 业务虚拟库'); }
+    await pageText('第 2 / 3 页');
+    await goto(3); await pageText('第 3 / 3 页');
+    assert.equal(await evaluate(`document.querySelectorAll('${items}').length`),1);
+    const search=page==='sources'?'搜索数据源':'搜索虚拟数据库';
+    await fill(`[aria-label="${search}"]`,page==='sources'?'paged_20':'paged_db_20'); await pageText('共 1 项 · 第 1 / 1 页');
+    await evaluate(`document.querySelector('[aria-label="${search}"]').focus()`); await sleep(2800);
+    assert.equal(await evaluate(`document.activeElement.getAttribute('aria-label')`),search);
+    await fill(`[aria-label="${search}"]`,'no-such-page'); await pageText('共 0 项 · 第 1 / 1 页');
+    await fill(`[aria-label="${search}"]`,'');
+    await fill('[aria-label="每页条数"]','20'); await pageText('第 1 / 2 页');
+    assert.equal(await evaluate(`document.querySelectorAll('${items}').length`),20);
+    await click('下一页',pager); await pageText('第 2 / 2 页');
+    if (page==='databases') {
+      await click('删除'); await click('确认删除业务库','document.querySelector("#dialog")'); await closed();
+      await pageText('共 20 项 · 第 1 / 1 页');
+    }
+    await fill('[aria-label="每页条数"]','10');
+  }
+  await evaluate('sessionStorage.removeItem("fedengine.operations")');
+  await cdp.send('Page.reload'); await waitText('数据源列表');
+  await evaluate('document.querySelector("[data-page=operations]").click()');
+  const history=await api('operations?limit=100'); assert(history.total>40);
+  await pageText(`共 ${history.total} 项`);
+  const seen=new Set();
+  const pages=Math.ceil(history.total/10);
+  for(let i=1;i<=pages;i++) {
+    await pageText(`第 ${i} / ${pages} 页`);
+    for(const id of await evaluate('[...document.querySelectorAll("#operation-rows .operation-id")].map(n=>n.textContent)')) {
+      assert(!seen.has(id),'operation pages must not duplicate');seen.add(id);
+    }
+    if(i<pages) await click('下一页',pager);
+  }
+  assert.equal(seen.size,history.total,'fresh browser must see all persisted history');
+  await fill('[aria-label="搜索操作编号、源 ID、动作或状态"]','paged_20'); await pageText('共 2 项 · 第 1 / 1 页');
+  await click('查看结果'); await waitText('操作详情'); await click('取消','document.querySelector("#dialog")');
+  await fill('[aria-label="搜索操作编号、源 ID、动作或状态"]','absent'); await pageText('共 0 项 · 第 1 / 1 页');
+  await fill('[aria-label="搜索操作编号、源 ID、动作或状态"]',''); await pageText(`共 ${history.total} 项`);
+  await fill('[aria-label="每页条数"]','20'); await pageText(`第 1 / ${Math.ceil(history.total/20)} 页`);
+  await goto(2); await pageText(`第 2 / ${Math.ceil(history.total/20)} 页`);
+  await click('↻ 刷新状态'); await sleep(300); await pageText(`第 2 / ${Math.ceil(history.total/20)} 页`);
+  for (const page of ['sources','databases','operations']) {
+    await evaluate(`document.querySelector('[data-page=${page}]').click()`);
+    await cdp.send('Emulation.setDeviceMetricsOverride', {width:320,height:844,deviceScaleFactor:1,mobile:true});
+    await until(() => evaluate('!!document.querySelector(".list-pagination")'),'mobile pager');
+    assert.equal(await evaluate('document.documentElement.scrollWidth <= window.innerWidth'),true,`${page} mobile pagination`);
+    assert.equal(await evaluate('document.querySelector("#database-navigation").hidden'),true);
+  }
+  assert.deepEqual(exceptions,[]); assert.deepEqual(blocked,[]);
+  console.log('Passed: source/database/history pagination, sizes/jump, filters, focus/refresh/detail retention, deletion clamp, fresh-browser complete history and mobile layout');
   engine.kill('SIGTERM'); await once(engine, 'exit');
   assert.equal(engine.exitCode, 0); assert.match(engine.output, /GracefullyStopped/u);
   console.log('Passed: isolated process checked drain');

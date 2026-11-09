@@ -1,4 +1,4 @@
-> Generated snapshot; source: docs/concepts/component-model.md; source sha256: 81821b126c2b27567c05cff87c33a777530b766f7a7782a90a969d7fa35619e0; revision 1.0.5. Do not edit.
+> Generated snapshot; source: docs/concepts/component-model.md; source sha256: 81821b126c2b27567c05cff87c33a777530b766f7a7782a90a969d7fa35619e0; revision 1.0.6. Do not edit.
 
 # 两种组件角色
 

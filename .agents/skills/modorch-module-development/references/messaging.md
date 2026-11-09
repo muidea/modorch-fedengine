@@ -1,4 +1,4 @@
-> Generated snapshot; source: docs/guides/messaging.md; source sha256: 23bc434a82df7c5f2b1a3792c7b68928c0bdbfddcae73b811f5f41ac97a1ad06; revision 1.0.5. Do not edit.
+> Generated snapshot; source: docs/guides/messaging.md; source sha256: 23bc434a82df7c5f2b1a3792c7b68928c0bdbfddcae73b811f5f41ac97a1ad06; revision 1.0.6. Do not edit.
 
 # Event、Command 与 Request
 

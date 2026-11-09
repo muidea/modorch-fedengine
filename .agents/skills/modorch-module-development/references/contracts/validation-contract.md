@@ -1,11 +1,11 @@
-> Generated snapshot; source: contracts/validation-contract.md; source sha256: 771a93649df96994119854f4d420d39220160f52c8984dc0c288a07b981e40b6; revision 1.0.5. Do not edit.
+> Generated snapshot; source: contracts/validation-contract.md; source sha256: 9ab8b4f0fa05dfa9790741cfa383dd8be2f2aa0fa8f26125d092ec4a5127f34c; revision 1.0.6. Do not edit.
 
 # Validation Contract
 
 ## VAL-001：规则到执行证据
 
 - Level: MUST
-- Applies to: Contract revision 1.1.0
+- Applies to: Contract revision 1.2.0
 - Status: Implemented
 - Precondition: 声称当前能力已通过验收。
 - Trigger: 执行 tools/doc-validation/check-contracts.sh。

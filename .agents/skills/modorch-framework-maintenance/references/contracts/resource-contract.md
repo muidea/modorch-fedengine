@@ -1,8 +1,8 @@
-> Generated snapshot; source: contracts/resource-contract.md; source sha256: 78dbf4ee1b4c562666c489c4830840ad2ec5f0630a2f5457fdc8bba6c918be07; revision 1.0.5. Do not edit.
+> Generated snapshot; source: contracts/resource-contract.md; source sha256: 04263d1e70bffcc8decfc9fa988a7a9b98a98680fc923e7a46a9df1d895a6615; revision 1.0.6. Do not edit.
 
 # Resource Contract
 
-适用于 modorch 0.0.2 当前开发树，Contract revision 1.1.0。维护责任：Framework Maintainer + QA。发布前必须以验证报告确认；规则文本和源码冲突时阻断发布。
+适用于 modorch 0.0.2 当前开发树，Contract revision 1.2.0。维护责任：Framework Maintainer + QA。发布前必须以验证报告确认；规则文本和源码冲突时阻断发布。
 
 ## RES-001：服务访问与身份
 

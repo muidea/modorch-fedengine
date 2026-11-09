@@ -321,6 +321,116 @@ async fn registration_versions_idempotency_and_deletion_survive_restart_without_
     assert_eq!(engine.handle.task_metrics().tasks, 0);
 }
 
+#[tokio::test]
+async fn operation_history_paginates_all_persisted_records_and_validates_queries() {
+    let temporary = TestDirectory::new();
+    let config = configuration(&temporary);
+    let engine = FedEngine::start(config.clone()).await.unwrap();
+    let address = engine.management_address().unwrap();
+    let empty = get(address, "operations").await;
+    assert_eq!(empty, json!({"items":[],"total":0,"offset":0,"limit":10}));
+    // More than the browser's progress cache: history must be server-owned.
+    let mut ids = std::collections::BTreeSet::new();
+    for index in 0..43 {
+        let mut definition = definition();
+        definition["id"] = json!(format!("history_{index:02}"));
+        definition["catalog_alias"] = json!(format!("history_{index:02}"));
+        let operation = submit(
+            address,
+            "POST",
+            "sources",
+            &format!("history-{index}"),
+            definition,
+        )
+        .await;
+        ids.insert(operation["id"].as_str().unwrap().to_owned());
+    }
+    let all = get(address, "operations?limit=100").await;
+    assert_eq!(all["total"], 43);
+    let records = all["items"].as_array().unwrap();
+    assert!(records.windows(2).all(|pair| {
+        (pair[0]["created_at"].as_str(), pair[0]["id"].as_str())
+            > (pair[1]["created_at"].as_str(), pair[1]["id"].as_str())
+    }));
+    let mut paged_ids = std::collections::BTreeSet::new();
+    for offset in [0, 10, 20, 30, 40] {
+        let page = get(address, &format!("operations?offset={offset}&limit=10")).await;
+        assert_eq!(page["offset"], offset);
+        assert_eq!(page["total"], 43);
+        assert_eq!(
+            page["items"],
+            json!(records.iter().skip(offset).take(10).collect::<Vec<_>>())
+        );
+        for item in page["items"].as_array().unwrap() {
+            assert!(paged_ids.insert(item["id"].as_str().unwrap().to_owned()));
+        }
+    }
+    assert_eq!(ids, paged_ids);
+    assert_eq!(get(address, "operations?offset=9999").await["offset"], 40);
+    assert_eq!(
+        get(address, "operations?search=HISTORY_42&offset=40").await["total"],
+        1
+    );
+    assert_eq!(
+        get(address, "operations?search=history_42&offset=40").await["offset"],
+        0
+    );
+    assert_eq!(
+        get(address, "operations?search=register").await["total"],
+        43
+    );
+    assert_eq!(
+        get(address, "operations?search=Succeeded").await["total"],
+        43
+    );
+    let absent = get(address, "operations?search=absent&offset=999").await;
+    assert_eq!(absent["total"], 0);
+    assert_eq!(absent["offset"], 0);
+    for query in [
+        "limit=0",
+        "limit=101",
+        "offset=-1",
+        "limit=abc",
+        "unknown=x",
+        "limit=10&limit=20",
+        "offset=99999999999999999999999999999999",
+    ] {
+        assert_eq!(
+            http(
+                address,
+                "GET",
+                &format!("operations?{query}"),
+                None,
+                Value::Null
+            )
+            .await
+            .0,
+            400,
+            "{query}"
+        );
+    }
+    assert_eq!(
+        http(
+            address,
+            "GET",
+            &format!("operations?search={}", "x".repeat(257)),
+            None,
+            Value::Null
+        )
+        .await
+        .0,
+        400
+    );
+    engine.shutdown_until_drained().await.unwrap();
+    drop(engine);
+    let engine = FedEngine::start(config).await.unwrap();
+    assert_eq!(
+        get(engine.management_address().unwrap(), "operations?limit=100").await,
+        all
+    );
+    engine.shutdown_until_drained().await.unwrap();
+}
+
 #[path = "common/wire.rs"]
 mod wire;
 #[tokio::test]
@@ -897,12 +1007,21 @@ async fn zero_source_online_activation_catalog_refresh_rollback_portal_drain_and
     });
     assert_eq!(
         reader
-            .query_one("SELECT count(*) FROM pg_class WHERE relkind='f'", &[])
+            .query_one("SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='mapped' AND c.relname='online_items' AND c.relkind='f'", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        1,
+        "pg_catalog describes bound objects independently of SELECT privileges"
+    );
+    assert_eq!(
+        reader
+            .query_one("SELECT count(*) FROM information_schema.tables WHERE table_schema='mapped' AND table_name='online_items'", &[])
             .await
             .unwrap()
             .get::<_, i64>(0),
         0,
-        "CONNECT must not reveal source objects"
+        "information_schema must filter objects without SELECT privileges"
     );
     assert!(
         reader

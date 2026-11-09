@@ -1,11 +1,11 @@
-> Generated snapshot; source: contracts/compatibility-contract.md; source sha256: fb0eb6208ce196b1d72a4e33bf70684fafbe2dec7be9362c0c0d0088b303a94b; revision 1.0.5. Do not edit.
+> Generated snapshot; source: contracts/compatibility-contract.md; source sha256: 93524505d169b9832665892dcb2e67ccb8a0cd286ea27d8aa4bbeaf0ab78f51f; revision 1.0.6. Do not edit.
 
 # Compatibility Contract
 
 ## COMPAT-001：版本与来源匹配
 
 - Level: MUST
-- Applies to: 0.0.2 开发树；Skill revision 1.0.5
+- Applies to: 0.0.2 开发树；Skill revision 1.0.6
 - Status: Implemented；执行证据见本次验证报告
 - Precondition: 外部应用准备运行 Skill 或安装 Bundle。
 - Trigger: preflight 通过 Cargo metadata --locked --offline 读取实际解析依赖。

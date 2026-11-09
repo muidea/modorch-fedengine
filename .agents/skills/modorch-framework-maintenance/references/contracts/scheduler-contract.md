@@ -1,8 +1,8 @@
-> Generated snapshot; source: contracts/scheduler-contract.md; source sha256: 9b077abd5fc9d4e86f2462c099227e61756a1e61b450ce1a0e6632366453e4bb; revision 1.0.5. Do not edit.
+> Generated snapshot; source: contracts/scheduler-contract.md; source sha256: 9f0002c1634520c1c4ec324b468bb123f5c72cb5b1ac340625bb9287b91581fb; revision 1.0.6. Do not edit.
 
 # Scheduler Contract
 
-适用于 modorch 0.0.2 当前开发树，Contract revision 1.1.0。维护责任：Framework Maintainer + QA。发布前必须以验证报告确认；规则文本和源码冲突时阻断发布。
+适用于 modorch 0.0.2 当前开发树，Contract revision 1.2.0。维护责任：Framework Maintainer + QA。发布前必须以验证报告确认；规则文本和源码冲突时阻断发布。
 
 ## SCH-001：Owner 与取消
 

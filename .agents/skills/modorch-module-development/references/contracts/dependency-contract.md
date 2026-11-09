@@ -1,8 +1,8 @@
-> Generated snapshot; source: contracts/dependency-contract.md; source sha256: 85672b411b21ec3db9600be4c18af29492704c91d109414ccfe96c317cc74bb9; revision 1.0.5. Do not edit.
+> Generated snapshot; source: contracts/dependency-contract.md; source sha256: 786bb5702e07a9e644df14a06469bf510dac177985ce00851b50bde5ada39680; revision 1.0.6. Do not edit.
 
 # Dependency Contract
 
-适用于 modorch 0.0.2 当前开发树，Contract revision 1.1.0。维护责任：Framework Maintainer + QA。发布前必须以验证报告确认；规则文本和源码冲突时阻断发布。
+适用于 modorch 0.0.2 当前开发树，Contract revision 1.2.0。维护责任：Framework Maintainer + QA。发布前必须以验证报告确认；规则文本和源码冲突时阻断发布。
 
 ## DEP-001：依赖闭包与拓扑
 

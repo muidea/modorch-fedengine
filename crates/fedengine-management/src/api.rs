@@ -219,7 +219,7 @@ fn error_response(error: EngineError) -> Response {
     )
         .into_response()
 }
-use crate::pagination::CatalogParameters;
+use crate::pagination::{CatalogParameters, OperationParameters};
 fn decode(
     method: &Method,
     uri: &Uri,
@@ -240,6 +240,16 @@ fn decode(
             ["virtual-databases", name] => ManagementRequest::VirtualDatabase((*name).into()),
             ["sources"] => ManagementRequest::List,
             ["sources", id] => ManagementRequest::Get(DataSourceId((*id).into())),
+            ["operations"] => {
+                let query = axum::extract::Query::<OperationParameters>::try_from_uri(uri)
+                    .map_err(|_| EngineError::config("invalid operation query parameters"))?
+                    .0;
+                ManagementRequest::Operations {
+                    offset: query.offset.unwrap_or(0),
+                    limit: query.limit.unwrap_or(10),
+                    search: query.search.unwrap_or_default(),
+                }
+            }
             ["operations", id] => ManagementRequest::Operation((*id).into()),
             ["sources", id, "catalog"] => {
                 let query = axum::extract::Query::<CatalogParameters>::try_from_uri(uri)

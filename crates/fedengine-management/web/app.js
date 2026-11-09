@@ -21,11 +21,38 @@ function saveSession(key, value) {
   try { sessionStorage.setItem(key, JSON.stringify(value)); } catch { /* In-memory retry remains available. */ }
 }
 const state = {
-  sources: [], databases: [], operations: new Map(), page: 'sources', selected: null, search: '',
+  sources: [], databases: [], operations: new Map(), page: 'sources', selected: null,
   operationIds: readSession('fedengine.operations', []).slice(0, 40),
   pending: readSession('fedengine.pending', null), writing: false, loading: false,
   initialized: false, sourceSignature: '', databaseSignature: '',
 };
+
+const lists = Object.fromEntries(['sources', 'databases', 'operations'].map(name => [name, { page: 1, size: 10, search: '' }]));
+function pageItems(name, items) {
+  const list = lists[name];
+  list.page = Math.min(list.page, Math.max(1, Math.ceil(items.length / list.size)));
+  return items.slice((list.page - 1) * list.size, list.page * list.size);
+}
+function listSearch(name, label, changed) {
+  return el('input', { type: 'search', 'aria-label': label, placeholder: label, value: lists[name].search,
+    oninput: event => { lists[name].search = event.target.value; lists[name].page = 1; changed(); } });
+}
+function listPager(name, total, changed) {
+  const list = lists[name], pages = Math.max(1, Math.ceil(total / list.size));
+  const move = page => { list.page = Math.max(1, Math.min(pages, page)); return changed(); };
+  const size = el('select', { 'aria-label': '每页条数', onchange: event => {
+    list.size = Number(event.target.value); list.page = 1; changed();
+  } }, [10, 20, 50, 100].map(value => el('option', { value }, `${value} 条 / 页`)));
+  size.value = String(list.size);
+  const jump = el('input', { type: 'number', min: 1, max: pages, value: list.page, 'aria-label': '跳转页码', required: true });
+  return el('nav', { class: 'list-pagination', 'aria-label': `${name} 分页` },
+    el('span', {}, `共 ${total} 项 · 第 ${list.page} / ${pages} 页`),
+    el('div', { class: 'list-page-controls' }, size,
+      button('上一页', () => move(list.page - 1), 'small', false, list.page === 1),
+      el('span', { 'aria-current': 'page' }, list.page),
+      button('下一页', () => move(list.page + 1), 'small', false, list.page === pages),
+      el('form', { onsubmit: guard(event => { event.preventDefault(); return move(Number(jump.value)); }) }, jump, el('button', { type: 'submit', class: 'small' }, '跳转'))));
+}
 
 // All remote strings are rendered as text nodes, including errors and metadata.
 function el(tag, attrs = {}, ...children) {
@@ -190,8 +217,8 @@ async function reload() {
     else if (state.page === 'sources') {
       if (state.selected && (sourcesChanged || sources.some(source => source.id === state.selected && source.current_operation))) renderSourceOverview();
       else if (!state.selected && sourcesChanged) renderSourceRows();
-    } else if (state.page === 'databases' && databasesChanged) renderDatabases();
-    if (state.page === 'operations') renderOperations();
+    } else if (state.page === 'databases' && (databasesChanged || sourcesChanged)) renderDatabaseRows();
+    if (state.page === 'operations') await loadOperations();
   } catch (error) {
     $('#connection').textContent = '● 管理服务暂不可用'; $('#connection').className = 'offline';
     if (!state.initialized) replace($('#content'), empty('无法连接管理服务', '请检查服务状态，然后点击刷新重试。'));
@@ -285,8 +312,7 @@ function sourceName(source) {
     el('div', {}, button(sourceLabel(source), () => navigate('sources', source.id), 'link name-text'), el('span', { class: 'subtext' }, source.id)));
 }
 function renderSources() {
-  const search = el('input', { type: 'search', placeholder: '搜索名称或数据源 ID…', 'aria-label': '搜索数据源', value: state.search,
-    oninput: event => { state.search = event.target.value; renderSourceRows(); } });
+  const search = listSearch('sources', '搜索数据源', renderSourceRows);
   replace($('#content'), el('section', { class: 'panel' },
     el('div', { class: 'panel-heading' }, el('div', {}, el('h3', {}, '数据源列表'), el('p', {}, '先登记并核对连接，再选择 Schema、激活数据源。')),
       el('div', { class: 'toolbar' }, search)), el('div', { id: 'source-rows' })),
@@ -295,15 +321,17 @@ function renderSources() {
 }
 function renderSourceRows() {
   const container = $('#source-rows'); if (!container) return;
-  const sources = state.sources.filter(source => `${source.id} ${sourceLabel(source)} ${source.desired.definition.organization?.virtual_database ?? ''} ${source.kind}`.toLowerCase().includes(state.search.toLowerCase()));
-  replace(container, sources.length ? table(['数据源 / ID', '类型', '状态', '纳管范围', '版本', '操作'], sources.map(source => {
+  const sources = state.sources.filter(source => `${source.id} ${sourceLabel(source)} ${source.desired.definition.organization?.virtual_database ?? ''} ${source.kind}`.toLowerCase().includes(lists.sources.search.trim().toLowerCase()))
+    .sort((a, b) => sourceLabel(a).localeCompare(sourceLabel(b)) || a.id.localeCompare(b.id));
+  const visible = pageItems('sources', sources);
+  replace(container, sources.length ? table(['数据源 / ID', '类型', '状态', '纳管范围', '版本', '操作'], visible.map(source => {
     const bindings = source.desired.bindings.filter(binding => binding.enabled).map(binding => binding.remote_schema);
     return el('tr', {}, el('td', {}, sourceName(source)), el('td', {}, source.kind === 'postgres' ? 'PostgreSQL' : 'MySQL'),
       el('td', {}, badge(source.status), source.current_operation ? el('span', { class: 'subtext' }, '有进行中操作') : null),
       el('td', {}, bindings.join(', ') || '未选择'),
       el('td', {}, `${source.applied_revision ?? '—'} / ${source.desired_revision}`, el('span', { class: 'subtext' }, '生效 / 期望')),
       el('td', {}, button('管理 →', () => navigate('sources', source.id), 'link')));
-  })) : empty(state.sources.length ? '没有匹配的数据源' : '尚未登记数据源', '点击右上角“登记数据源”开始接入。'));
+  })) : empty(state.sources.length ? '没有匹配的数据源' : '尚未登记数据源', '点击右上角“登记数据源”开始接入。'), listPager('sources', sources.length, renderSourceRows));
 }
 function renderSource() {
   replace($('#content'), button('← 返回数据源列表', () => navigate('sources'), 'link back'),
@@ -479,8 +507,18 @@ function confirmSource(source, action) {
 }
 
 function renderDatabases() {
-  replace($('#content'),
-    state.databases.length ? el('div', { class: 'db-grid' }, state.databases.map(database => {
+  replace($('#content'), el('section', { class: 'panel' }, el('div', { class: 'panel-heading' },
+    el('h3', {}, '虚拟数据库列表'), listSearch('databases', '搜索虚拟数据库', renderDatabaseRows))), el('div', { id: 'database-rows' }));
+  renderDatabaseRows();
+}
+function renderDatabaseRows() {
+  const container = $('#database-rows'); if (!container) return;
+  const search = lists.databases.search.trim().toLowerCase();
+  const databases = state.databases.filter(database => `${database.config.name} ${database.config.owner} ${database.config.schemas.map(s => s.name).join(' ')}`.toLowerCase().includes(search))
+    .sort((a, b) => a.config.name.localeCompare(b.config.name) || a.oid - b.oid);
+  const visible = pageItems('databases', databases);
+  replace(container,
+    databases.length ? el('div', { class: 'db-grid' }, visible.map(database => {
       const config = database.config;
       return el('section', { class: 'panel' },
         el('div', { class: 'panel-heading' }, el('div', {}, el('h3', {}, button(config.name, () => navigate('browser', database.oid), 'link database-entry')),
@@ -491,7 +529,7 @@ function renderDatabases() {
             el('div', {}, config.schemas.filter(mapping => mapping.name === name).map(mapping => el('div', {}, sourceLabel(state.sources.find(source => source.id === mapping.source)) ?? mapping.source,
               el('span', { class: 'subtext' }, mapping.remote_schema)))), el('span', { class: 'badge' }, '只读'))) : el('p', { class: 'small-note' }, '尚无外部 Schema 映射'),
           database.managed ? null : el('div', { class: 'actions form-section' }, button('编辑定义与映射', () => databaseForm(database), '', true), button('删除', () => deleteDatabase(database), 'danger', true))));
-    })) : empty('尚未创建业务虚拟库', '创建业务库后，可将多个来源映射到不同 Schema。'));
+    })) : empty(state.databases.length ? '没有匹配的虚拟数据库' : '尚未创建业务虚拟库'), listPager('databases', databases.length, renderDatabaseRows));
 }
 function databaseForm(database = null) {
   const config = database?.config ?? { name: '', owner: '', connect: [], allow_connections: true, schemas: [] };
@@ -538,28 +576,42 @@ function deleteDatabase(database) {
     () => write('DELETE', `virtual-databases/${encodeURIComponent(database.config.name)}`,
       { target: { oid: database.oid, expected_revision: database.revision } }, '删除业务库'), '确认删除业务库');
 }
+let operationEpoch = 0;
+let operationTimer;
 function renderOperations() {
-  const operations = [...state.operations.values()].sort((a, b) => b.created_at.localeCompare(a.created_at));
-  const signature = JSON.stringify(operations);
-  if ($('#operation-rows') && state.operationSignature === signature) return;
-  state.operationSignature = signature;
-  if (!$('#operation-rows')) {
-    const lookup = el('input', { required: true, placeholder: '输入操作编号', 'aria-label': '操作编号' });
-    replace($('#content'), el('p', { class: 'operation-history' }, '显示本浏览器会话最近 40 项操作及当前源的进行中操作。可输入已知编号查询服务端记录。'),
-      el('form', { class: 'toolbar form-section', onsubmit: guard(async event => {
-        event.preventDefault(); const operation = await get(`operations/${encodeURIComponent(lookup.value.trim())}`);
-        rememberOperation(operation.id); state.operations.set(operation.id, operation); renderOperations();
-      }) }, lookup, el('button', { type: 'submit' }, '查询操作')),
-      panel('操作记录', '已受理不等于执行成功；等待状态会持续更新。', el('div', { id: 'operation-rows' })));
+  replace($('#content'), panel('操作记录', '', el('div', { class: 'panel-body toolbar' },
+    listSearch('operations', '搜索操作编号、源 ID、动作或状态', () => {
+      operationEpoch++;
+      clearTimeout(operationTimer); operationTimer = setTimeout(() => loadOperations(), 250);
+    })), el('div', { id: 'operation-rows' }, empty('正在读取操作记录…'))));
+  loadOperations();
+}
+async function loadOperations() {
+  if (state.page !== 'operations') return;
+  const epoch = ++operationEpoch, container = $('#operation-rows'), list = lists.operations;
+  if (!container) return;
+  const rawSearch = list.search.trim();
+  const search = Object.entries({ ...labels, ...actionLabels }).find(([, label]) => label === rawSearch)?.[0] ?? rawSearch;
+  const query = new URLSearchParams({ offset: (list.page - 1) * list.size, limit: list.size, search });
+  try {
+    const page = await get(`operations?${query}`);
+    if (epoch !== operationEpoch || state.page !== 'operations' || container !== $('#operation-rows')) return;
+    list.page = Math.floor(page.offset / page.limit) + 1;
+    const signature = JSON.stringify([page, state.sourceSignature]);
+    if (container.responseSignature === signature) return;
+    container.responseSignature = signature;
+    replace(container, page.items.length ? table(['操作', '数据源', '状态 / 阶段', '更新时间', '详情'], page.items.map(operation => {
+      const id = operation.action.id ?? operation.action.definition?.id ?? '—';
+      return el('tr', {}, el('td', {}, actionLabels[operation.action.action] ?? operation.action.action, el('span', { class: 'subtext operation-id' }, operation.id)),
+        el('td', {}, state.sources.find(source => source.id === id)?.catalog_alias ?? id),
+        el('td', {}, badge(operation.status), el('span', { class: 'subtext' }, operation.phase)),
+        el('td', {}, time(operation.updated_at)), el('td', {}, button('查看结果', async () => showJson('操作详情', await get(`operations/${encodeURIComponent(operation.id)}`)), 'link')));
+    })) : empty(list.search ? '没有匹配的操作记录' : '尚无操作记录'), listPager('operations', page.total, loadOperations));
+  } catch (error) {
+    if (epoch !== operationEpoch || state.page !== 'operations' || container !== $('#operation-rows')) return;
+    container.responseSignature = null;
+    replace(container, empty('操作记录读取失败', error.message), button('重试', loadOperations));
   }
-  replace($('#operation-rows'),
-    operations.length ? table(['操作', '数据源', '状态 / 阶段', '更新时间', '详情'], operations.map(operation => {
-        const id = operation.action.id ?? operation.action.definition?.id ?? '—';
-        return el('tr', {}, el('td', {}, actionLabels[operation.action.action] ?? operation.action.action, el('span', { class: 'subtext operation-id' }, operation.id)),
-          el('td', {}, state.sources.find(source => source.id === id)?.catalog_alias ?? id),
-          el('td', {}, badge(operation.status), el('span', { class: 'subtext' }, operation.phase)),
-          el('td', {}, time(operation.updated_at)), el('td', {}, button('查看结果', () => showJson('操作详情', state.operations.get(operation.id)), 'link')));
-      })) : empty('尚无操作记录', '在页面提交操作后，可在这里跟踪进度。'));
 }
 
 document.querySelectorAll('[data-page]').forEach(node => node.addEventListener('click', () => navigate(node.dataset.page)));

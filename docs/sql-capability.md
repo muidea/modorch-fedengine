@@ -7,7 +7,7 @@
 | SELECT、聚合、CTE、子查询、JOIN | 可跨 PostgreSQL/MySQL；函数为显式安全白名单 |
 | INSERT/UPDATE/DELETE | 完整对象和依赖必须属于一个注册源；使用官方扩展原生集合操作 |
 | 无主键表 | 不自行逐行拼装写入，原生路径的重复行、NULL 与影响行数由集成测试验证 |
-| 多语句 Simple Query | 仅允许全为只读 SELECT；带写入、DDL 或事务时整条消息执行前拒绝 |
+| 多语句 Simple Query | 允许受支持的只读查询及 SET/RESET；带写入、DDL 或事务时整条消息执行前拒绝 |
 | 参数 | 显式 PG OID 或 SQL cast；无法推断返回 42P18；不猜测未知类型 |
 | 显式事务 BEGIN/COMMIT/ROLLBACK | 0A000；ReadyForQuery 保持 Idle |
 | COPY、RETURNING、临时对象、视图、任意管理 SQL | 拒绝 |

@@ -1,0 +1,696 @@
+{
+  "revision": "1.1.1",
+  "suites": {
+    "bundle": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "--test",
+        "bundle",
+        "--",
+        "--test-threads=1"
+      ],
+      "scope": "local",
+      "kind": "production-bundle"
+    },
+    "ingress": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "--test",
+        "ingress",
+        "--",
+        "--test-threads=1"
+      ],
+      "scope": "local",
+      "kind": "network-boundary-fixture"
+    },
+    "standalone": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "--test",
+        "standalone",
+        "--",
+        "--test-threads=1"
+      ],
+      "scope": "local",
+      "kind": "production-bundle"
+    },
+    "protocol": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "--test",
+        "protocol",
+        "--",
+        "--test-threads=1"
+      ],
+      "scope": "local",
+      "kind": "production-bundle"
+    },
+    "instances": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "--test",
+        "instances",
+        "--",
+        "--test-threads=1"
+      ],
+      "scope": "local",
+      "kind": "production-bundle"
+    },
+    "management": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "--test",
+        "management",
+        "--",
+        "--test-threads=1"
+      ],
+      "scope": "local",
+      "kind": "production-bundle-and-quota-fixture"
+    },
+    "observation": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "modorch-fedengine",
+        "--lib",
+        "--",
+        "--test-threads=1"
+      ],
+      "scope": "local",
+      "kind": "framework-observation-fixture"
+    },
+    "external": {
+      "command": [
+        "python3",
+        "scripts/test-embedded-host.py"
+      ],
+      "scope": "external",
+      "kind": "external-facade-consumer"
+    },
+    "federation": {
+      "command": [
+        "scripts/test-federation.sh"
+      ],
+      "scope": "remote",
+      "kind": "disposable-pg-mysql"
+    },
+    "clients": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "--test",
+        "clients",
+        "--",
+        "--test-threads=1"
+      ],
+      "scope": "local",
+      "kind": "production-bundle-public-clients"
+    },
+    "message_budget": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "modorch-fedengine-contract",
+        "--lib"
+      ],
+      "scope": "local",
+      "kind": "logical-message-cost-boundary"
+    }
+  },
+  "tests": [
+    {
+      "suite": "bundle",
+      "source": "tests/bundle.rs",
+      "name": "registration_and_build_do_not_touch_files_ports_or_secrets",
+      "output": "registration_and_build_do_not_touch_files_ports_or_secrets",
+      "rules": [
+        "FE-BUNDLE-001"
+      ]
+    },
+    {
+      "suite": "bundle",
+      "source": "tests/bundle.rs",
+      "name": "registration_preserves_existing_state_without_opening_or_repairing_it",
+      "output": "registration_preserves_existing_state_without_opening_or_repairing_it",
+      "rules": [
+        "FE-BUNDLE-001",
+        "FE-STATE-002"
+      ]
+    },
+    {
+      "suite": "bundle",
+      "source": "tests/bundle.rs",
+      "name": "invalid_configuration_and_overflow_fail_before_registering_factories",
+      "output": "invalid_configuration_and_overflow_fail_before_registering_factories",
+      "rules": [
+        "FE-BUNDLE-002"
+      ]
+    },
+    {
+      "suite": "bundle",
+      "source": "tests/bundle.rs",
+      "name": "duplicate_bundle_and_late_collision_report_the_actual_identity",
+      "output": "duplicate_bundle_and_late_collision_report_the_actual_identity",
+      "rules": [
+        "FE-BUNDLE-002"
+      ]
+    },
+    {
+      "suite": "bundle",
+      "source": "tests/bundle.rs",
+      "name": "host_must_explicitly_select_required_dependencies",
+      "output": "host_must_explicitly_select_required_dependencies",
+      "rules": [
+        "FE-BUNDLE-002"
+      ]
+    },
+    {
+      "suite": "bundle",
+      "source": "tests/bundle.rs",
+      "name": "unselected_engine_stays_uninstantiated_and_preserves_host_selection_and_budgets",
+      "output": "unselected_engine_stays_uninstantiated_and_preserves_host_selection_and_budgets",
+      "rules": [
+        "FE-BUNDLE-001"
+      ]
+    },
+    {
+      "suite": "bundle",
+      "source": "tests/bundle.rs",
+      "name": "unsupported_profiles_and_invalid_core_modes_fail_before_registration",
+      "output": "unsupported_profiles_and_invalid_core_modes_fail_before_registration",
+      "rules": [
+        "FE-PROFILE-001"
+      ]
+    },
+    {
+      "suite": "bundle",
+      "source": "tests/bundle.rs",
+      "name": "managed_http_only_ignores_pg_transport_and_auth_but_keeps_virtual_databases",
+      "output": "managed_http_only_ignores_pg_transport_and_auth_but_keeps_virtual_databases",
+      "rules": [
+        "FE-PROFILE-001"
+      ]
+    },
+    {
+      "suite": "bundle",
+      "source": "tests/bundle.rs",
+      "name": "pg_server_without_http_preserves_managed_virtual_database_queries",
+      "output": "pg_server_without_http_preserves_managed_virtual_database_queries",
+      "rules": [
+        "FE-PROFILE-001"
+      ]
+    },
+    {
+      "suite": "bundle",
+      "source": "tests/bundle.rs",
+      "name": "observations_reject_other_applications_and_remain_isolated",
+      "output": "observations_reject_other_applications_and_remain_isolated",
+      "rules": [
+        "FE-HANDLE-001"
+      ]
+    },
+    {
+      "suite": "bundle",
+      "source": "tests/bundle.rs",
+      "name": "partially_selected_profile_never_claims_full_readiness",
+      "output": "partially_selected_profile_never_claims_full_readiness",
+      "rules": [
+        "FE-HANDLE-001"
+      ]
+    },
+    {
+      "suite": "bundle",
+      "source": "tests/bundle.rs",
+      "name": "failure_before_engine_setup_retains_unknown_identity_without_false_readiness",
+      "output": "failure_before_engine_setup_retains_unknown_identity_without_false_readiness",
+      "rules": [
+        "FE-HANDLE-001"
+      ]
+    },
+    {
+      "suite": "ingress",
+      "source": "tests/ingress.rs",
+      "name": "ipv4_and_ipv6_bind_without_listening_until_all_components_are_ready",
+      "output": "ipv4_and_ipv6_bind_without_listening_until_all_components_are_ready",
+      "rules": [
+        "FE-LIFE-001"
+      ]
+    },
+    {
+      "suite": "ingress",
+      "source": "tests/ingress.rs",
+      "name": "later_activation_failure_compensates_both_live_ingresses",
+      "output": "later_activation_failure_compensates_both_live_ingresses",
+      "rules": [
+        "FE-LIFE-001"
+      ]
+    },
+    {
+      "suite": "ingress",
+      "source": "tests/ingress.rs",
+      "name": "real_listen_failure_compensates_prebound_and_activated_ingresses",
+      "output": "real_listen_failure_compensates_prebound_and_activated_ingresses",
+      "rules": [
+        "FE-LIFE-001"
+      ]
+    },
+    {
+      "suite": "ingress",
+      "source": "tests/ingress.rs",
+      "name": "cancelling_start_wait_still_drains_both_live_ingresses",
+      "output": "cancelling_start_wait_still_drains_both_live_ingresses",
+      "rules": [
+        "FE-LIFE-001"
+      ]
+    },
+    {
+      "suite": "standalone",
+      "source": "tests/standalone.rs",
+      "name": "startup_errors_preserve_framework_cause_cleanup_and_handle_then_allow_restart",
+      "output": "startup_errors_preserve_framework_cause_cleanup_and_handle_then_allow_restart",
+      "rules": [
+        "FE-LIFE-001"
+      ]
+    },
+    {
+      "suite": "standalone",
+      "source": "tests/standalone.rs",
+      "name": "slow_http_request_keeps_adapter_alive_until_retry_really_drains",
+      "output": "slow_http_request_keeps_adapter_alive_until_retry_really_drains",
+      "rules": [
+        "FE-LIFE-002"
+      ]
+    },
+    {
+      "suite": "observation",
+      "source": "crates/modorch-fedengine/src/handle/tests.rs",
+      "name": "live_observation_tracks_real_recovery_and_component_generations",
+      "output": "handle::tests::live_observation_tracks_real_recovery_and_component_generations",
+      "rules": [
+        "FE-HANDLE-001"
+      ]
+    },
+    {
+      "suite": "observation",
+      "source": "crates/modorch-fedengine/src/handle/tests.rs",
+      "name": "forced_shutdown_is_observed_as_forced_instead_of_graceful_or_ready",
+      "output": "handle::tests::forced_shutdown_is_observed_as_forced_instead_of_graceful_or_ready",
+      "rules": [
+        "FE-LIFE-002"
+      ]
+    },
+    {
+      "suite": "instances",
+      "source": "tests/instances.rs",
+      "name": "a_live_management_file_cannot_be_owned_by_two_applications",
+      "output": "a_live_management_file_cannot_be_owned_by_two_applications",
+      "rules": [
+        "FE-STATE-001"
+      ]
+    },
+    {
+      "suite": "instances",
+      "source": "tests/instances.rs",
+      "name": "path_aliases_do_not_bypass_ownership_and_drain_releases_it",
+      "output": "path_aliases_do_not_bypass_ownership_and_drain_releases_it",
+      "rules": [
+        "FE-STATE-001"
+      ]
+    },
+    {
+      "suite": "instances",
+      "source": "tests/instances.rs",
+      "name": "concurrent_new_file_admission_has_exactly_one_owner",
+      "output": "concurrent_new_file_admission_has_exactly_one_owner",
+      "rules": [
+        "FE-STATE-001"
+      ]
+    },
+    {
+      "suite": "instances",
+      "source": "tests/instances.rs",
+      "name": "failed_setup_releases_ownership_without_resetting_existing_state",
+      "output": "failed_setup_releases_ownership_without_resetting_existing_state",
+      "rules": [
+        "FE-CONFIG-001",
+        "FE-STATE-002"
+      ]
+    },
+    {
+      "suite": "instances",
+      "source": "tests/instances.rs",
+      "name": "applications_isolate_paths_ports_receipts_and_persist_identity_across_rename",
+      "output": "applications_isolate_paths_ports_receipts_and_persist_identity_across_rename",
+      "rules": [
+        "FE-CONFIG-001",
+        "FE-STATE-002"
+      ]
+    },
+    {
+      "suite": "management",
+      "source": "tests/management.rs",
+      "name": "registration_versions_idempotency_and_deletion_survive_restart_without_reimport",
+      "output": "registration_versions_idempotency_and_deletion_survive_restart_without_reimport",
+      "rules": [
+        "FE-MANAGE-001",
+        "FE-STATE-002"
+      ]
+    },
+    {
+      "suite": "protocol",
+      "source": "tests/protocol.rs",
+      "name": "scram_simple_extended_parameters_null_and_error_recovery",
+      "output": "scram_simple_extended_parameters_null_and_error_recovery",
+      "rules": [
+        "FE-QUERY-001"
+      ]
+    },
+    {
+      "suite": "protocol",
+      "source": "tests/protocol.rs",
+      "name": "real_cancel_request_interrupts_worker_and_drains",
+      "output": "real_cancel_request_interrupts_worker_and_drains",
+      "rules": [
+        "FE-QUERY-001"
+      ]
+    },
+    {
+      "suite": "protocol",
+      "source": "tests/protocol.rs",
+      "name": "tls_required_without_cert_rejects_before_listener",
+      "output": "tls_required_without_cert_rejects_before_listener",
+      "rules": [
+        "FE-QUERY-001"
+      ]
+    },
+    {
+      "suite": "protocol",
+      "source": "tests/protocol.rs",
+      "name": "rejected_credentials_and_ssl_negotiation",
+      "output": "rejected_credentials_and_ssl_negotiation",
+      "rules": [
+        "FE-QUERY-001"
+      ]
+    },
+    {
+      "suite": "protocol",
+      "source": "tests/protocol.rs",
+      "name": "named_portal_resumes_same_execution_without_materializing_all_rows",
+      "output": "named_portal_resumes_same_execution_without_materializing_all_rows",
+      "rules": [
+        "FE-QUERY-001"
+      ]
+    },
+    {
+      "suite": "protocol",
+      "source": "tests/protocol.rs",
+      "name": "metadata_portal_resumes_and_catalog_cancel_releases_worker",
+      "output": "metadata_portal_resumes_and_catalog_cancel_releases_worker",
+      "rules": [
+        "FE-QUERY-001"
+      ]
+    },
+    {
+      "suite": "protocol",
+      "source": "tests/protocol.rs",
+      "name": "supplied_oid_infers_uncast_parameter_and_preserves_binary_scalars",
+      "output": "supplied_oid_infers_uncast_parameter_and_preserves_binary_scalars",
+      "rules": [
+        "FE-QUERY-001"
+      ]
+    },
+    {
+      "suite": "protocol",
+      "source": "tests/protocol.rs",
+      "name": "tls_handshake_scram_query_and_plaintext_rejection",
+      "output": "tls_handshake_scram_query_and_plaintext_rejection",
+      "rules": [
+        "FE-QUERY-001"
+      ]
+    },
+    {
+      "suite": "protocol",
+      "source": "tests/protocol.rs",
+      "name": "shutdown_cancels_running_query_and_full_suspended_portal",
+      "output": "shutdown_cancels_running_query_and_full_suspended_portal",
+      "rules": [
+        "FE-QUERY-001"
+      ]
+    },
+    {
+      "suite": "protocol",
+      "source": "tests/protocol.rs",
+      "name": "startup_bind_failure_compensates_and_port_can_be_reused",
+      "output": "startup_bind_failure_compensates_and_port_can_be_reused",
+      "rules": [
+        "FE-QUERY-001"
+      ]
+    },
+    {
+      "suite": "protocol",
+      "source": "tests/protocol.rs",
+      "name": "date_time_uuid_and_exact_decimal_wire_values",
+      "output": "date_time_uuid_and_exact_decimal_wire_values",
+      "rules": [
+        "FE-QUERY-001"
+      ]
+    },
+    {
+      "suite": "protocol",
+      "source": "tests/protocol.rs",
+      "name": "named_objects_reject_duplicates_and_sync_close_release_quotas",
+      "output": "named_objects_reject_duplicates_and_sync_close_release_quotas",
+      "rules": [
+        "FE-QUERY-001"
+      ]
+    },
+    {
+      "suite": "protocol",
+      "source": "tests/protocol.rs",
+      "name": "catalog_wire_types_session_execute_and_namespace_invalidation",
+      "output": "catalog_wire_types_session_execute_and_namespace_invalidation",
+      "rules": [
+        "FE-QUERY-001"
+      ]
+    },
+    {
+      "suite": "protocol",
+      "source": "tests/protocol.rs",
+      "name": "unknown_startup_database_is_rejected",
+      "output": "unknown_startup_database_is_rejected",
+      "rules": [
+        "FE-QUERY-001"
+      ]
+    },
+    {
+      "suite": "protocol",
+      "source": "tests/protocol.rs",
+      "name": "omitted_and_empty_startup_database_use_login_user_database",
+      "output": "omitted_and_empty_startup_database_use_login_user_database",
+      "rules": [
+        "FE-QUERY-001"
+      ]
+    },
+    {
+      "suite": "external",
+      "source": "examples/embedded-in-modorch/tests/host.rs",
+      "name": "registration_and_build_preserve_existing_bytes_without_io_or_runtime",
+      "output": "registration_and_build_preserve_existing_bytes_without_io_or_runtime",
+      "rules": [
+        "FE-BUNDLE-001"
+      ]
+    },
+    {
+      "suite": "external",
+      "source": "examples/embedded-in-modorch/tests/host.rs",
+      "name": "unselected_bundle_keeps_host_running_without_creating_engine_resources",
+      "output": "unselected_bundle_keeps_host_running_without_creating_engine_resources",
+      "rules": [
+        "FE-BUNDLE-001"
+      ]
+    },
+    {
+      "suite": "external",
+      "source": "examples/embedded-in-modorch/tests/host.rs",
+      "name": "profiles_serve_pg_queries_and_http_in_the_same_application_as_the_host",
+      "output": "profiles_serve_pg_queries_and_http_in_the_same_application_as_the_host",
+      "rules": [
+        "FE-PROFILE-001",
+        "FE-QUERY-001"
+      ]
+    },
+    {
+      "suite": "external",
+      "source": "examples/embedded-in-modorch/tests/host.rs",
+      "name": "host_ready_failure_preserves_startup_error_and_compensates_engine",
+      "output": "host_ready_failure_preserves_startup_error_and_compensates_engine",
+      "rules": [
+        "FE-LIFE-001"
+      ]
+    },
+    {
+      "suite": "external",
+      "source": "examples/embedded-in-modorch/tests/host.rs",
+      "name": "slow_http_request_retains_work_until_the_external_host_retries_shutdown",
+      "output": "slow_http_request_retains_work_until_the_external_host_retries_shutdown",
+      "rules": [
+        "FE-LIFE-002"
+      ]
+    },
+    {
+      "suite": "federation",
+      "source": "tests/federation.rs",
+      "name": "remote_crud_federation_ddl_index_generation_and_zero_cross_source_effects",
+      "output": "remote_crud_federation_ddl_index_generation_and_zero_cross_source_effects",
+      "rules": [
+        "FE-QUERY-001",
+        "FE-WRITE-001"
+      ]
+    },
+    {
+      "suite": "federation",
+      "source": "tests/management.rs",
+      "name": "zero_source_online_activation_catalog_refresh_rollback_portal_drain_and_recovery",
+      "output": "zero_source_online_activation_catalog_refresh_rollback_portal_drain_and_recovery",
+      "rules": [
+        "FE-MANAGE-001"
+      ]
+    },
+    {
+      "suite": "federation",
+      "source": "tests/ownership.rs",
+      "name": "blocked_write_cancel_and_shutdown_retain_real_resources",
+      "output": "blocked_write_cancel_and_shutdown_retain_real_resources",
+      "rules": [
+        "FE-LIFE-002",
+        "FE-STATE-001",
+        "FE-WRITE-001"
+      ]
+    },
+    {
+      "suite": "federation",
+      "source": "tests/ownership.rs",
+      "name": "supervised_instance_rebuild_drains_io_and_invalidates_sessions_and_capabilities",
+      "output": "supervised_instance_rebuild_drains_io_and_invalidates_sessions_and_capabilities",
+      "rules": [
+        "FE-LIFE-003",
+        "FE-WRITE-001"
+      ]
+    },
+    {
+      "suite": "federation",
+      "source": "tests/instances.rs",
+      "name": "same_secret_reference_is_scoped_to_each_host_and_survives_rename",
+      "output": "same_secret_reference_is_scoped_to_each_host_and_survives_rename",
+      "rules": [
+        "FE-CONFIG-001",
+        "FE-STATE-002"
+      ]
+    },
+    {
+      "suite": "clients",
+      "source": "tests/clients.rs",
+      "name": "public_clients_prepare_parameterize_stream_and_do_not_grant_admin",
+      "output": "public_clients_prepare_parameterize_stream_and_do_not_grant_admin",
+      "rules": [
+        "FE-CLIENT-001",
+        "FE-CLIENT-002",
+        "FE-CLIENT-003",
+        "FE-MESSAGE-001"
+      ]
+    },
+    {
+      "suite": "clients",
+      "source": "tests/clients.rs",
+      "name": "client_input_output_and_clone_admission_budgets_are_enforced",
+      "output": "client_input_output_and_clone_admission_budgets_are_enforced",
+      "rules": [
+        "FE-CLIENT-001",
+        "FE-CLIENT-002",
+        "FE-CLIENT-003"
+      ]
+    },
+    {
+      "suite": "clients",
+      "source": "tests/clients.rs",
+      "name": "client_cancel_drop_and_stream_deadline_release_only_after_real_drain",
+      "output": "client_cancel_drop_and_stream_deadline_release_only_after_real_drain",
+      "rules": [
+        "FE-CLIENT-001",
+        "FE-CLIENT-002",
+        "FE-CLIENT-003"
+      ]
+    },
+    {
+      "suite": "clients",
+      "source": "tests/clients.rs",
+      "name": "management_clients_scope_cas_replay_and_pin_prepared_database_identity",
+      "output": "management_clients_scope_cas_replay_and_pin_prepared_database_identity",
+      "rules": [
+        "FE-CLIENT-001",
+        "FE-CLIENT-002",
+        "FE-CLIENT-003",
+        "FE-MESSAGE-001"
+      ]
+    },
+    {
+      "suite": "clients",
+      "source": "tests/clients.rs",
+      "name": "client_binding_rejects_foreign_and_unselected_applications",
+      "output": "client_binding_rejects_foreign_and_unselected_applications",
+      "rules": [
+        "FE-CLIENT-001",
+        "FE-CLIENT-002",
+        "FE-CLIENT-003"
+      ]
+    },
+    {
+      "suite": "external",
+      "source": "examples/embedded-in-modorch/tests/host.rs",
+      "name": "facade_clients_stream_parameters_and_require_explicit_management_grants",
+      "output": "facade_clients_stream_parameters_and_require_explicit_management_grants",
+      "rules": [
+        "FE-CLIENT-001",
+        "FE-CLIENT-002",
+        "FE-CLIENT-003"
+      ]
+    },
+    {
+      "suite": "federation",
+      "source": "tests/clients.rs",
+      "name": "public_clients_remote_policy_crud_ddl_management_and_unknown_write_drain",
+      "output": "public_clients_remote_policy_crud_ddl_management_and_unknown_write_drain",
+      "rules": [
+        "FE-CLIENT-001",
+        "FE-CLIENT-002",
+        "FE-CLIENT-003"
+      ]
+    },
+    {
+      "suite": "message_budget",
+      "source": "crates/modorch-fedengine-contract/src/lib.rs",
+      "name": "query_payload_cost_accounts_for_variable_input_and_rejects_deep_arrays",
+      "output": "message_budget_tests::query_payload_cost_accounts_for_variable_input_and_rejects_deep_arrays",
+      "rules": [
+        "FE-MESSAGE-001"
+      ]
+    }
+  ]
+}

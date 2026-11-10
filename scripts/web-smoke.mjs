@@ -9,7 +9,7 @@ import { dirname, resolve, join } from 'node:path';
 import { parseArgs } from 'node:util';
 
 const { values } = parseArgs({ options: {
-  binary: { type: 'string', default: 'target/debug/fedengine' },
+  binary: { type: 'string', default: 'target/debug/examples/fedengine-test-host' },
   chrome: { type: 'string', default: '/opt/google/chrome/chrome' },
   screenshot: { type: 'string' },
 } });
@@ -77,8 +77,8 @@ try {
     config += '\n[[grants]]\nprincipal="fedengine"\nsource="web_organization"\nschema="*"\nobject="*"\nactions=["SELECT"]\n';
   }
   await writeFile(join(temporary, 'application.toml'), config);
-  const env = { ...process.env, FEDENGINE_PASSWORD: 'disposable-web-smoke', RUST_LOG: 'fedengine=info', NO_COLOR: '1' };
-  const libraries = resolve(dirname(binary), '../duckdb-download');
+  const env = { ...process.env, FEDENGINE_PASSWORD: 'disposable-web-smoke', RUST_LOG: 'fedengine_test_host=info,modorch_fedengine=info', NO_COLOR: '1' };
+  const libraries = resolve(dirname(binary), '../../duckdb-download');
   for (const triple of await readdir(libraries)) {
     env.LD_LIBRARY_PATH = `${join(libraries, triple, 'v2.0.0')}:${process.env.LD_LIBRARY_PATH ?? ''}`;
     break;

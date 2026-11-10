@@ -1,14 +1,20 @@
 [package]
-name = "fedengine"
+name = "modorch-fedengine-workspace"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Development tests and examples for the Modorch FedEngine library"
+autobins = false
+readme = "README.md"
 
 [workspace]
 resolver = "3"
-members = ["crates/*"]
+members = ["crates/*", "tests/support/host"]
+exclude = ["examples/embedded-in-modorch"]
 
 [workspace.package]
 version = "0.1.0"
@@ -16,9 +22,11 @@ edition = "2024"
 license = "MIT"
 rust-version = "1.94"
 publish = false
+repository = "https://github.com/muidea/modorch-fedengine"
+homepage = "https://github.com/muidea/modorch-fedengine"
 
 [workspace.dependencies]
-modorch = { path = "../modorch-rs/crates/modorch", version = "=0.0.2" }
+modorch = { git = "https://github.com/muidea/modorch-rs", rev = "336ba20196044e1b81fb2ca297a18b5e258a5800", version = "=0.0.3" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "signal", "time", "io-util"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 async-trait = "0.1"
@@ -36,38 +44,43 @@ uuid = "1"
 rustls-pemfile = "2"
 tokio-rustls = "0.26"
 rand = "0.10"
-fedengine-core = { path = "crates/fedengine-core" }
-fedengine-contract = { path = "crates/fedengine-contract" }
-fedengine-datasource = { path = "crates/fedengine-datasource" }
-fedengine-ddl = { path = "crates/fedengine-ddl" }
-fedengine-policy = { path = "crates/fedengine-policy" }
-fedengine-catalog = { path = "crates/fedengine-catalog" }
-fedengine-duckdb = { path = "crates/fedengine-duckdb" }
-fedengine-query = { path = "crates/fedengine-query" }
-fedengine-pg-compat = { path = "crates/fedengine-pg-compat" }
-fedengine-pgwire = { path = "crates/fedengine-pgwire" }
-fedengine-app = { path = "crates/fedengine-app" }
-fedengine-management = { path = "crates/fedengine-management" }
+modorch-fedengine-core = { path = "crates/modorch-fedengine-core", version = "=0.1.0" }
+modorch-fedengine-contract = { path = "crates/modorch-fedengine-contract", version = "=0.1.0" }
+modorch-fedengine-datasource = { path = "crates/modorch-fedengine-datasource", version = "=0.1.0" }
+modorch-fedengine-ddl = { path = "crates/modorch-fedengine-ddl", version = "=0.1.0" }
+modorch-fedengine-policy = { path = "crates/modorch-fedengine-policy", version = "=0.1.0" }
+modorch-fedengine-catalog = { path = "crates/modorch-fedengine-catalog", version = "=0.1.0" }
+modorch-fedengine-duckdb = { path = "crates/modorch-fedengine-duckdb", version = "=0.1.0" }
+modorch-fedengine-query = { path = "crates/modorch-fedengine-query", version = "=0.1.0" }
+modorch-fedengine-pg-compat = { path = "crates/modorch-fedengine-pg-compat", version = "=0.1.0" }
+modorch-fedengine-pgwire = { path = "crates/modorch-fedengine-pgwire", version = "=0.1.0" }
+modorch-fedengine-test-host = { path = "tests/support/host", version = "=0.1.0" }
+modorch-fedengine-management = { path = "crates/modorch-fedengine-management", version = "=0.1.0" }
+modorch-fedengine = { path = "crates/modorch-fedengine", version = "=0.1.0" }
 axum = "0.8"
 serde_json = "1"
 
-[dependencies]
-fedengine-app.workspace = true
-fedengine-core.workspace = true
+[[example]]
+name = "fedengine-test-host"
+path = "examples/fedengine-test-host.rs"
+
+[dev-dependencies]
+modorch-fedengine-test-host.workspace = true
+modorch-fedengine.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-[dev-dependencies]
-fedengine-ddl.workspace = true
-fedengine-management.workspace = true
-fedengine-contract.workspace = true
-fedengine-catalog.workspace = true
-fedengine-datasource.workspace = true
-fedengine-duckdb.workspace = true
-fedengine-policy.workspace = true
-fedengine-query.workspace = true
-fedengine-pgwire.workspace = true
+modorch-fedengine-core.workspace = true
+modorch-fedengine-ddl.workspace = true
+modorch-fedengine-management.workspace = true
+modorch-fedengine-contract.workspace = true
+modorch-fedengine-catalog.workspace = true
+modorch-fedengine-datasource.workspace = true
+modorch-fedengine-duckdb.workspace = true
+modorch-fedengine-policy.workspace = true
+modorch-fedengine-query.workspace = true
+modorch-fedengine-pgwire.workspace = true
 modorch.workspace = true
 serde_json.workspace = true
 tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-uuid-1"] }

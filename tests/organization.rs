@@ -1,7 +1,7 @@
 //! Native target organization, discovery, grants and durable identity regressions.
 mod common;
-use fedengine_app::FedEngine;
-use fedengine_core::*;
+use modorch_fedengine_core::*;
+use modorch_fedengine_test_host::FedEngine;
 use serde_json::{Value, json};
 use std::{net::SocketAddr, time::Duration};
 use tokio::{

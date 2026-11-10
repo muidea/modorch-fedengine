@@ -1,0 +1,26 @@
+[package]
+name = "modorch-fedengine-pgwire"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+modorch-fedengine-core.workspace = true
+modorch-fedengine-contract.workspace = true
+modorch-fedengine-ddl.workspace = true
+modorch-fedengine-pg-compat.workspace = true
+modorch-fedengine-catalog.workspace = true
+modorch-fedengine-policy.workspace = true
+pgwire.workspace = true
+modorch.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+bytes.workspace = true
+rustls-pemfile.workspace = true
+tokio-rustls.workspace = true
+rand.workspace = true

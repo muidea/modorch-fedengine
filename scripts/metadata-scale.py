@@ -83,7 +83,7 @@ def run(args, repetition):
             secret = work / 'secrets/pg.dsn'
             secret.write_text(os.environ[args.postgres_dsn_env])
             secret.chmod(0o600)
-            env = dict(os.environ, FEDENGINE_PASSWORD='disposable-scale-only', RUST_LOG='warn,fedengine_duckdb=debug,fedengine_management=debug,fedengine_query=debug', NO_COLOR='1')
+            env = dict(os.environ, FEDENGINE_PASSWORD='disposable-scale-only', RUST_LOG='warn,modorch_fedengine_duckdb=debug,modorch_fedengine_management=debug,modorch_fedengine_query=debug', NO_COLOR='1')
             if args.library_dir:
                 env['LD_LIBRARY_PATH'] = str(args.library_dir) + os.pathsep + env.get('LD_LIBRARY_PATH', '')
             log_path = work / 'server.log'
@@ -271,7 +271,7 @@ def run(args, repetition):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--binary', type=Path, default=ROOT / 'target/release/fedengine')
+    parser.add_argument('--binary', type=Path, default=ROOT / 'target/release/examples/fedengine-test-host')
     parser.add_argument('--library-dir', type=Path)
     parser.add_argument('--extensions', type=Path, default=ROOT / 'data/extensions')
     parser.add_argument('--postgres-dsn-env', default='FEDENGINE_POSTGRES_DSN')

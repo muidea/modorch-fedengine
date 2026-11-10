@@ -244,7 +244,7 @@ PostgreSQL 普通刷新在来源仍为 Active、旧快照有效且完整、结�
 
 准备阶段逐对象读取旧事实，身份保留、比较及淘汰不载入完整旧目录；源目录投影直接写入有类型的表，移除 VARCHAR 暂存及转换副本。批次在 4096 行或估算 2MiB 后刷新；这是软阈值，单个值、列或完整约束组可超出，不是堆内存硬限制。约束组完成目标对象可见性标注后才刷新，保留授权过滤。虚拟映射通过受控 SQL 从已准备的源投影生成，不复制整份对象图；本地 OID、schema、只读语义及未知物理统计独立保留。在线虚拟库变更和启动恢复只读目录头。所有变化仍在不可见事务内完成，提交和运行注册表切换保持原子性。
 
-开启 `fedengine_duckdb=debug` 可读取 `metadata phase started/finished` 的 phase、elapsed_ms、rss_kib、peak_rss_kib 和 rss_delta_kib，覆盖采集、身份处理、本地准备、源/虚拟投影、提交及 checkpoint。RSS 为阶段边界观测，VmHWM 是进程截至该时刻的历史峰值，不能当作该阶段独占分配；实际进程回归另以 20ms 采样并读取内核高水位。非 Linux 平台缺少 `/proc` 时省略内存字段，不填零冒充已测量。
+开启 `modorch_fedengine_duckdb=debug` 可读取 `metadata phase started/finished` 的 phase、elapsed_ms、rss_kib、peak_rss_kib 和 rss_delta_kib，覆盖采集、身份处理、本地准备、源/虚拟投影、提交及 checkpoint。RSS 为阶段边界观测，VmHWM 是进程截至该时刻的历史峰值，不能当作该阶段独占分配；实际进程回归另以 20ms 采样并读取内核高水位。非 Linux 平台缺少 `/proc` 时省略内存字段，不填零冒充已测量。
 
 部署应根据正式查询引擎、并发采集、目录准备、结果缓冲和原生开销的混合负载峰值加余量定容。`examples/config/resource-budget.toml` 提供 2GiB 分配的候选起点，仍须验证；外部 cgroup/systemd 限制会计入部分文件缓存，与进程 RSS 不是同一指标。进程硬限额不能仅由 DuckDB 额度推断。1GiB 继续作为固定元数据工作负载的效率验收线，不用扩大部署额度替代该验收。
 

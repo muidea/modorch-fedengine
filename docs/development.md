@@ -1,4 +1,4 @@
-# 开发与部署
+# 开发验证与宿主交付边界
 
 ## 当前阶段的数据兼容规约
 
@@ -11,37 +11,43 @@
 ## 锁定依赖
 
 - `rust-toolchain.toml` 固定 Rust/Cargo 1.94.0，并声明 rustfmt、Clippy；edition 2024。Workspace 的 `rust-version = "1.94"` 是当前支持基线，尚未承诺更低版本；内部包统一 `publish = false`。
-- Modorch-RS Facade 0.0.2，本地 `../modorch-rs/crates/modorch`。锁定 `v0.0.2` 源码 revision `84f22cddd46be1cf5f20023bfec201d1f1fe280d`，匹配 Skill 1.0.5 / Contract 1.1.0；实际文件指纹由 managed skill preflight 核对。该版本为 GitHub Candidate 源码发布，不视为 crates.io 发布或完整生产认证。
+- Modorch-RS Facade 0.0.3，通过 `https://github.com/muidea/modorch-rs` 固定源码 revision `336ba20196044e1b81fb2ca297a18b5e258a5800`，与 modorch-mqtt 使用同一 Git Source/Revision；匹配 Skill 1.0.7 / Contract 1.2.0。实际文件指纹由 managed skill preflight 核对。该版本为 GitHub Candidate 源码发布，不视为 crates.io 发布或完整生产认证。
 - duckdb-rs 1.20000.1、核心 v2.0.0；pgwire 0.42.1；Cargo.lock 固定传递依赖。
 - 使用 duckdb-rs 官方 download-lib 特性获取对应原生库，避免每次编译庞大的 bundled C++。构建首次需要网络。
 
-当前交付采用 FedEngine 与 Modorch 两个同级仓库；CI 和 Docker 同样准备这两个目录。克隆 Modorch 到同级目录并 checkout 上述 revision。不要把路径依赖替换成未经验证的同名 crate。Linux 动态库位于 `target/duckdb-download/<triple>/v2.0.0/libduckdb.so`；部署需携带该库并设置加载路径，或使用提供的 Dockerfile。
+本地和 CI 均由 Cargo 获取锁定的 Modorch Git 源码，不要求同级 Modorch checkout。不要替换为未经验证的同名 crate；本地联合开发如需 path override，必须统一覆盖相同 Git 源并重新核对解析后的 Package ID、版本与指纹。Linux 动态库位于 `target/duckdb-download/<triple>/v2.0.0/libduckdb.so`；宿主发布时需携带该库并设置加载路径。所有服务及镜像统一由 magicDataHub 编排交付，本库不提供服务 Dockerfile。
 
-Modorch 0.0.2 的 Topic Name / Filter 采用 MQTT 3.1.1/5.0 语义，`:id` 是字面量，单层通配为 `+`。FedEngine 的 `query/execute/v1`、`catalog/control/v1`、`policy/authorize/v1` 和 `management/control/v1` 均使用精确订阅，不扩大匹配范围；Destination、Request 结果等待、受管任务、ServiceLease 和检查式排空仍按既有组件契约运行。
+Modorch 0.0.3 的 Topic Name / Filter 采用 MQTT 3.1.1/5.0 语义，`:id` 是字面量，单层通配为 `+`。FedEngine 的 `query/execute/v1`、`catalog/control/v1`、`policy/authorize/v1` 和 `management/control/v1` 均使用精确订阅，不扩大匹配范围；Destination、Request 结果等待、受管任务、ServiceLease 和检查式排空仍按既有组件契约运行。
 
 ## 目录与测试归属
 
-根目录同时是可执行包和 workspace，`src/main.rs` 只负责宿主入口，`crates/fedengine-app` 装配应用，其他组件库位于 `crates/`。无需额外的 `apps/` 层。
+根目录是 `modorch-fedengine-workspace` 测试包和 workspace，没有服务 binary；正常依赖为空。`examples/fedengine-test-host.rs` 只负责开发/回归进程入口，通过 dev-dependency 使用 `tests/support/host` 的测试适配层，复用公开 Facade/Bundle，负责配置、显式选择、资源建议、唯一 Application 的启动与检查式退出。接入方式和当前边界见[嵌入说明](embedded-library.md)。其他组件库位于 `crates/`，无需额外的 `apps/` 层。
 
-`config/application.toml` 是默认本地运行配置；`examples/config/federation.toml` 是包含 PostgreSQL/MySQL 数据源的完整示例，通过 `--config examples/config/federation.toml` 显式选择。程序一次只读取一份配置，不做文件合并。配置内的相对路径以进程工作目录为基准，文档中的启动命令从仓库根目录执行。
+`config/application.toml` 是默认开发测试配置；`examples/config/federation.toml` 是包含 PostgreSQL/MySQL 数据源的完整示例，通过 `--config examples/config/federation.toml` 显式选择。程序一次只读取一份配置，不做文件合并。配置内的相对路径以进程工作目录为基准，文档中的启动命令从仓库根目录执行。
 
-- `fedengine-ddl/src/`：`analysis` 负责语句分析，`binding` 负责对象及约束绑定，`model` 定义领域类型，`index` 生成受控模板，`parameters` 处理参数 AST。
-- `fedengine-duckdb/src/`：`instance` 打开唯一实例，`storage` 当前结构初始化与持久化，`control` 受控挂载及恢复，`credentials` 解析引用，`catalog` 扫描结构，`discovery` 枚举原生数据库，`relational` 采集扩展关系事实，`identity` 维护稳定身份，`projection` 发布 PG 目录，`virtuals` 持久化逻辑数据库并同步外部表映射，`init` 装配运行时，`runtime` 管理执行准入，`worker` 执行和输出行批次，`codec` 转换数据，`metadata` 查询元数据，`extensions` 校验扩展，`error` 转换错误。
-- `fedengine-pgwire/src/`：监听生命周期、认证、取消分别独立；`session/` 保存连接状态，并拆分游标、解析、Simple 和 Extended 协议实现。
+- `modorch-fedengine-ddl/src/`：`analysis` 负责语句分析，`binding` 负责对象及约束绑定，`model` 定义领域类型，`index` 生成受控模板，`parameters` 处理参数 AST。
+- `modorch-fedengine-duckdb/src/`：`instance` 打开唯一实例，`storage` 当前结构初始化与持久化，`control` 受控挂载及恢复，`credentials` 解析引用，`catalog` 扫描结构，`discovery` 枚举原生数据库，`relational` 采集扩展关系事实，`identity` 维护稳定身份，`projection` 发布 PG 目录，`virtuals` 持久化逻辑数据库并同步外部表映射，`init` 装配运行时，`runtime` 管理执行准入，`worker` 执行和输出行批次，`codec` 转换数据，`metadata` 查询元数据，`extensions` 校验扩展，`error` 转换错误。
+- `modorch-fedengine-pgwire/src/`：监听生命周期、认证、取消分别独立；`session/` 保存连接状态，并拆分游标、解析、Simple 和 Extended 协议实现。
 
 上述适配 crate 的 `lib.rs` 声明内部模块并导出组件接口。内部模块保持私有，模块拆分不改变组件边界或 Modorch 生命周期。
 
-`fedengine-management` 的 `module` 接收 Typed Request，`reducer` 校验意图与版本，`coordinator` 编排受管长任务，`api` 提供生命周期受管 HTTP 入口，`pagination` 定义操作记录分页参数并绑定来源目录快照、过滤条件与续页参数；`browser` 提供虚拟库目录与有界调试任务，`browser_query` 通过现有协调器消费只读结果流；`discovery` 使用 source-manager 的受管任务、共享并发和内存许可执行实例枚举，Web 的 `organization.js` 核对逐目标结果后逐项提交持久化登记/激活。管理配置、凭据引用、首次导入及调用示例见 [管理 API](management-api.md)。
+`modorch-fedengine-management` 的 `module` 接收 Typed Request，`reducer` 校验意图与版本，`coordinator` 编排受管长任务，`api` 提供生命周期受管 HTTP 入口，`pagination` 定义操作记录分页参数并绑定来源目录快照、过滤条件与续页参数；`browser` 提供虚拟库目录与有界调试任务，`browser_query` 通过现有协调器消费只读结果流；`discovery` 使用 source-manager 的受管任务、共享并发和内存许可执行实例枚举，Web 的 `organization.js` 核对逐目标结果后逐项提交持久化登记/激活。管理配置、凭据引用、首次导入及调用示例见 [管理 API](management-api.md)。
 
 SQL 分析、配置和授权测试分别位于 ddl、core、policy 的 `tests/`。通过 `include_str!` 读取仓库配置示例，避免依赖测试进程工作目录。根目录 `tests/` 保留协议、引擎控制和在线管理系统测试；临时目录由作用域守卫自动清理。
 
 ```sh
-cargo test -p fedengine-ddl --locked
-cargo test -p fedengine-core --locked
-cargo test -p fedengine-policy --locked
+cargo test -p modorch-fedengine-ddl --locked
+cargo test -p modorch-fedengine-core --locked
+cargo test -p modorch-fedengine-policy --locked
 ```
 
 根目录 `cargo test` 默认只测试根包；完整检查使用 `cargo test --workspace`。首次配置工具链及下载 DuckDB 原生库需要网络。
+
+库化后的协议、执行、DDL 门禁及在线恢复断言对应[回归矩阵](library-regression.md)。`tests/protocol.rs` 通过正式 Bundle/独立薄适配运行；管理故障注入夹具和原生控制测试单列，不替代 Bundle 端到端证据。
+
+`tests/ownership.rs` 的两个 ignored 用例由一次性联邦脚本执行，覆盖真实 PG 阻塞 I/O、取消后的资源保留、StopIncomplete/文件锁和显式测试 Restart 的数据库闭包。入口依赖和生产 FailFast 边界见[资源与退出说明](resource-lifecycle.md)。
+
+`examples/embedded-in-modorch` 是显式排除的独立 workspace，保留单独 Cargo.lock，不由根工作区测试隐式覆盖。运行 `python3 scripts/test-embedded-host.py` 将它复制到仓库外进行独立依赖/框架指纹、fmt/Clippy/test/doc 和真实二进制验收；CI 使用同一命令。脚本复用根 target 的编译/原生库缓存，临时宿主及业务状态会清理，详见[样例说明](../examples/embedded-in-modorch/README.md)。
 
 ## skill-hub
 
@@ -57,17 +63,20 @@ python3 .agents/skills/modorch-app-development/scripts/preflight.py --manifest-p
 skill-hub validate --pattern 'modorch-*' --links
 ```
 
-仅在 status 显示过期时通过 apply 刷新；不要手工复制或修改 managed skill。当前项目还托管了 skill-hub-project-usage、skill-capability-index。远端发布未执行。
+仅在 status 显示过期时通过 apply 刷新；不要手工复制或修改 managed skill。当前项目还托管了 skill-hub-project-usage、skill-capability-index、skill-hub-skill-authoring；本库专用 `modorch-fedengine-integration` 通过 skill-hub 创建/校验并归档到本地技能仓库，面向外部宿主，检查实际 Facade 与框架指纹。维护已托管技能时比较源/副本，不覆盖此前改动；新技能用 create，修改后 validate/feedback，远端 push 独立授权。
 
 ## 检查
 
 ```sh
+python3 scripts/check-library-contracts.py
+python3 -B -m unittest discover -s tests/contracts -p 'test_*.py' -v
+python3 .agents/skills/modorch-fedengine-integration/scripts/preflight.py --manifest-path Cargo.toml
 cargo fmt --all -- --check
 cargo check --workspace --all-targets --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 cargo doc --workspace --no-deps --locked
-cargo build --locked
+cargo build --example fedengine-test-host --locked
 python3 scripts/smoke.py
 scripts/test-federation.sh
 ```
@@ -86,62 +95,54 @@ scripts/test-federation.sh
 
 ## CI 执行策略
 
-Actions 在 PR、`master` 分支 push 和手动触发时执行。普通分支 push 由对应 PR 承接验证；同一 PR 或分支的新运行会取消旧运行。
+Actions 在所有分支 push、PR 和手动触发时执行，同一 PR 或分支的新运行会取消旧运行。运行环境固定为Ubuntu24.04、Rust1.94.0、Python3.12，Web验证使用Node.js24与runner预置Chrome；外部Action均固定实际发布commit。
 
-`changes` 判断改动范围，`validate` 在一个 job 内共享构建目录，最终 `check` 汇总结果。分支保护继续使用 `check`：只有改动判断成功，且代码验证成功或纯文档变更按规则跳过时才通过；失败、取消和意外跳过都不能伪报通过。
+`library-contracts` 对所有变更执行无需 Cargo/Docker 的契约/链接/元数据静态检查与证据检查器负向测试。`changes` 判断改动范围，`validate` 在一个 job 内共享构建目录，最终 `check` 要求契约检查成功并汇总构建结果。分支保护继续使用 `check`：只有改动判断成功，且代码验证成功或纯文档变更按规则跳过时才通过；失败、取消和意外跳过都不能伪报通过。
 
 | 改动 / 触发方式 | 执行内容 |
 |---|---|
-| 仅 `README.md`、`LICENSE`、`docs/**/*.md` | 跳过 Rust 构建和数据库集成，完成最终 `check` |
-| 其他路径，包括代码、配置、示例、依赖、脚本、skill、CI，以及未知新路径 | fmt、JavaScript 语法、依赖准备、框架指纹、Clippy、workspace 测试、真实进程及 Web 浏览器 smoke、一次性数据库联邦集成 |
-| 上述验证中的 Rust 源码、包清单、锁文件、工具链、Cargo 设置、skill 或 CI 变更 | 额外执行 Rustdoc，警告视为错误；保守覆盖公共 API 文档变更 |
-| `master` 上的非纯文档变更 | 完整验证，包含 Rustdoc |
+| 仅 `README.md`、`LICENSE`、`docs/**/*.md` | 执行契约/链接/元数据静态检查，跳过 Rust 构建和数据库集成，再完成最终 `check` |
+| 其他路径，包括代码、配置、示例、依赖、脚本、skill、CI，以及未知新路径 | fmt、JavaScript语法、依赖准备、框架/Facade指纹、Clippy、workspace测试、仓库外宿主、真实进程/Web smoke、Rustdoc及一次性数据库联邦集成；Rustdoc警告视为错误 |
 | 手动触发 | 无论改动范围如何都执行完整验证 |
 
-CI 删除独立 `cargo check`，由同范围的 Clippy 完成编译检查。根包集成测试会使 `cargo test` 构建 `target/debug/fedengine`，smoke 直接使用该程序，因此删除独立 `cargo build`。本地仍可使用上文列出的完整检查命令。
+CI 由 Clippy 完成编译检查。网络/Web smoke 前显式执行 `cargo build --example fedengine-test-host --locked`；根集成测试不再隐式产生可发布的服务程序。本地仍可使用上文列出的完整检查命令。
 
-Cargo 依赖及编译产物通过 Rust cache 复用，key 包含固定的 Modorch revision；DuckDB 原生库和扩展通过单独缓存复用，key 包含 runner 平台、架构、Cargo.lock 和扩展下载脚本。扩展脚本在命中缓存后仍校验 manifest 与文件 SHA256。只有 `master` 运行保存缓存，PR 使用缓存并在缺失时正常下载和构建。
+Cargo依赖及编译产物通过Rust cache复用，key包含固定的Modorch revision；DuckDB原生库和扩展通过单独缓存复用，key包含runner平台、架构、Cargo.lock和扩展下载脚本。扩展脚本在命中缓存后仍校验manifest与文件SHA256。只有仓库默认分支运行保存缓存，PR与其他分支使用缓存并在缺失时正常下载和构建，不依赖默认分支名为master或main。
 
 恢复缓存后先执行 `cargo fetch --locked`，再执行离线指纹预检，保证冷缓存也能工作。格式检查放在缓存恢复和依赖下载之前，以便尽早失败。未增加构建矩阵或将 Rust 检查拆成多个重复编译的 job；实际节省时间以 Actions 分步耗时为准。
 
 ## Web 管理端验证
 
-静态页面位于 `crates/fedengine-management/web/`，由 `fedengine-management/src/web.rs` 编译嵌入，通过原有受管 HTTP 监听提供。修改静态资源后需要重新构建二进制，不依赖 npm 或外部 CDN。
+静态页面位于 `crates/modorch-fedengine-management/web/`，由 `modorch-fedengine-management/src/web.rs` 编译嵌入，通过原有受管 HTTP 监听提供。修改静态资源后需要重新构建二进制，不依赖 npm 或外部 CDN。
 
 `tests/management.rs` 验证页面与静态资源可达、响应策略、未知路径及浏览器同源写边界。浏览器回归使用 Node.js 22 及以上版本的标准库和本机 Chromium，不安装 npm 依赖：
 
 ```sh
-cargo build --locked
-node --check crates/fedengine-management/web/app.js
-node --check crates/fedengine-management/web/browser.js
+cargo build --example fedengine-test-host --locked
+node --check crates/modorch-fedengine-management/web/app.js
+node --check crates/modorch-fedengine-management/web/browser.js
 node scripts/web-smoke.mjs --chrome /opt/google/chrome/chrome
 ```
 
 `tests/browser.rs` 覆盖真实 HTTP 目录、精度保真的只读结果、只读 AST 拒绝、幂等提交、截断、取消、超时和退出；其 ignored 来源用例由 `scripts/test-federation.sh` 在一次性 PG/MySQL 上执行，核对映射、分页、来源详情、授权与快照变化。
 
-脚本启动独立临时状态库、随机端口和专用无头浏览器，验证数据库树仅在对象浏览/SQL 工作区显示（含退出后的桌面/窄屏隐藏）、库切换和查询取消、各库独立草稿、对象/列按需加载、原生双击与光标/选区插入、标识符转义、目录冲突重载、系统 Schema 默认隐藏、空 public、SQL 选中执行、NULL/int8、错误、截断分页和窄屏，以及登记、异步状态、失败探测、凭据引用与 Schema 配置、过期表单冲突、响应丢失后的原键重试、业务虚拟库完整映射编辑和删除、源停用/删除、操作记录。列表回归创建一次性数据源、虚拟库与超过 40 项的持久化操作记录，检查分页、条数切换、跳页、筛选重置、刷新/详情返回保留、删除后页码收缩、新浏览器完整历史及窄屏布局。JavaScript 语法检查及默认浏览器回归已接入 CI，使用 Node.js 22 和 runner 预置 Chrome。目录分页、快照冲突和不可信名称渲染使用浏览器层合成 HTTP 响应，不能替代真实远端目录采集验收。可通过 `FEDENGINE_WEB_POSTGRES_DSN` 和 `FEDENGINE_WEB_POSTGRES_SCHEMA` 显式指定含表的 PostgreSQL schema，额外验证只读探测、发现、激活、刷新及实际目录展示；需事先准备匹配扩展，脚本不执行远端业务 DDL。
+脚本启动独立临时状态库、随机端口和专用无头浏览器，验证数据库树仅在对象浏览/SQL 工作区显示（含退出后的桌面/窄屏隐藏）、库切换和查询取消、各库独立草稿、对象/列按需加载、原生双击与光标/选区插入、标识符转义、目录冲突重载、系统 Schema 默认隐藏、空 public、SQL 选中执行、NULL/int8、错误、截断分页和窄屏，以及登记、异步状态、失败探测、凭据引用与 Schema 配置、过期表单冲突、响应丢失后的原键重试、业务虚拟库完整映射编辑和删除、源停用/删除、操作记录。列表回归创建一次性数据源、虚拟库与超过 40 项的持久化操作记录，检查分页、条数切换、跳页、筛选重置、刷新/详情返回保留、删除后页码收缩、新浏览器完整历史及窄屏布局。JavaScript 语法检查及默认浏览器回归已接入 CI，使用 Node.js 24 和 runner 预置 Chrome。目录分页、快照冲突和不可信名称渲染使用浏览器层合成 HTTP 响应，不能替代真实远端目录采集验收。可通过 `FEDENGINE_WEB_POSTGRES_DSN` 和 `FEDENGINE_WEB_POSTGRES_SCHEMA` 显式指定含表的 PostgreSQL schema，额外验证只读探测、发现、激活、刷新及实际目录展示；需事先准备匹配扩展，脚本不执行远端业务 DDL。
 
 可选 `--binary` 指定构建程序，`--screenshot /tmp/页面.png` 生成临时检查截图。服务日志、状态库和浏览器配置退出时清理，截图由调用者验证后删除，不归档。
 
-## 容器
+## 服务与测试容器边界
 
-构建上下文为同时包含 fedengine 和 modorch-rs 的父目录：
+所有正式服务、Application 编排、运行配置和镜像由 magicDataHub 项目负责。本库没有服务 Dockerfile 或独立服务部署命令。宿主使用公开 `modorch-fedengine` Bundle，统一管理 Runtime、日志、信号、联合预算和检查式退出。
 
-```sh
-docker build -f fedengine/docker/Dockerfile -t fedengine:dev .
-```
-
-镜像内默认开发配置监听 localhost。部署时挂载 `/etc/fedengine/application.toml` 并配置容器内监听 `0.0.0.0:15432`、TLS、SecretRef、扩展绝对路径和持久化临时目录。镜像不包含源密码和测试证书。运行时需要保护配置、扩展目录和 TLS key，应用采用单一可信安全域，不提供强多租户隔离。管理入口默认 loopback；默认 `duckdb.database_path` 为文件，部署时将数据库及 WAL 放入同一持久化卷，同时挂载受保护的凭据目录。
-
-`docker/docker-compose.test.yml` 仅用于隔离联调，固定测试口令不是生产凭证。测试结束使用专用 project 的 `down -v` 清理，不影响其他容器。
+`docker/docker-compose.test.yml` 只启动一次性 PostgreSQL/MySQL 测试源，不构建或运行 FedEngine 服务。固定测试口令不是生产凭证；脚本结束使用专用 project 的 `down -v` 清理。
 
 ## JDBC 与目录规模复现
 
 真实 JDBC 程序及准备说明见 [tests/jdbc](../tests/jdbc/README.md)。目录 SQL 回放会验证规划、Describe、执行和结果转换；回放通过不能替代 GUI 实测。
 
 ```sh
-FEDENGINE_BENCH_OBJECTS=1000 cargo test -p fedengine-duckdb catalog_scale_baseline -- --ignored --nocapture
-FEDENGINE_BENCH_OBJECTS=10000 cargo test -p fedengine-duckdb catalog_scale_baseline -- --ignored --nocapture
+FEDENGINE_BENCH_OBJECTS=1000 cargo test -p modorch-fedengine-duckdb catalog_scale_baseline -- --ignored --nocapture
+FEDENGINE_BENCH_OBJECTS=10000 cargo test -p modorch-fedengine-duckdb catalog_scale_baseline -- --ignored --nocapture
 ```
 
 该基线只测本地 synthetic 投影；每表一列，不包含远端扫描、远端请求、生产写锁竞争或业务负载影响。实际扫描还需要每对象一次扩展 DESCRIBE，不能据此推断远端请求数恒定。
@@ -167,10 +168,10 @@ FEDENGINE_SCALE_OBJECTS=10000 FEDENGINE_SCALE_COLUMNS=10 FEDENGINE_SCALE_ROUNDS=
 `metadata-scale.py` 启动真实 release 二进制，使用独立端口、状态库和临时日志；只允许显式确认的一次性 PostgreSQL。需要 Python 的 psycopg2，源容器的 `max_locks_per_transaction=512`，源 DSN 从环境变量读取，日志及输出不打印凭据。夹具 schema、状态及日志在退出时删除，输出只写 stdout，不归档。
 
 ```sh
-cargo build --release --locked
+cargo build --release --example fedengine-test-host --locked
 export FEDENGINE_POSTGRES_DSN='一次性 PostgreSQL 的 DSN'
 python3 scripts/metadata-scale.py --disposable-source \
-  --binary target/release/fedengine \
+  --binary target/release/examples/fedengine-test-host \
   --library-dir target/duckdb-download/x86_64-unknown-linux-gnu/v2.0.0 \
   --objects 10000 --columns 10 --rounds 10 --repetitions 3
 ```
@@ -194,3 +195,11 @@ cargo test --locked --test organization -- --ignored --nocapture --test-threads=
 `node scripts/web-smoke.mjs` 检查真实 Chromium 的管理与浏览交互；可额外提供 `FEDENGINE_WEB_POSTGRES_CREDENTIALS`（结构化凭据 JSON）及 `FEDENGINE_WEB_POSTGRES_HOST/PORT/DATABASE` 验证新接入向导、核对后激活、原生 public 和 SQL 上下文。这些参数仅进入一次性服务环境，不写入仓库。默认主机 127.0.0.1、端口 36432、库 crm。
 
 当前管理存储版本 7。新组织模型使用独立状态路径验证，不转换或清空既有版本的开发实例；部署需单独备份并选用匹配存储版本。
+
+## 配置与独立实例回归
+
+路径、密钥引用及部署状态规则见[配置所有权](configuration-ownership.md)。`cargo test --test instances --locked` 验证同文件拒绝、启动补偿和多实例状态隔离；其中真实凭据目录隔离用例由 `scripts/test-federation.sh` 在一次性 PostgreSQL 中执行。外部宿主脚本另验配置文件与宿主工作目录不同的启动方式。
+
+## 业务库契约与发布准备
+
+[业务契约](../contracts/README.md)以 13 个稳定 ID 对应测试映射，`check-library-contracts.py` 默认只做静态检查，明确输出 execution_status=NotRun；`--run local`、`--run external` 才逐条核对实际测试成功行，不依据通过总数认定覆盖。原生 PG/MySQL 用例和测试注入 Restart 单独标明范围。发布与包元数据见[0.1.0 交付边界](releases/0.1.0.md)，所有包保留 publish=false。

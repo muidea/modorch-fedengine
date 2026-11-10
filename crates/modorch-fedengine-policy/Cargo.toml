@@ -1,0 +1,19 @@
+[package]
+name = "modorch-fedengine-policy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+modorch-fedengine-contract.workspace = true
+modorch-fedengine-core.workspace = true
+modorch-fedengine-datasource.workspace = true
+modorch-fedengine-ddl.workspace = true
+modorch.workspace = true
+
+[dev-dependencies]
+toml.workspace = true

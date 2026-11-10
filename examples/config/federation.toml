@@ -1,5 +1,5 @@
-# Standalone federation example. Run from the repository root:
-# cargo run --locked -- --config examples/config/federation.toml
+# Development test-host federation example. Run from the repository root:
+# cargo run --locked --example fedengine-test-host -- --config examples/config/federation.toml
 # Relative paths below resolve from the process working directory.
 # Production must configure TLS certificate/key and tls_required=true.
 [application]

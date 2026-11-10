@@ -1,8 +1,11 @@
 //! Disposable PostgreSQL/MySQL integration. Never point the DSNs at business databases.
 mod common;
+#[path = "common/wire.rs"]
+mod wire;
 use common::TestDirectory;
-use fedengine_app::FedEngine;
-use fedengine_core::*;
+use modorch::{Phase, ShutdownReceipt, StartupError};
+use modorch_fedengine_core::*;
+use modorch_fedengine_test_host::FedEngine;
 use std::{collections::BTreeSet, time::Duration};
 use tokio_postgres::NoTls;
 #[tokio::test]
@@ -114,6 +117,76 @@ async fn remote_crud_federation_ddl_index_generation_and_zero_cross_source_effec
             index_adapter: true,
         });
     }
+    // A capability record is an admission gate, not permission to probe DDL.
+    let mut missing = config.clone();
+    missing.capabilities.clear();
+    let unverified = FedEngine::start(missing).await.unwrap();
+    let (client, connection) = tokio_postgres::Config::new()
+        .host("127.0.0.1")
+        .port(unverified.address().unwrap().port())
+        .user("fedengine")
+        .password(std::env::var("USER").unwrap())
+        .dbname("pg_crm")
+        .connect(NoTls)
+        .await
+        .unwrap();
+    let driver = tokio::spawn(connection);
+    for source in &config.datasources {
+        let error = client
+            .simple_query(&format!(
+                "CREATE TABLE {}.{}.fedengine_capability_denied(id INTEGER)",
+                quote_identifier(&source.catalog_alias),
+                quote_identifier(&source.default_schema)
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code().unwrap().code(), "0A000");
+        let native_sql = format!(
+            "SELECT table_name FROM information_schema.tables WHERE table_schema={} AND table_name='fedengine_capability_denied'",
+            quote_literal(&source.default_schema)
+        );
+        let count: i64 = admin
+            .query_row(
+                &format!(
+                    "SELECT count(*) FROM {}_query({}, {})",
+                    source.kind.extension(),
+                    quote_literal(&source.catalog_alias),
+                    quote_literal(&native_sql)
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "unverified DDL must have no remote effect");
+    }
+    drop(client);
+    driver.await.unwrap().unwrap();
+    assert!(matches!(
+        unverified.shutdown_until_drained().await.unwrap(),
+        ShutdownReceipt::GracefullyStopped
+    ));
+    assert_eq!(unverified.handle.task_metrics().tasks, 0);
+    drop(unverified);
+
+    // Each remote's tuple is checked against the actual source before Ready.
+    for index in 0..config.capabilities.len() {
+        let mut mismatched = config.clone();
+        mismatched.capabilities[index].remote_version = "unverified-fixture-version".into();
+        let error = match FedEngine::start(mismatched).await {
+            Ok(engine) => {
+                engine.shutdown_until_drained().await.unwrap();
+                panic!("a mismatched remote capability tuple was accepted");
+            }
+            Err(error) => error.downcast::<StartupError>().unwrap(),
+        };
+        assert_eq!(error.source.phase(), Some(Phase::Setup));
+        assert!(error.source.to_string().contains("version does not match"));
+        assert!(matches!(
+            error.cleanup,
+            Ok(ShutdownReceipt::GracefullyStopped)
+        ));
+        assert_eq!(error.handle.task_metrics().tasks, 0);
+    }
     let engine = FedEngine::start(config).await.unwrap();
     let mut connection_config = tokio_postgres::Config::new();
     connection_config
@@ -216,6 +289,22 @@ async fn remote_crud_federation_ddl_index_generation_and_zero_cross_source_effec
                 .await
                 .unwrap(),
             1
+        );
+        // Reject the entire Simple Query message before its first write runs.
+        let error = client
+            .simple_query(&format!(
+                "INSERT INTO {table} VALUES(99,'must-not-be-written',99); SELECT 1"
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code().unwrap().code(), "0A000");
+        assert_eq!(
+            client
+                .query_one(&format!("SELECT count(*)::BIGINT FROM {table}"), &[])
+                .await
+                .unwrap()
+                .get::<_, i64>(0),
+            2
         );
         assert_eq!(
             client
@@ -365,6 +454,70 @@ async fn remote_crud_federation_ddl_index_generation_and_zero_cross_source_effec
     let rows=client.query("SELECT a.name,b.amount FROM pg_crm.public.fedengine_test_items a JOIN mysql_erp.erp.fedengine_test_items b ON a.id=b.id",&[]).await.unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get::<_, String>(0), "Alice");
+    // Exercise a real CancelRequest on an execution involving both remote sources.
+    // This does not simulate a blocked extension network call.
+    let cancel = client.cancel_token();
+    {
+        let query = client.simple_query(
+            "SELECT sum(a.amount::BIGINT + r.i*s.j) \
+             FROM pg_crm.public.fedengine_test_items a \
+             JOIN mysql_erp.erp.fedengine_test_items b ON a.id=b.id \
+             CROSS JOIN range(1000000000) r(i) CROSS JOIN range(1000000000) s(j)",
+        );
+        tokio::pin!(query);
+        tokio::select! {
+            result = &mut query => panic!("remote-source query ended before cancellation: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+        }
+        cancel.cancel_query(NoTls).await.unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(5), query)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.code().unwrap().code(), "57014");
+    }
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT count(*)::BIGINT FROM pg_crm.public.fedengine_test_items a \
+                 JOIN mysql_erp.erp.fedengine_test_items b ON a.id=b.id",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        1
+    );
+    // Suspend and resume a named Portal over the same cross-source JOIN, then
+    // Close/Sync with one row still unread rather than consuming its result.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut portal = wire::raw_start(engine.address().unwrap(), "pg_crm").await;
+        wire::packet(
+            &mut portal,
+            b'P',
+            b"join_stmt\0SELECT r.i::INTEGER \
+              FROM pg_crm.public.fedengine_test_items a \
+              JOIN mysql_erp.erp.fedengine_test_items b ON a.id=b.id \
+              CROSS JOIN range(3) r(i) ORDER BY r.i\0\0\0",
+        )
+        .await;
+        wire::packet(&mut portal, b'B', b"join_portal\0join_stmt\0\0\0\0\0\0\0").await;
+        let mut execute = b"join_portal\0".to_vec();
+        execute.extend_from_slice(&1i32.to_be_bytes());
+        for expected in ["0", "1"] {
+            wire::packet(&mut portal, b'E', &execute).await;
+            wire::packet(&mut portal, b'H', &[]).await;
+            let (rows, boundary) = wire::until_boundary(&mut portal).await;
+            assert_eq!(rows, [expected]);
+            assert_eq!(boundary, b's');
+        }
+        wire::packet(&mut portal, b'C', b"Pjoin_portal\0").await;
+        wire::packet(&mut portal, b'S', &[]).await;
+        assert_eq!(wire::message(&mut portal).await.0, b'3');
+        assert_eq!(wire::message(&mut portal).await.0, b'Z');
+    })
+    .await
+    .unwrap();
     for sql in [
         "INSERT INTO pg_crm.public.fedengine_test_items(id,name,amount) SELECT id,name,amount FROM mysql_erp.erp.fedengine_test_items",
         "CREATE TABLE pg_crm.public.cross_source_must_not_exist AS SELECT * FROM mysql_erp.erp.fedengine_test_items",
@@ -435,6 +588,7 @@ async fn remote_crud_federation_ddl_index_generation_and_zero_cross_source_effec
         .unwrap()
         .unwrap();
     assert_eq!(engine.handle.health().pending.operations, 0);
+    assert_eq!(engine.handle.task_metrics().tasks, 0);
     let metrics = engine.metrics();
     assert_eq!(metrics.active_workers, 0);
     assert_eq!(metrics.active_sessions, 0);

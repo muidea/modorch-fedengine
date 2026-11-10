@@ -1,9 +1,9 @@
 //! The virtual server accepts only authorized, published source catalogs.
 mod common;
-use fedengine_app::FedEngine;
-use fedengine_contract::CatalogHeader;
-use fedengine_core::*;
-use fedengine_policy::metadata_scope;
+use modorch_fedengine_contract::CatalogHeader;
+use modorch_fedengine_core::*;
+use modorch_fedengine_policy::metadata_scope;
+use modorch_fedengine_test_host::FedEngine;
 use tokio_postgres::NoTls;
 
 fn fixture() -> (Config, CatalogHeader, DataSourceDefinition) {
@@ -178,7 +178,7 @@ async fn empty_server_has_no_synthetic_database_or_username_fallback_catalog() {
 
 #[test]
 fn user_database_connect_and_mapped_objects_have_independent_authorization() {
-    use fedengine_contract::CatalogHeads;
+    use modorch_fedengine_contract::CatalogHeads;
     let (mut config, header, definition) = fixture();
     let db = VirtualDatabase {
         managed: false,

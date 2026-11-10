@@ -3,8 +3,8 @@ mod common;
 #[path = "common/protocol_engine.rs"]
 mod protocol_engine;
 use common::TestDirectory;
-use fedengine_app::FedEngine;
-use fedengine_core::*;
+use modorch_fedengine_core::*;
+use modorch_fedengine_test_host::FedEngine;
 use serde_json::{Value, json};
 use std::{net::SocketAddr, time::Duration};
 use tokio::{
@@ -1814,7 +1814,7 @@ async fn metadata_scale_refresh_preserves_query_admission_and_memory_budget() {
         * 1024
         * 1024;
     let _ = tracing_subscriber::fmt()
-        .with_env_filter("warn,fedengine_duckdb::catalog=debug,fedengine_duckdb::identity=debug,fedengine_duckdb::projection=debug,fedengine_duckdb::storage=debug,fedengine_duckdb::runtime=debug,fedengine_management::coordinator=debug,fedengine_query=debug")
+        .with_env_filter("warn,modorch_fedengine_duckdb::catalog=debug,modorch_fedengine_duckdb::identity=debug,modorch_fedengine_duckdb::projection=debug,modorch_fedengine_duckdb::storage=debug,modorch_fedengine_duckdb::runtime=debug,modorch_fedengine_management::coordinator=debug,modorch_fedengine_query=debug")
         .with_test_writer()
         .try_init();
     let (admin, connection) = tokio_postgres::connect(

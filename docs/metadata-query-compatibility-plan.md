@@ -1,6 +1,6 @@
 # 元数据管理与 PostgreSQL 查询兼容实施方案
 
-状态：**用户已确认并实施**。M0–M4 的核心代码和固定客户端流程已落地；规模和故障验证仍有未完成项，边界见[开发文档](development.md#规模与故障验证边界)，后续实施见[剩余项方案](remaining-items-plan.md)。本文保留经确认的目标与验收条件，不能将目标条目直接当成已通过证据。参考工程为 `/home/fedquery/下载/federated-query-engine-9.00.00.00`。
+状态：**用户已确认并实施**。M0–M4 的核心代码和固定客户端流程已落地；规模和故障验证仍有未完成项，边界见[开发文档](development.md#规模与故障验证边界)，后续实施见[剩余项方案](remaining-items-plan.md)。本文保留经确认的目标与验收条件，不能将目标条目直接当成已通过证据。参考工程为 `federated-query-engine-9.00.00.00`，按开发环境单独获取。
 
 ## 1. 目标与实施前差距
 
@@ -12,12 +12,12 @@
 
 | 差距 | 当前落点 | 本次处理 |
 | --- | --- | --- |
-| 业务绑定拒绝系统命名空间 | `fedengine-ddl/src/binding.rs` | 增加受控系统目录查询路径 |
-| QueryRequest 没有当前 database/search_path | `fedengine-contract/src/lib.rs`、`fedengine-pgwire/src/session/mod.rs` | 引入会话命名空间并贯通绑定 |
-| 元数据只有基础列属性和索引定义 | `fedengine-core/src/management.rs` | 补齐关系元数据和分类状态 |
-| 没有持久化的 PG 对象 OID、列 attnum | `fedengine-duckdb/src/storage.rs` | 增加稳定身份与迁移 |
-| wire 只支持现有标量，不能表达目录 vector/array | `fedengine-contract`、`fedengine-pg-compat` | 增加目录所需类型及编码 |
-| 目录 HTTP 分页读取管理状态后在内存过滤 | `fedengine-catalog/src/lib.rs` | 改为有界、按范围读取统一发布层 |
+| 业务绑定拒绝系统命名空间 | `modorch-fedengine-ddl/src/binding.rs` | 增加受控系统目录查询路径 |
+| QueryRequest 没有当前 database/search_path | `modorch-fedengine-contract/src/lib.rs`、`modorch-fedengine-pgwire/src/session/mod.rs` | 引入会话命名空间并贯通绑定 |
+| 元数据只有基础列属性和索引定义 | `modorch-fedengine-core/src/management.rs` | 补齐关系元数据和分类状态 |
+| 没有持久化的 PG 对象 OID、列 attnum | `modorch-fedengine-duckdb/src/storage.rs` | 增加稳定身份与迁移 |
+| wire 只支持现有标量，不能表达目录 vector/array | `modorch-fedengine-contract`、`modorch-fedengine-pg-compat` | 增加目录所需类型及编码 |
+| 目录 HTTP 分页读取管理状态后在内存过滤 | `modorch-fedengine-catalog/src/lib.rs` | 改为有界、按范围读取统一发布层 |
 | 未验证真实 JDBC 和 DBeaver | `docs/protocol-compatibility.md` | 增加独立验收证据 |
 
 管理 API 继续展示所有登记源及其状态。PG 目录展示当前用户可见的已启用源；尚未激活、停用、删除和恢复失败的源不伪装成可连接 database。两种展示范围不同，但结构事实来自同一发布版本。
@@ -146,9 +146,9 @@ flowchart TD
     Q --> BIZ[既有业务绑定 授权 屏障 执行]
 ```
 
-`fedengine-pg-compat` 增加会话探针、系统目录关系/函数描述和 AST 规划；`catalog-manager` 负责统一读取及 scope；`fedengine-duckdb` 负责内部关系投影与有界执行。入口不直接访问 DuckDB，不增加独立数据库实例，不改变 Modorch Runtime。
+`modorch-fedengine-pg-compat` 增加会话探针、系统目录关系/函数描述和 AST 规划；`catalog-manager` 负责统一读取及 scope；`modorch-fedengine-duckdb` 负责内部关系投影与有界执行。入口不直接访问 DuckDB，不增加独立数据库实例，不改变 Modorch Runtime。
 
-实现文件按现有边界组织：`fedengine-core` 保存事实 DTO；`fedengine-contract` 增加会话、目录读取和结果类型契约；`fedengine-catalog` 组织版本化读取；`fedengine-policy` 复用现有 grants 生成可见范围；`fedengine-query` 分类并调度；`fedengine-ddl` 接受显式会话绑定上下文；`fedengine-duckdb` 拆分采集、身份迁移、发布投影和目录执行；`fedengine-pgwire` 保存每连接会话并统一协议处理；`fedengine-management` 只扩展现有编排与 API。`fedengine-app` 仅调整已有组件依赖和服务装配，不为每个 catalog 创建动态组件。
+实现文件按现有边界组织：`modorch-fedengine-core` 保存事实 DTO；`modorch-fedengine-contract` 增加会话、目录读取和结果类型契约；`modorch-fedengine-catalog` 组织版本化读取；`modorch-fedengine-policy` 复用现有 grants 生成可见范围；`modorch-fedengine-query` 分类并调度；`modorch-fedengine-ddl` 接受显式会话绑定上下文；`modorch-fedengine-duckdb` 拆分采集、身份迁移、发布投影和目录执行；`modorch-fedengine-pgwire` 保存每连接会话并统一协议处理；`modorch-fedengine-management` 只扩展现有编排与 API。`modorch-fedengine-test-host` 仅调整已有组件依赖和服务装配，不为每个 catalog 创建动态组件。
 
 查询先分类为会话控制、纯目录读取或业务 SQL。首版拒绝目录与业务对象混合查询，返回明确的 `0A000`；业务 SQL 含 current_database 等会话函数时可受控替换，仍走既有业务授权路径。
 

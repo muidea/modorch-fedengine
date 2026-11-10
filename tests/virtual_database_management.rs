@@ -3,8 +3,8 @@ mod common;
 #[allow(dead_code)]
 #[path = "common/wire.rs"]
 mod wire;
-use fedengine_app::FedEngine;
-use fedengine_core::*;
+use modorch_fedengine_core::*;
+use modorch_fedengine_test_host::FedEngine;
 use serde_json::{Value, json};
 use std::{net::SocketAddr, time::Duration};
 use tokio::{

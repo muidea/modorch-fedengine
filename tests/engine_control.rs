@@ -1,6 +1,6 @@
 //! Real-engine contracts for the conservative, single-instance control boundary.
 use duckdb::Connection;
-use fedengine_core::{quote_identifier, quote_literal};
+use modorch_fedengine_core::{quote_identifier, quote_literal};
 
 #[test]
 #[ignore = "requires disposable PostgreSQL/MySQL and pinned extensions"]

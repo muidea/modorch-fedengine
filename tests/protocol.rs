@@ -1,11 +1,10 @@
+//! Full production Bundle/standalone path, using an explicit empty virtual database.
 mod common;
 #[path = "common/wire.rs"]
 mod wire;
 use common::TestDirectory;
-#[path = "common/protocol_engine.rs"]
-mod protocol_engine;
-use fedengine_core::Config;
-use protocol_engine::ProtocolEngine as FedEngine;
+use modorch_fedengine_core::{Config, VirtualDatabaseConfig};
+use modorch_fedengine_test_host::FedEngine;
 use std::time::Duration;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -16,15 +15,27 @@ use wire::{authenticate, message, packet, raw_start, until_boundary};
 fn config() -> (Config, TestDirectory) {
     let temporary = TestDirectory::new();
     let mut c = Config::load("config/application.toml").unwrap();
-    c.management.enabled = false;
-    c.duckdb.database_path = ":memory:".into();
+    c.duckdb.database_path = temporary
+        .path()
+        .join("state.duckdb")
+        .to_string_lossy()
+        .into();
+    c.management.listen = "127.0.0.1:0".into();
+    c.management.credentials_directory = temporary.path().join("secrets").to_string_lossy().into();
     c.pgwire.listen = "127.0.0.1:0".into();
     c.users[0].password_secret_ref = "USER".into();
     c.duckdb.max_workers = 2;
     c.duckdb.threads = 1;
     c.duckdb.batch_rows = 32;
     c.duckdb.result_channel_batches = 2;
-    c.duckdb.temp_directory = temporary.path().to_string_lossy().into_owned();
+    c.duckdb.temp_directory = temporary.path().join("tmp").to_string_lossy().into_owned();
+    c.virtual_databases = vec![VirtualDatabaseConfig {
+        name: "protocol_db".into(),
+        owner: c.users[0].name.clone(),
+        connect: vec![],
+        allow_connections: true,
+        schemas: vec![],
+    }];
     (c, temporary)
 }
 async fn connect(engine: &FedEngine) -> (tokio_postgres::Client, tokio::task::JoinHandle<()>) {
@@ -526,6 +537,7 @@ async fn unknown_startup_database_is_rejected() {
 async fn omitted_and_empty_startup_database_use_login_user_database() {
     let (mut config, _temporary) = config();
     config.users[0].name = "protocol_db".into();
+    config.virtual_databases[0].owner = "protocol_db".into();
     let engine = FedEngine::start(config).await.unwrap();
     // Send Startup packets directly: client libraries may fill in a database
     // themselves, which would leave the server fallback untested.

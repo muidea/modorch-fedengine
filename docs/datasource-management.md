@@ -23,12 +23,12 @@
 
 | 位置 | 实施前行为 | 改动依据 |
 | --- | --- | --- |
-| `fedengine-core` | `Config.datasources` 保存静态定义 | 区分启动配置、持久化定义和有效快照 |
-| `fedengine-datasource` | 不可变源映射，generation 从 1 开始 | 支持版本化发布、准入状态、持久化身份及在线变更 |
-| `fedengine-duckdb/src/init.rs` | 依赖 Registry，在初始化时打开实例、加载扩展并挂载静态源 | 分离本地实例初始化与外部挂载，增加受控管理端口 |
-| `fedengine-query` | Analyzer 和部分适配逻辑读取静态源定义 | 改为读取同一份有效数据源快照，并在执行准入时复核版本 |
-| `fedengine-catalog` | 提供 generation 快照和远端索引归属 | 增加 schema、表、列发现和完整目录快照 |
-| `fedengine-app` | 固定装配三个 Initiator、三个 Module | 装配实例资源、管理 Module 和管理入口，调整依赖关系 |
+| `modorch-fedengine-core` | `Config.datasources` 保存静态定义 | 区分启动配置、持久化定义和有效快照 |
+| `modorch-fedengine-datasource` | 不可变源映射，generation 从 1 开始 | 支持版本化发布、准入状态、持久化身份及在线变更 |
+| `modorch-fedengine-duckdb/src/init.rs` | 依赖 Registry，在初始化时打开实例、加载扩展并挂载静态源 | 分离本地实例初始化与外部挂载，增加受控管理端口 |
+| `modorch-fedengine-query` | Analyzer 和部分适配逻辑读取静态源定义 | 改为读取同一份有效数据源快照，并在执行准入时复核版本 |
+| `modorch-fedengine-catalog` | 提供 generation 快照和远端索引归属 | 增加 schema、表、列发现和完整目录快照 |
+| `modorch-fedengine-test-host` | 固定装配三个 Initiator、三个 Module | 装配实例资源、管理 Module 和管理入口，调整依赖关系 |
 | `config/application.toml` | 已有 `[duckdb].database_path`，默认 `:memory:` | 使用本地文件；不再新增重复的 `[storage].path` |
 
 仅修改 Registry 不能实现在线管理。绑定、状态检查、目录和运行时必须共同使用已发布版本。现有策略代码中读取静态数据源定义的位置只做动态快照适配，不扩展数据权限模型，也不借此删除已有校验。
@@ -161,7 +161,7 @@ flowchart TD
 | `source-manager` | 接受管理意图，编排持久化、探测、应用、排空及恢复 |
 | `management-api` | 生命周期受管的 HTTP 入口，只做协议转换与结果映射 |
 
-数据源记录不会变成动态 Modorch 组件。启动恢复和在线应用复用 `fedengine-duckdb` 内部的控制与恢复函数，source-manager 通过受控端口调用；下层运行时不反向依赖管理 crate，Initiator 不依赖管理 Module 才能初始化。
+数据源记录不会变成动态 Modorch 组件。启动恢复和在线应用复用 `modorch-fedengine-duckdb` 内部的控制与恢复函数，source-manager 通过受控端口调用；下层运行时不反向依赖管理 crate，Initiator 不依赖管理 Module 才能初始化。
 
 Handler 负责校验、登记操作及安排任务，长工作通过 Owner TaskScheduler 执行；同步 DuckDB I/O 使用 `spawn_blocking_io`。ServiceLease、源锁和执行资源保留到任务真实退出。操作状态通过 Request 读取，不把 Command Accepted 或 Request 超时当作操作完成。
 
@@ -274,14 +274,14 @@ Analyzer、目录解析和运行时源检查使用同一版本快照。请求即
 
 | 位置 | 工作 |
 | --- | --- |
-| `fedengine-core` | 拆分启动参数与源定义；增加 revision、状态、绑定、目录 DTO |
-| `fedengine-contract` | 定义中立的存储、管理、目录和运行时控制契约 |
-| `fedengine-duckdb` | 新增实例资源、当前结构初始化/存储适配、连接控制及 schema/table/column 发现内部模块 |
-| `fedengine-datasource` | 改造 Registry、快照发布、准入和身份/generation 校验 |
-| `fedengine-catalog` | 扩展目录请求、快照存取和刷新编排 |
-| 新增 `fedengine-management` crate | 容纳 source-manager Module、管理 HTTP Initiator、操作协调与恢复逻辑 |
-| `fedengine-query` 及现有源定义使用方 | 移除运行路径对静态数据源列表的依赖，接入快照和屏障 |
-| `fedengine-app` | 显式注册/启用新组件、启动恢复、就绪与关闭处理 |
+| `modorch-fedengine-core` | 拆分启动参数与源定义；增加 revision、状态、绑定、目录 DTO |
+| `modorch-fedengine-contract` | 定义中立的存储、管理、目录和运行时控制契约 |
+| `modorch-fedengine-duckdb` | 新增实例资源、当前结构初始化/存储适配、连接控制及 schema/table/column 发现内部模块 |
+| `modorch-fedengine-datasource` | 改造 Registry、快照发布、准入和身份/generation 校验 |
+| `modorch-fedengine-catalog` | 扩展目录请求、快照存取和刷新编排 |
+| 新增 `modorch-fedengine-management` crate | 容纳 source-manager Module、管理 HTTP Initiator、操作协调与恢复逻辑 |
+| `modorch-fedengine-query` 及现有源定义使用方 | 移除运行路径对静态数据源列表的依赖，接入快照和屏障 |
+| `modorch-fedengine-test-host` | 显式注册/启用新组件、启动恢复、就绪与关闭处理 |
 | 配置、示例和文档 | 文件持久化、首次导入、在线管理示例和部署卷说明 |
 
 新增 crate 对应独立管理能力；初始化、凭据解析、状态枚举等普通实现不各自拆成 crate 或 Modorch 组件。应用入口继续留在根包，不改变现有 workspace 总体结构。
@@ -329,8 +329,8 @@ Analyzer、目录解析和运行时源检查使用同一版本快照。请求即
 | 阶段 | 实现落点 | 长期维护的验证 |
 | --- | --- | --- |
 | P0 | 同实例连接、受控扩展加载/挂载/卸载；保守实例屏障 | `tests/engine_control.rs` 验证 PostgreSQL/MySQL 零源初始化后的动态挂载、变更前后创建的连接、活跃流释放、缓存刷新和卸载可见性 |
-| P1 | `fedengine-core::management`；DuckDB `instance`、`storage`、`credentials` | core 配置测试、DuckDB 初始化/事务/凭据测试、管理持久化重启测试；覆盖空首次导入、禁止再次导入、事务回滚、非当前版本拒绝、目录逃逸和引用重新读取 |
-| P2 | `fedengine-management` 的 API、Module、意图 reducer 和后台 coordinator；动态 Registry、查询和策略适配 | `tests/management.rs` 覆盖 HTTP 状态、CAS/幂等、连接探测/发现、双库零源接入、应用、失败保留旧版、排空、删除与身份重建 |
+| P1 | `modorch-fedengine-core::management`；DuckDB `instance`、`storage`、`credentials` | core 配置测试、DuckDB 初始化/事务/凭据测试、管理持久化重启测试；覆盖空首次导入、禁止再次导入、事务回滚、非当前版本拒绝、目录逃逸和引用重新读取 |
+| P2 | `modorch-fedengine-management` 的 API、Module、意图 reducer 和后台 coordinator；动态 Registry、查询和策略适配 | `tests/management.rs` 覆盖 HTTP 状态、CAS/幂等、连接探测/发现、双库零源接入、应用、失败保留旧版、排空、删除与身份重建 |
 | P3 | 版本化 schema 绑定、远端结构扫描、真实映射类型、目录分页、完整快照发布、DDL 后刷新 | 真实远端集成覆盖发现不自动纳入、MySQL database 范围、Schema 纳入/移出、默认绑定清除、外部 DDL 刷新、旧 Prepared Statement 拒绝、DDL 成功但刷新失败及在线恢复 |
 | P4 | 启动协调、独立恢复操作、短事务重试、目录保留、配额和 checked shutdown；配置和 API 示例 | 管理集成覆盖 `IntentCommitted`、`Attaching`、`SnapshotCommitted`、`Publishing` 持久化中断状态重启核对、单源离线、并发刷新/写入、Portal 排空、队列背压及退出时未完成意图；进程 smoke 覆盖双入口 Ready、PG 协商、HTTP 读取与 SIGTERM 排空 |
 
@@ -340,7 +340,7 @@ Analyzer、目录解析和运行时源检查使用同一版本快照。请求即
 
 验证命令为 fmt、严格 Clippy、workspace 单元/集成测试、警告视为错误的 Rustdoc、真实进程 smoke 和上述统一数据库集成脚本。真实远端验证组合为 Linux x86_64、DuckDB v2.0.0、锁定扫描扩展、PostgreSQL 17.7 和 MySQL 5.7。其他数据库类型和长时间负载验证不在本阶段覆盖范围。后续已实现的系统目录浏览、统一关系元数据和固定客户端实测见 [元数据实施方案](metadata-query-compatibility-plan.md) 与 [协议兼容说明](protocol-compatibility.md)。
 
-Modorch 预检继续使用项目托管 skill：Facade `0.0.2`，skill revision `1.0.5`，Contract revision `1.1.0`，解析框架指纹 `e87977dbb4ac10ded6c3e5059a0dd5d547ef5e973f3f42e6a637d86647e727e1`。锁定源码与发布边界见[开发说明](development.md)。未改动框架 Runtime 或公共契约。测试日志、数据库、凭据和临时输出不纳入 Git。
+Modorch 预检使用项目托管 skill：Facade `0.0.3`，skill revision `1.0.7`，Contract revision `1.2.0`，框架完整指纹 `3c3ddca614e910cef42cd34800364e2600609821f259c22f3a73f464f49e1971`。锁定 Git revision 与发布边界见[开发说明](development.md)，实际解析的 Feature 子集由 preflight 逐文件核对。未改动框架 Runtime 或公共契约。测试日志、数据库、凭据和临时输出不纳入 Git。
 
 ## 虚拟 PostgreSQL Server 的目录边界
 

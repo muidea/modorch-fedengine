@@ -1,0 +1,20 @@
+[package]
+name = "embedded-in-modorch"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT"
+publish = false
+
+# A separate consumer, deliberately outside FedEngine's workspace.
+[workspace]
+resolver = "3"
+
+[dependencies]
+modorch = { git = "https://github.com/muidea/modorch-rs", rev = "336ba20196044e1b81fb2ca297a18b5e258a5800", version = "=0.0.3" }
+modorch-fedengine = { path = "../../crates/modorch-fedengine" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "net", "io-util", "sync"] }
+
+[dev-dependencies]
+serde_json = "1"
+tokio-postgres = "0.7"

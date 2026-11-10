@@ -3,8 +3,8 @@ mod common;
 #[allow(dead_code)]
 #[path = "common/wire.rs"]
 mod wire;
-use fedengine_app::FedEngine;
-use fedengine_core::*;
+use modorch_fedengine_core::*;
+use modorch_fedengine_test_host::FedEngine;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -216,7 +216,7 @@ async fn startup_authentication_precedes_database_checks_and_failures_are_termin
 
 #[test]
 fn postgres_qualified_wildcards_columns_and_correlated_queries_execute_after_binding() {
-    use fedengine_ddl::{Analyzer, BindingNamespace};
+    use modorch_fedengine_ddl::{Analyzer, BindingNamespace};
     let c = Config::load("examples/config/federation.toml").unwrap();
     let a = Analyzer {
         sources: c.datasources,

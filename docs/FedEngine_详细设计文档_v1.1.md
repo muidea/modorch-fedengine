@@ -1,9 +1,11 @@
 # FedEngine — 基于 Modorch-RS、PGWire 与 DuckDB 的联邦数据库引擎详细设计
 
+> 当前实现基线：Modorch-RS 0.0.3，固定 Git rev `336ba20196044e1b81fb2ca297a18b5e258a5800`。本文保留领域设计目标，当前公开业务库 API、已实现行为和发布边界分别以 [Facade/宿主说明](embedded-library.md)、[业务契约](../contracts/README.md)和 [0.1.0 交付说明](releases/0.1.0.md)为准；设计中的未来接口不作为可调用 API。
+
 > **文档版本**：v1.1（设计草案，DDL 单数据源约束修订）\
 > **编写日期**：2026-11-02\
 > **项目名称**：FedEngine\
-> **技术栈**：Rust / Modorch-RS v0.3 / PostgreSQL Wire Protocol / DuckDB 2.0 LTS\
+> **技术栈**：Rust / Modorch-RS 0.0.3 / PostgreSQL Wire Protocol / DuckDB 2.0 LTS\
 > **当前数据源**：PostgreSQL、MySQL\
 > **状态说明**：本文件给出工程实现目标与验收契约，不宣称所列组件已全部实现或兼容性测试完成。PostgreSQL/MySQL 扩展的 Table/Schema 常用 DDL 有官方文档依据；远端 Index DDL 须按锁定版本专项验证或采用受控 DuckDB 内执行适配。
 
@@ -11,7 +13,7 @@
 
 ## 0. 执行摘要
 
-FedEngine 是一个**支持查询、写入及受控 DDL 对象管理的联邦数据库引擎**。它在 Rust 进程中运行，对客户端提供兼容 PostgreSQL 的 Wire Protocol 入口，使用 DuckDB 作为唯一 SQL 解析、优化和执行内核，当前通过 DuckDB 的 `postgres` 和 `mysql` 扩展访问远端数据库。应用编排基于 Modorch-RS v0.3 的 Initiator、Module、ServiceRegistry、EventHub、TaskScheduler、生命周期和检查式停机模型。
+FedEngine 是一个**支持查询、写入及受控 DDL 对象管理的联邦数据库引擎**。它在 Rust 进程中运行，对客户端提供兼容 PostgreSQL 的 Wire Protocol 入口，使用 DuckDB 作为唯一 SQL 解析、优化和执行内核，当前通过 DuckDB 的 `postgres` 和 `mysql` 扩展访问远端数据库。应用编排基于 Modorch-RS 0.0.3 的 Initiator、Module、ServiceRegistry、EventHub、TaskScheduler、生命周期和检查式停机模型。
 
 **总体能力**：
 
@@ -31,7 +33,7 @@ FedEngine 是一个**支持查询、写入及受控 DDL 对象管理的联邦数
 - 一个 DML 写入语句只能有一个被修改的数据源；首版进一步保守要求**写语句涉及的业务数据表均属于同一个数据源**，防止跨库 `INSERT ... SELECT` 和跨源更新语义歧义。
 - **DDL 强约束**：`CREATE/ALTER/DROP` Schema、Table、Index 以及关联的读取、引用、依赖对象（如 CTAS、外键）在单条语句内必须属于同一个 `DataSourceId`；不能以“只修改一个源”为理由放行跨源读取。
 - 不因协议层成功入队而声明 SQL 执行成功；不因请求超时而声明远端写入未发生。
-- Modorch-RS v0.3 仍是目标框架设计基线；文内框架 API 均是接口契约示意，实际实现以正式 crate API 为准。
+- Modorch-RS 0.0.3 仍是目标框架设计基线；文内框架 API 均是接口契约示意，实际实现以正式 crate API 为准。
 
 ## 1. 目标、范围与非目标
 
@@ -82,7 +84,7 @@ FedEngine 是一个**支持查询、写入及受控 DDL 对象管理的联邦数
 | 组件 | 建议版本/原则 | 备注 |
 |---|---|---|
 | Rust | Edition 2024；MSRV 按 Modorch 实际实现锁定 | 不在此处伪定已兼容的 MSRV |
-| Modorch-RS | v0.3 **架构规范** | Initiator/Module、EventHub、生命周期等以框架实现版本为准 |
+| Modorch-RS | 0.0.3，固定 Git revision | Initiator/Module、EventHub、生命周期以匹配版本的公开 API/Contract 为准 |
 | Tokio | 1.x | 由宿主进程创建 Runtime，框架不私建全局 Runtime |
 | pgwire | `0.42.1` 评估基线 | 封装为协议适配层，实际特性按编译和兼容测试锁定 |
 | DuckDB 核心 | `2.0.0 LTS` 评估基线 | 正式部署须固定核心和扩展构建版本 |
@@ -166,7 +168,7 @@ Shared Config / Secrets
                         └── pgwire-listener (Ready 后激活外部准入)
 ```
 
-以上逻辑依赖不意味着 Initiator 可以依赖 Module。Modorch-RS v0.3 默认**禁止 Initiator → Module 的强依赖**。因此 PG Listener 只能依赖已注册的受控 `QueryIngressPort` 或在 Application 激活阶段等待 Query Coordinator Ready：
+以上逻辑依赖不意味着 Initiator 可以依赖 Module。Modorch-RS 0.0.3 默认**禁止 Initiator → Module 的强依赖**。因此 PG Listener 只能依赖已注册的受控 `QueryIngressPort` 或在 Application 激活阶段等待 Query Coordinator Ready：
 
 1. 先建立 Listener 资源，但**关闭外部请求准入**。
 2. 按 Initiator 阶段执行资源 Setup/Start。
@@ -852,47 +854,25 @@ pub trait DataSourceRegistryPort: Send + Sync {
 ## 12. Cargo Workspace 设计
 
 ```text
-fedengine/
-├── Cargo.toml
-├── Cargo.lock
-├── README.md
-├── src/
-│   └── main.rs                      # 进程入口：配置/信号/调度
+modorch-fedengine/
+├── Cargo.toml / Cargo.lock       # 测试 workspace，无服务 binary
 ├── crates/
-│   ├── fedengine-app/               # Modorch Application Builder 和装配
-│   ├── fedengine-contract/          # 请求、结果、Topic、OperationId
-│   ├── fedengine-core/              # 配置、错误、基础类型、能力矩阵
-│   ├── fedengine-pgwire/            # PG 协议 Initiator、Session/Portal
-│   ├── fedengine-duckdb/            # DuckDB Runtime Initiator / Worker
-│   ├── fedengine-datasource/        # PostgreSQL/MySQL 注册表 Initiator
-│   ├── fedengine-query/             # Query Coordinator Module
-│   ├── fedengine-catalog/           # Catalog Manager Module
-│   ├── fedengine-policy/            # Policy Manager Module
-│   ├── fedengine-ddl/               # 受控 DDL AST/Scope/Capabilities/Index Adapter（普通 Library）
-│   └── fedengine-pg-compat/         # PG 类型、Catalog、SQLSTATE 映射库
-├── config/
-│   ├── application.toml
-│   └── datasources.toml
+│   ├── modorch-fedengine/        # 公共 Facade / Bundle
+│   └── modorch-fedengine-*/      # 业务组件库
+├── config/                      # 开发示例配置
+├── examples/
+│   ├── fedengine-test-host.rs    # 仅开发/回归进程
+│   └── embedded-in-modorch/      # 独立消费者验收
 ├── tests/
-│   ├── protocol/
-│   ├── crud/
-│   ├── federation/
-│   ├── ddl/                         # 同源/跨源矩阵、Index 所属、故障与代际
-│   ├── resilience/
-│   └── lifecycle/
+│   └── support/host/            # 仅供 dev-dependency 的测试装配
 ├── docker/
-│   ├── docker-compose.test.yml
-│   └── Dockerfile
+│   └── docker-compose.test.yml  # 一次性 PG/MySQL 测试源
 └── docs/
-    ├── architecture.md
-    ├── sql-capability.md
-    ├── ddl-capability-matrix.md
-    ├── protocol-compatibility.md
-    ├── development.md
-    └── adr/
 ```
 
-依赖方向：`contract/core` 仅含领域类型，不依赖 Modorch Runtime；PGWire 适配依赖 `contract` 与 Modorch Facade；Query 依赖 `contract` 和 Port 接口；DuckDB 实现负责 `ExecutionPort`；App 负责注入资源及组装。禁止让 `fedengine-duckdb` 反向依赖 PGWire 类型，以确保可独立测试。
+所有正式服务及镜像由 magicDataHub 项目编排交付；本库不交付独立服务程序或 Docker 镜像。
+
+依赖方向：`contract/core` 仅含领域类型，不依赖 Modorch Runtime；PGWire 适配依赖 `contract` 与 Modorch Facade；Query 依赖 `contract` 和 Port 接口；DuckDB 实现负责 `ExecutionPort`；magicDataHub 宿主负责注入资源及组装。禁止让 `modorch-fedengine-duckdb` 反向依赖 PGWire 类型，以确保可独立测试。
 
 ### 12.1 Cargo.toml 基线
 
@@ -1170,7 +1150,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 | MySQL 表存储引擎或 DDL 原子性不足 | 高 | DML/DDL 分级承诺与真实故障测试 |
 | 双层连接池耗尽 | 高 | wait 模式、预算、峰值压测 |
 | DuckDB 扩展与核心 ABI 不一致 | 中高 | 版本固定、启动校验、离线依赖打包 |
-| Modorch-RS v0.3 接口仍为设计草案 | 高 | 先锁定可编译的框架公共 API，再适配 |
+| 未来接口草案与当前 Modorch-RS 0.0.3 实际 API 混用 | 高 | 用锁定版本、源码指纹、公开 Rustdoc 和真实消费者验证，不把设计示意当实现 |
 | PG Catalog/驱动兼容面过大 | 中高 | 逐客户端功能清单和测试驱动迭代 |
 
 ## 20. 最终设计结论
@@ -1185,7 +1165,7 @@ FedEngine 是通过 PostgreSQL Wire Protocol 对外提供标准数据库连接�
 
 ## 参考文档
 
-1. Modorch-RS v0.3 框架设计（本项目既有设计基线，非公开 crate 的发布证明）。
+1. Modorch-RS 0.0.3 框架设计（本项目既有设计基线，非公开 crate 的发布证明）。
 2. DuckDB 2.0 LTS Release Calendar：https://duckdb.org/release_calendar
 3. DuckDB PostgreSQL Extension：https://duckdb.org/docs/2.0/core_extensions/postgres/overview
 4. DuckDB MySQL Extension：https://duckdb.org/docs/current/core_extensions/mysql

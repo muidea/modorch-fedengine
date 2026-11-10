@@ -1,17 +1,17 @@
 //! Wire/codec tests supply a catalog fixture through the module boundary. They
 //! exercise the real listener, policy, query coordinator and DuckDB workers
 //! without creating a production entry database or requiring a remote server.
-use fedengine_contract::*;
-use fedengine_core::*;
-use fedengine_pgwire::{ListenerStatus, PgwireFactory};
 use modorch::{prelude::*, *};
+use modorch_fedengine_contract::*;
+use modorch_fedengine_core::*;
+use modorch_fedengine_pgwire::{ListenerStatus, PgwireFactory};
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 pub struct ProtocolEngine {
     pub handle: ApplicationHandle,
     metrics: Arc<EngineMetrics>,
     status: Arc<ListenerStatus>,
-    management_status: Arc<fedengine_management::ManagementListenerStatus>,
+    management_status: Arc<modorch_fedengine_management::ManagementListenerStatus>,
 }
 impl ProtocolEngine {
     pub async fn start(
@@ -46,7 +46,8 @@ impl ProtocolEngine {
         let config = Arc::new(config);
         let metrics = Arc::new(EngineMetrics::default());
         let status = Arc::new(ListenerStatus::default());
-        let management_status = Arc::new(fedengine_management::ManagementListenerStatus::default());
+        let management_status =
+            Arc::new(modorch_fedengine_management::ManagementListenerStatus::default());
         let mut selection = ComponentSelection::new();
         selection.enable_module("source-manager");
         if config.management.enabled {
@@ -77,14 +78,14 @@ impl ProtocolEngine {
                 ..Default::default()
             });
         builder
-            .register_initiator(fedengine_duckdb::DuckdbInstanceFactory {
+            .register_initiator(modorch_fedengine_duckdb::DuckdbInstanceFactory {
                 config: config.clone(),
             })?
-            .register_initiator(fedengine_datasource::DataSourceFactory {
+            .register_initiator(modorch_fedengine_datasource::DataSourceFactory {
                 definitions: vec![fixture.clone()],
                 managed: false,
             })?
-            .register_initiator(fedengine_duckdb::DuckdbFactory {
+            .register_initiator(modorch_fedengine_duckdb::DuckdbFactory {
                 config: config.clone(),
                 metrics: metrics.clone(),
             })?
@@ -93,18 +94,18 @@ impl ProtocolEngine {
                 metrics: metrics.clone(),
                 status: status.clone(),
             })?
-            .register_module(fedengine_catalog::CatalogFactory { managed: true })?
+            .register_module(modorch_fedengine_catalog::CatalogFactory { managed: true })?
             .register_module(CatalogFixture)?
-            .register_module(fedengine_policy::PolicyFactory {
+            .register_module(modorch_fedengine_policy::PolicyFactory {
                 config: config.clone(),
             })?
-            .register_module(fedengine_query::QueryFactory {
+            .register_module(modorch_fedengine_query::QueryFactory {
                 config: config.clone(),
             })?
-            .register_module(fedengine_management::SourceManagerFactory {
+            .register_module(modorch_fedengine_management::SourceManagerFactory {
                 config: config.clone(),
             })?
-            .register_initiator(fedengine_management::ManagementApiFactory {
+            .register_initiator(modorch_fedengine_management::ManagementApiFactory {
                 config,
                 status: management_status.clone(),
             })?;

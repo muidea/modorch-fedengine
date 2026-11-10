@@ -6,7 +6,7 @@
 
 对外维持 PostgreSQL Server 的数据库、会话及协议模型，联邦能力通过库内 schema 映射提供。以 PostgreSQL 16 真实行为和固定 JDBC/DBeaver 客户端作为验收基准。
 
-参考工程 `/home/fedquery/下载/federated-query-engine-9.00.00.00` 的事实采集、稳定身份、原子发布、授权过滤和 AST 规划继续适用。但其 `internal/modules/kernel/pgserver/biz/fed/startupMessage.go` 会把空 database **或显式等于用户名的 database** 改成 `postgres`，且使用明文密码认证；本方案不采用这些连接行为，保留 SCRAM-SHA-256。
+参考工程 `federated-query-engine-9.00.00.00` 的事实采集、稳定身份、原子发布、授权过滤和 AST 规划继续适用。但其 `internal/modules/kernel/pgserver/biz/fed/startupMessage.go` 会把空 database **或显式等于用户名的 database** 改成 `postgres`，且使用明文密码认证；本方案不采用这些连接行为，保留 SCRAM-SHA-256。
 
 ## 2. 独立业务虚拟库与本地业务范围
 

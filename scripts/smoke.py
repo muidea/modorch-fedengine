@@ -16,7 +16,7 @@ import time
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--binary", default="target/debug/fedengine")
+    parser.add_argument("--binary", default="target/debug/examples/fedengine-test-host")
     args = parser.parse_args()
     binary = str(Path(args.binary).resolve())
     output = []
@@ -28,9 +28,9 @@ def main():
         text = text.replace('database_path = "./data/fedengine.duckdb"', f'database_path = "{folder}/management.duckdb"')
         text = text.replace('temp_directory = "./data/tmp"', f'temp_directory = "{folder}/tmp"')
         configuration.write_text(text)
-        environment = dict(os.environ, FEDENGINE_PASSWORD="disposable-smoke-password", RUST_LOG="fedengine=info", NO_COLOR="1")
+        environment = dict(os.environ, FEDENGINE_PASSWORD="disposable-smoke-password", RUST_LOG="fedengine_test_host=info,modorch_fedengine=info", NO_COLOR="1")
         # Match cargo run's library search path when exercising a download-lib build.
-        libraries = list((Path(binary).parent.parent / "duckdb-download").glob("*/v2.0.0/libduckdb.so"))
+        libraries = list((Path(binary).parent.parent.parent / "duckdb-download").glob("*/v2.0.0/libduckdb.so"))
         if libraries:
             environment["LD_LIBRARY_PATH"] = str(libraries[0].parent) + os.pathsep + environment.get("LD_LIBRARY_PATH", "")
         process = subprocess.Popen([binary, "--config", str(configuration)], env=environment,

@@ -10,9 +10,9 @@ Startup database 可对应有效且授权的数据源 catalog_alias 或显式配
 
 两段名称表示当前库的 schema.table；单段名称按当前有效 search_path 解析；当前数据库.schema.table 同样有效。跨 database 引用默认返回 0A000，显式启用 pgwire.allow_cross_database 才提供原联邦三段扩展。账号库默认 search_path 为 "$user", public，不把所有业务 schema 自动放入路径。原源 database 保留其配置默认 schema。支持引号精确匹配。SET/RESET search_path 推进命名空间版本，使旧 Prepared Statement 返回 0A000，需重新 Parse/Bind；Parse/Describe 不执行 SET，Execute 才生效。切库通过重新连接，不提供 USE。
 
-统一参数注册表支持 search_path、application_name、client_encoding=UTF8、TimeZone=UTC、DateStyle=ISO/MDY、extra_float_digits、client_min_messages、standard_conforming_strings 等受限值；只读 server_version/server_version_num、server_encoding、integer_datetimes 反映兼容契约。未知或不支持参数/值明确报错，具体值约束见 `fedengine-pg-compat/src/session.rs`。
+统一参数注册表支持 search_path、application_name、client_encoding=UTF8、TimeZone=UTC、DateStyle=ISO/MDY、extra_float_digits、client_min_messages、standard_conforming_strings 等受限值；只读 server_version/server_version_num、server_encoding、integer_datetimes 反映兼容契约。未知或不支持参数/值明确报错，具体值约束见 `modorch-fedengine-pg-compat/src/session.rs`。
 
-兼容目录包括 PG16 字段契约的 database/namespace/class/attribute/type、constraint/index/attrdef/description，以及 information_schema 的基础表列与约束视图。所支持的目录清单由 `fedengine-pg-compat/catalog/pg16-schema.json` 固定。部分辅助目录为空（例如没有采集的触发器、规则、分区和列分布统计），不能据此推断远端不存在这些能力。
+兼容目录包括 PG16 字段契约的 database/namespace/class/attribute/type、constraint/index/attrdef/description，以及 information_schema 的基础表列与约束视图。所支持的目录清单由 `modorch-fedengine-pg-compat/catalog/pg16-schema.json` 固定。部分辅助目录为空（例如没有采集的触发器、规则、分区和列分布统计），不能据此推断远端不存在这些能力。
 
 支持客户端所需的 format_type、pg_get_constraintdef、pg_get_indexdef、pg_get_viewdef、pg_get_expr、obj_description、col_description、current_database/current_schema/current_schemas/current_setting、可见性和权限辅助查询。`pg_get_keywords()` 来自固定 PG16 基线。`pg_class.reltuples/relpages/relallvisible` 可返回刷新时采集的远端规划估计；MySQL 页数未知。它们不是实时行数或本地存储统计。
 
@@ -51,6 +51,8 @@ Portal 的 maxRows 保留同一执行流；挂起后不重跑 SQL，也不预先
 CancelRequest 使用匹配后端 key 取消，不能推断远端写入回滚。取消监控持续至执行 worker 实际退出，跨内部 setup/describe/execute 语句重新发送中断，避免 DuckDB 重置单次中断后遗留后台计算；客户端收到 57014 不代表租约已经归还，checked shutdown 仍核对实际排空。应用须使用 autocommit；ReadyForQuery 的 Idle 不代表支持显式多语句事务。
 
 ## 实测范围
+
+正式 Bundle 装配路径上的协议/执行测试、一次性 PG/MySQL 断言与复现命令见[库化回归矩阵](library-regression.md)。该矩阵区分默认测试、ignored 远端用例及专用故障夹具。
 
 tokio-postgres 与原始协议覆盖真实 TLS、simple/extended、类型/OID、会话、Portal、取消和清理。PostgreSQL JDBC 42.7.8 已实际执行 catalogs/schemas/tables/columns/PK/FK/cross-reference/index/type 元数据方法；DBeaver CE 25.2.5 已实际浏览 PG/MySQL 目录、关系及数据，并执行跨源 SELECT。复现入口见[固定客户端验证](../tests/jdbc/README.md)，查询与基线夹具位于 `tests/fixtures/metadata/`。SQL 回放不能替代真实 GUI 验证。不承诺其他驱动版本、完整 psql 或完整 PostgreSQL 行为。
 

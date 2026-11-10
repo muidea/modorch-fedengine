@@ -683,215 +683,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
 
 [[package]]
-name = "fedengine"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "duckdb",
- "fedengine-app",
- "fedengine-catalog",
- "fedengine-contract",
- "fedengine-core",
- "fedengine-datasource",
- "fedengine-ddl",
- "fedengine-duckdb",
- "fedengine-management",
- "fedengine-pgwire",
- "fedengine-policy",
- "fedengine-query",
- "modorch",
- "postgres-protocol",
- "rustls-pemfile",
- "serde_json",
- "tokio",
- "tokio-postgres",
- "tokio-rustls",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "fedengine-app"
-version = "0.1.0"
-dependencies = [
- "fedengine-catalog",
- "fedengine-contract",
- "fedengine-core",
- "fedengine-datasource",
- "fedengine-duckdb",
- "fedengine-management",
- "fedengine-pgwire",
- "fedengine-policy",
- "fedengine-query",
- "modorch",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "fedengine-catalog"
-version = "0.1.0"
-dependencies = [
- "fedengine-contract",
- "fedengine-core",
- "fedengine-datasource",
- "fedengine-ddl",
- "modorch",
-]
-
-[[package]]
-name = "fedengine-contract"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "fedengine-core",
- "serde",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
-name = "fedengine-core"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "serde",
- "serde_json",
- "thiserror",
- "toml",
-]
-
-[[package]]
-name = "fedengine-datasource"
-version = "0.1.0"
-dependencies = [
- "fedengine-contract",
- "fedengine-core",
- "modorch",
- "tokio",
-]
-
-[[package]]
-name = "fedengine-ddl"
-version = "0.1.0"
-dependencies = [
- "fedengine-core",
- "sqlparser",
- "toml",
-]
-
-[[package]]
-name = "fedengine-duckdb"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "duckdb",
- "fedengine-contract",
- "fedengine-core",
- "fedengine-datasource",
- "fedengine-pg-compat",
- "flate2",
- "modorch",
- "serde",
- "serde_json",
- "sha2",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "fedengine-management"
-version = "0.1.0"
-dependencies = [
- "axum",
- "chrono",
- "fedengine-catalog",
- "fedengine-contract",
- "fedengine-core",
- "fedengine-datasource",
- "fedengine-ddl",
- "fedengine-pg-compat",
- "fedengine-policy",
- "flate2",
- "modorch",
- "serde",
- "serde_json",
- "sha2",
- "sqlparser",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "fedengine-pg-compat"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "chrono",
- "fedengine-contract",
- "fedengine-core",
- "pgwire",
- "serde",
- "serde_json",
- "sqlparser",
- "uuid",
-]
-
-[[package]]
-name = "fedengine-pgwire"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "fedengine-catalog",
- "fedengine-contract",
- "fedengine-core",
- "fedengine-ddl",
- "fedengine-pg-compat",
- "fedengine-policy",
- "futures",
- "modorch",
- "pgwire",
- "rand 0.10.3",
- "rustls-pemfile",
- "tokio",
- "tokio-rustls",
- "tokio-util",
-]
-
-[[package]]
-name = "fedengine-policy"
-version = "0.1.0"
-dependencies = [
- "fedengine-contract",
- "fedengine-core",
- "fedengine-datasource",
- "fedengine-ddl",
- "modorch",
- "toml",
-]
-
-[[package]]
-name = "fedengine-query"
-version = "0.1.0"
-dependencies = [
- "fedengine-catalog",
- "fedengine-contract",
- "fedengine-core",
- "fedengine-datasource",
- "fedengine-ddl",
- "fedengine-pg-compat",
- "fedengine-policy",
- "modorch",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "filetime"
 version = "0.2.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1477,7 +1268,8 @@ dependencies = [
 
 [[package]]
 name = "modorch"
-version = "0.0.2"
+version = "0.0.3"
+source = "git+https://github.com/muidea/modorch-rs?rev=336ba20196044e1b81fb2ca297a18b5e258a5800#336ba20196044e1b81fb2ca297a18b5e258a5800"
 dependencies = [
  "async-trait",
  "modorch-core",
@@ -1490,7 +1282,8 @@ dependencies = [
 
 [[package]]
 name = "modorch-core"
-version = "0.0.2"
+version = "0.0.3"
+source = "git+https://github.com/muidea/modorch-rs?rev=336ba20196044e1b81fb2ca297a18b5e258a5800#336ba20196044e1b81fb2ca297a18b5e258a5800"
 dependencies = [
  "semver",
  "serde_json",
@@ -1501,7 +1294,8 @@ dependencies = [
 
 [[package]]
 name = "modorch-eventhub"
-version = "0.0.2"
+version = "0.0.3"
+source = "git+https://github.com/muidea/modorch-rs?rev=336ba20196044e1b81fb2ca297a18b5e258a5800#336ba20196044e1b81fb2ca297a18b5e258a5800"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -1511,8 +1305,232 @@ dependencies = [
 ]
 
 [[package]]
+name = "modorch-fedengine"
+version = "0.1.0"
+dependencies = [
+ "modorch",
+ "modorch-fedengine-catalog",
+ "modorch-fedengine-contract",
+ "modorch-fedengine-core",
+ "modorch-fedengine-datasource",
+ "modorch-fedengine-duckdb",
+ "modorch-fedengine-management",
+ "modorch-fedengine-pgwire",
+ "modorch-fedengine-policy",
+ "modorch-fedengine-query",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "modorch-fedengine-catalog"
+version = "0.1.0"
+dependencies = [
+ "modorch",
+ "modorch-fedengine-contract",
+ "modorch-fedengine-core",
+ "modorch-fedengine-datasource",
+ "modorch-fedengine-ddl",
+]
+
+[[package]]
+name = "modorch-fedengine-contract"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "modorch-fedengine-core",
+ "serde",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "modorch-fedengine-core"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "toml",
+]
+
+[[package]]
+name = "modorch-fedengine-datasource"
+version = "0.1.0"
+dependencies = [
+ "modorch",
+ "modorch-fedengine-contract",
+ "modorch-fedengine-core",
+ "tokio",
+]
+
+[[package]]
+name = "modorch-fedengine-ddl"
+version = "0.1.0"
+dependencies = [
+ "modorch-fedengine-core",
+ "sqlparser",
+ "toml",
+]
+
+[[package]]
+name = "modorch-fedengine-duckdb"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "duckdb",
+ "flate2",
+ "modorch",
+ "modorch-fedengine-contract",
+ "modorch-fedengine-core",
+ "modorch-fedengine-datasource",
+ "modorch-fedengine-pg-compat",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "modorch-fedengine-management"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "chrono",
+ "flate2",
+ "modorch",
+ "modorch-fedengine-catalog",
+ "modorch-fedengine-contract",
+ "modorch-fedengine-core",
+ "modorch-fedengine-datasource",
+ "modorch-fedengine-ddl",
+ "modorch-fedengine-pg-compat",
+ "modorch-fedengine-policy",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlparser",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "modorch-fedengine-pg-compat"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "chrono",
+ "modorch-fedengine-contract",
+ "modorch-fedengine-core",
+ "pgwire",
+ "serde",
+ "serde_json",
+ "sqlparser",
+ "uuid",
+]
+
+[[package]]
+name = "modorch-fedengine-pgwire"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures",
+ "modorch",
+ "modorch-fedengine-catalog",
+ "modorch-fedengine-contract",
+ "modorch-fedengine-core",
+ "modorch-fedengine-ddl",
+ "modorch-fedengine-pg-compat",
+ "modorch-fedengine-policy",
+ "pgwire",
+ "rand 0.10.3",
+ "rustls-pemfile",
+ "tokio",
+ "tokio-rustls",
+ "tokio-util",
+]
+
+[[package]]
+name = "modorch-fedengine-policy"
+version = "0.1.0"
+dependencies = [
+ "modorch",
+ "modorch-fedengine-contract",
+ "modorch-fedengine-core",
+ "modorch-fedengine-datasource",
+ "modorch-fedengine-ddl",
+ "toml",
+]
+
+[[package]]
+name = "modorch-fedengine-query"
+version = "0.1.0"
+dependencies = [
+ "modorch",
+ "modorch-fedengine-catalog",
+ "modorch-fedengine-contract",
+ "modorch-fedengine-core",
+ "modorch-fedengine-datasource",
+ "modorch-fedengine-ddl",
+ "modorch-fedengine-pg-compat",
+ "modorch-fedengine-policy",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "modorch-fedengine-test-host"
+version = "0.1.0"
+dependencies = [
+ "modorch",
+ "modorch-fedengine",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "modorch-fedengine-workspace"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "duckdb",
+ "modorch",
+ "modorch-fedengine",
+ "modorch-fedengine-catalog",
+ "modorch-fedengine-contract",
+ "modorch-fedengine-core",
+ "modorch-fedengine-datasource",
+ "modorch-fedengine-ddl",
+ "modorch-fedengine-duckdb",
+ "modorch-fedengine-management",
+ "modorch-fedengine-pgwire",
+ "modorch-fedengine-policy",
+ "modorch-fedengine-query",
+ "modorch-fedengine-test-host",
+ "postgres-protocol",
+ "rustls-pemfile",
+ "serde_json",
+ "tokio",
+ "tokio-postgres",
+ "tokio-rustls",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "modorch-observe"
-version = "0.0.2"
+version = "0.0.3"
+source = "git+https://github.com/muidea/modorch-rs?rev=336ba20196044e1b81fb2ca297a18b5e258a5800#336ba20196044e1b81fb2ca297a18b5e258a5800"
 dependencies = [
  "modorch-core",
  "modorch-runtime",
@@ -1520,14 +1538,16 @@ dependencies = [
 
 [[package]]
 name = "modorch-registry"
-version = "0.0.2"
+version = "0.0.3"
+source = "git+https://github.com/muidea/modorch-rs?rev=336ba20196044e1b81fb2ca297a18b5e258a5800#336ba20196044e1b81fb2ca297a18b5e258a5800"
 dependencies = [
  "modorch-core",
 ]
 
 [[package]]
 name = "modorch-runtime"
-version = "0.0.2"
+version = "0.0.3"
+source = "git+https://github.com/muidea/modorch-rs?rev=336ba20196044e1b81fb2ca297a18b5e258a5800#336ba20196044e1b81fb2ca297a18b5e258a5800"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -1541,7 +1561,8 @@ dependencies = [
 
 [[package]]
 name = "modorch-scheduler"
-version = "0.0.2"
+version = "0.0.3"
+source = "git+https://github.com/muidea/modorch-rs?rev=336ba20196044e1b81fb2ca297a18b5e258a5800#336ba20196044e1b81fb2ca297a18b5e258a5800"
 dependencies = [
  "futures-util",
  "modorch-core",

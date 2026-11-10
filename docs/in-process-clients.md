@@ -1,6 +1,6 @@
 # 进程内 Query / Management Client
 
-适用 0.1.0 开发树、业务契约 1.1.1。宿主仅依赖 `modorch_fedengine` Facade；Modorch 固定 0.0.3。正式服务、鉴权入口、Application 和部署镜像统一由 magicDataHub 编排。FedEngine 只交付库。
+适用 0.1.0 开发树、业务契约 1.1.2。宿主仅依赖 `modorch_fedengine` Facade；Modorch 固定 0.0.3。正式服务、鉴权入口、Application 和部署镜像统一由 magicDataHub 编排。FedEngine 只交付库。
 
 ## 绑定与身份
 

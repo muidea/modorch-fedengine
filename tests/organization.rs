@@ -669,8 +669,81 @@ async fn native_discovery_merge_routing_grants_removal_and_restart() {
 }
 
 #[tokio::test]
+async fn mysql_native_databases_split_and_same_target_registrations_merge() {
+    let dir = common::TestDirectory::new();
+    let mut c = configuration(&dir);
+    c.users.push(UserConfig {
+        name: "reader".into(),
+        password_secret_ref: "USER".into(),
+    });
+    let engine = FedEngine::start(c).await.unwrap();
+    let api = engine.management_address().unwrap();
+    let connection = json!({"id":"mysql_instance","kind":"mysql","instance":{"host":"DB.EXAMPLE.","port":3306},"secret_ref":"file:unused.json"});
+    operation(
+        api,
+        "sources",
+        definition("sales", &connection, "Sales", "sales_db", &["Sales"]),
+    )
+    .await;
+    // One connection may enumerate several databases, each with its own outward name.
+    operation(
+        api,
+        "sources",
+        definition("app", &connection, "App", "app_db", &["App"]),
+    )
+    .await;
+    let mut alias = connection.clone();
+    alias["id"] = json!("other_credentials");
+    alias["instance"]["host"] = json!("db.example");
+    operation(
+        api,
+        "sources",
+        definition("overlap", &alias, "Sales", "sales_db", &["Sales"]),
+    )
+    .await;
+    for (id, database, name) in [
+        ("split", "Sales", "second_sales"),
+        ("collapsed", "Unrelated", "sales_db"),
+        ("case_distinct", "sales", "sales_db"),
+    ] {
+        assert_eq!(
+            http(
+                api,
+                "POST",
+                "sources",
+                definition(id, &alias, database, name, &[database])
+            )
+            .await
+            .0,
+            409
+        );
+    }
+    alias["id"] = json!("other_instance");
+    alias["instance"]["port"] = json!(3307);
+    assert_eq!(
+        http(
+            api,
+            "POST",
+            "sources",
+            definition("wrong_port", &alias, "Sales", "sales_db", &["Sales"])
+        )
+        .await
+        .0,
+        409
+    );
+    operation(
+        api,
+        "sources",
+        definition("other_port", &alias, "Sales", "other_sales", &["Sales"]),
+    )
+    .await;
+    assert_eq!(get(api, "sources").await.as_array().unwrap().len(), 4);
+    engine.shutdown_until_drained().await.unwrap();
+}
+
+#[tokio::test]
 #[ignore = "requires disposable MySQL fixture"]
-async fn mysql_instance_databases_are_schemas_in_one_virtual_database() {
+async fn mysql_instance_databases_have_distinct_virtual_databases() {
     mysql_organization(false).await;
 }
 #[tokio::test]
@@ -739,6 +812,7 @@ async fn mysql_organization(strict: bool) {
             |candidate| candidate["database"] == database.as_str()
                 && candidate["schemas"] == json!([database])
                 && candidate["status"] == "available"
+                && candidate["virtual_database"] == format!("my_{database}")
         ));
     }
     assert!(
@@ -750,23 +824,28 @@ async fn mysql_organization(strict: bool) {
     );
     activate(
         api,
-        definition("my_a", &connection, &a, "mysql_business", &[&a]),
+        definition("my_a", &connection, &a, "mysql_sales", &[&a]),
     )
     .await;
-    activate(
-        api,
-        definition("my_b", &connection, &b, "mysql_business", &[&b]),
-    )
-    .await;
+    activate(api, definition("my_b", &connection, &b, "mysql_app", &[&b])).await;
     let mut overlap = connection.clone();
     overlap["id"] = json!("overlap");
     activate(
         api,
-        definition("my_overlap", &overlap, &a, "mysql_business", &[&a]),
+        definition("my_overlap", &overlap, &a, "mysql_sales", &[&a]),
     )
     .await;
-    let database = get(api, "virtual-databases/mysql_business").await;
-    assert_eq!(database["config"]["schemas"].as_array().unwrap().len(), 3);
+    let database = get(api, "virtual-databases/mysql_sales").await;
+    let other_database = get(api, "virtual-databases/mysql_app").await;
+    assert_ne!(database["oid"], other_database["oid"]);
+    assert_eq!(database["config"]["schemas"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        other_database["config"]["schemas"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
     let schemas = get(api, &browse(&database, "schemas")).await;
     let names = schemas["schemas"]
         .as_array()
@@ -774,15 +853,18 @@ async fn mysql_organization(strict: bool) {
         .iter()
         .map(|s| s["name"].as_str().unwrap())
         .collect::<Vec<_>>();
-    assert!(names.contains(&a.as_str()) && names.contains(&b.as_str()));
+    assert!(names.contains(&a.as_str()) && !names.contains(&b.as_str()));
+    let q = query(api, &database, &format!("SELECT id FROM {a}.items")).await;
+    assert_eq!(q["status"], "succeeded", "{q}");
+    assert_eq!(q["result"]["rows"][0][0], "19");
     let q = query(
         api,
-        &database,
-        &format!("SELECT a.id+b.id AS total FROM {a}.items a CROSS JOIN \"{b}\".items b"),
+        &other_database,
+        &format!("SELECT id FROM \"{b}\".items"),
     )
     .await;
     assert_eq!(q["status"], "succeeded", "{q}");
-    assert_eq!(q["result"]["rows"][0][0], "42");
+    assert_eq!(q["result"]["rows"][0][0], "23");
     let item = get(
         api,
         &format!("{}&schema={a}&object=items", browse(&database, "object")),
@@ -797,7 +879,7 @@ async fn mysql_organization(strict: bool) {
         json!({"target":target(&source)}),
     )
     .await;
-    let database = get(api, "virtual-databases/mysql_business").await;
+    let database = get(api, "virtual-databases/mysql_sales").await;
     let item = get(
         api,
         &format!("{}&schema={a}&object=items", browse(&database, "object")),
@@ -807,7 +889,11 @@ async fn mysql_organization(strict: bool) {
     engine.shutdown_until_drained().await.unwrap();
     let engine = FedEngine::start(c).await.unwrap();
     let api = engine.management_address().unwrap();
-    let database = get(api, "virtual-databases/mysql_business").await;
+    let database = get(api, "virtual-databases/mysql_sales").await;
+    assert_eq!(
+        get(api, "virtual-databases/mysql_app").await["oid"],
+        other_database["oid"]
+    );
     let item = get(
         api,
         &format!("{}&schema={a}&object=items", browse(&database, "object")),

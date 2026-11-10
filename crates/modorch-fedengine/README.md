@@ -31,4 +31,6 @@ let app = builder.selection(selection).execution_resources(ExecutionResources {
 
 一个 Application 只支持一个固定 ID 的 FedEngine。不同实例独立使用管理文件、临时目录、端口和凭据来源；更名不自动重命名既有数据或 SecretRef。相对路径沿用进程工作目录语义，组合宿主应明确准备绝对路径。
 
+自动组织按产品、规范化实例身份和原生数据库精确名称分组。PostgreSQL 与 MySQL 的每个原生数据库分别对应一个虚拟库，同库来源合并；同一连接登记可发现多个独立虚拟库。PG 保留原 Schema，MySQL 保留源 database 同名 Schema，不按来源别名重命名。
+
 注册错误后丢弃 Builder。启动失败保留 StartupError 主因和 cleanup；StopIncomplete 时保留 Application、Runtime 与实际资源并重试。Forced 不代表正常排空，取消不保证远端写回滚，未知结果不自动重放。完整可编译启动/信号/退出样例在源码仓库的 `examples/embedded-in-modorch/`；公开签名和约束见本包 Rustdoc。

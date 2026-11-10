@@ -176,15 +176,6 @@ pub fn validate_organization(
                 "connection registration id belongs to another instance",
             ));
         }
-        if definition.kind == DataSourceKind::Mysql
-            && target.connection_id == existing.connection_id
-            && target.virtual_database != existing.virtual_database
-        {
-            return Err(EngineError::new(
-                "40001",
-                "one MySQL connection registration must use one virtual database",
-            ));
-        }
         let same_target = target.native_key(definition.kind) == existing.native_key(other.kind);
         let same_name = target
             .virtual_database
@@ -202,7 +193,7 @@ pub fn validate_organization(
             && (target.virtual_database != existing.virtual_database
                 || definition.kind != other.kind
                 || target.instance.key() != existing.instance.key()
-                || (definition.kind == DataSourceKind::Postgres && !same_target))
+                || !same_target)
         {
             return Err(EngineError::new(
                 "40001",

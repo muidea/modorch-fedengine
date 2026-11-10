@@ -147,7 +147,7 @@ impl Coordinator {
                         }
                     }
                     if candidate.virtual_database.is_none() && candidate.status == DatabaseDiscoveryStatus::Available {
-                        let name = if connection.kind == DataSourceKind::Postgres { format!("{}_{}", connection.id.0, candidate.database) } else {connection.id.0.clone()};
+                        let name = format!("{}_{}", connection.id.0, candidate.database);
                         candidate.virtual_database = Some(name.chars().take(63).collect());
                     }
                 }

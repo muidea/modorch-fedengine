@@ -16,7 +16,7 @@ export function createRegistration({ el, button, field, check, table, openDialog
     const target = source?.desired.definition.organization;
     const definition = source?.desired.definition;
     const kind = el('select', { name: 'kind' }, el('option', { value: 'postgres' }, 'PostgreSQL'), el('option', { value: 'mysql' }, 'MySQL / MySQL 协议'));
-    const body = el('div', {}, el('details', { class: 'small-note' }, el('summary', {}, '填写说明'), el('p', {}, '凭据引用指向含 username、password 及可选 options 的 JSON。填写连接后发现数据库，核对范围和虚拟库名，再激活。')),
+    const body = el('div', {}, el('details', { class: 'small-note' }, el('summary', {}, '填写说明'), el('p', {}, '凭据引用指向含 username、password 及可选 options 的 JSON。填写连接后发现数据库，核对范围和数据库名，再激活。')),
       el('div', { class: 'form-grid' },
         field('连接登记 ID', 'connection_id', target?.connection_id ?? '', { required: true, placeholder: '例如 crm_pg' }),
         el('label', { class: 'field' }, '产品 / 协议', kind),
@@ -25,7 +25,7 @@ export function createRegistration({ el, button, field, check, table, openDialog
         field('源数据库（可选）', 'database', '', { hint: '留空枚举该实例；系统数据库默认排除。' }),
         field('PG 引导数据库', 'bootstrap_database', 'postgres', { hint: '仅用于实例枚举；不改变对外登录规则。' }),
         field('凭据引用', 'secret_ref', definition?.secret_ref ?? '', { required: true, placeholder: 'file:crm.json 或环境变量名' }),
-        field('虚拟库名 / PG 多库名前缀', 'virtual_name', target ? (source.kind === 'mysql' ? target.virtual_database : target.connection_id) : '', { required: true }),
+        field('数据库名 / 多库名前缀', 'virtual_name', target?.connection_id ?? '', { required: true }),
         field('Owner 账号', 'owner', target?.owner ?? 'fedengine', { required: true }),
         field('其他 CONNECT 账号', 'connect', target?.connect.join(', ') ?? '', { hint: '逗号分隔；仍需单独配置 SELECT 授权。' }),
         field('显式实例身份（可选）', 'instance_identity', target?.instance.identity ?? '', { hint: '仅在确认代理 / 别名属于同一实例时填写。' })),
@@ -53,7 +53,6 @@ export function createRegistration({ el, button, field, check, table, openDialog
     }, '探测并发现数据库');
   };
   function review(connection, candidates, settings) {
-    const mysqlExisting = [...new Set(candidates.filter(c => c.merged).map(c => c.virtual_database))];
     const entries = candidates.map(candidate => {
       const existing = sources().find(source => {
         const target = source.desired.definition.organization;
@@ -61,24 +60,22 @@ export function createRegistration({ el, button, field, check, table, openDialog
       })?.desired.definition.organization;
       const enabled = candidate.status === 'available';
       const selected = el('input', { type: 'checkbox', checked: enabled, disabled: !enabled, 'aria-label': `纳管 ${candidate.database}` });
-      let suggested = connection.kind === 'mysql' || connection.database ? settings.name : `${settings.name}_${candidate.database}`.slice(0, 63);
-      if (connection.kind === 'mysql' && mysqlExisting.length === 1) suggested = mysqlExisting[0];
+      let suggested = connection.database ? settings.name : `${settings.name}_${candidate.database}`.slice(0, 63);
       if (candidate.merged) suggested = candidate.virtual_database;
-      const name = el('input', { value: suggested, required: enabled, disabled: !enabled || candidate.merged, 'aria-label': `${candidate.database} 虚拟库名` });
+      const name = el('input', { value: suggested, required: enabled, disabled: !enabled || candidate.merged, 'aria-label': `${candidate.database} 数据库名` });
       const schemas = el('input', { value: candidate.schemas.join(', '), disabled: !enabled || connection.kind === 'mysql', 'aria-label': `${candidate.database} Schema 范围` });
-      const status = el('span', {}, candidate.merged ? '合并到已有虚拟库' : ({available:'新目标', forbidden:'无权限', unavailable:'不可用', excluded:'系统库已排除'}[candidate.status] ?? candidate.status));
+      const status = el('span', {}, candidate.merged ? '合并到已有数据库' : ({available:'新目标', forbidden:'无权限', unavailable:'不可用', excluded:'系统库已排除'}[candidate.status] ?? candidate.status));
       const result = el('div', { class: 'subtext' }, candidate.error ?? '');
       return { candidate, existing, selected, name, schemas, status, result };
     });
-    const body = el('div', {}, el('details', { class: 'small-note' }, el('summary', {}, '映射规则'), el('p', {}, 'PostgreSQL 每个源库独立成库并保留 Schema；MySQL 源 database 映射为 Schema。同一实例同一源库复用已有虚拟库。已排除或不可用的库不会登记。')),
-      table(['纳管', '源数据库', '虚拟数据库', 'Schema 范围', '状态'], entries.map(e => el('tr', {}, el('td', {}, e.selected), el('td', {}, e.candidate.database), el('td', {}, e.name), el('td', {}, e.schemas), el('td', {}, e.status, e.result)))));
+    const body = el('div', {}, el('details', { class: 'small-note' }, el('summary', {}, '映射规则'), el('p', {}, '每个原生数据库独立映射为一个数据库；同一实例同一源库的登记合并。PostgreSQL 保留原 Schema；MySQL 保留源 database 名作为 Schema。不同端口或不同源库不合并。已排除或不可用的库不会登记。')),
+      table(['纳管', '源数据库', '数据库', 'Schema 范围', '状态'], entries.map(e => el('tr', {}, el('td', {}, e.selected), el('td', {}, e.candidate.database), el('td', {}, e.name), el('td', {}, e.schemas), el('td', {}, e.status, e.result)))));
     let busy = false;
     openDialog('添加数据源 · 核对映射并激活', body, async () => {
       if (busy) return;
       const selected = entries.filter(e => e.selected.checked && e.candidate.status === 'available');
       if (!selected.length) throw new Error('请选择至少一个可管理的源数据库。');
-      if (connection.kind === 'postgres' && new Set(selected.map(e => e.name.value.trim())).size !== selected.length) throw new Error('不同 PostgreSQL 源数据库需要独立的虚拟库名。');
-      if (connection.kind === 'mysql' && new Set(selected.map(e => e.name.value.trim())).size !== 1) throw new Error('同一 MySQL 登记的选定数据库须映射到同一个虚拟库；请使用已有目标所属的虚拟库名。');
+      if (new Set(selected.map(e => e.name.value.trim().toLowerCase())).size !== selected.length) throw new Error('不同原生数据库需要独立的数据库名；同库来源复用已有名称。');
       busy = true;
       try {
         for (const e of selected) {

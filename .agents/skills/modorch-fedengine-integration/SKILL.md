@@ -3,9 +3,9 @@ name: modorch-fedengine-integration
 description: "在 Modorch 0.0.3 宿主中接入 modorch-fedengine Facade，处理 Bundle/Profile、宿主预算、路径和检查式退出时使用；含受控 Query/Management Client，不用于修改框架 Runtime 或使用未开放的 EmbeddedCore。"
 metadata:
   compatibility: "Rust/Cargo 1.94、Python 3.11+；modorch-fedengine 0.1.0 开发源码与 Modorch 0.0.3 的匹配指纹"
-  version: "1.1.3"
+  version: "1.1.4"
   framework-version: "0.0.3"
-  library-contracts-revision: "1.1.1"
+  library-contracts-revision: "1.1.2"
 ---
 
 # modorch-fedengine 宿主接入
@@ -27,6 +27,7 @@ python3 scripts/preflight.py --manifest-path /absolute/host/Cargo.toml
 - 只通过 `modorch_fedengine` Facade 接入；与宿主的 `modorch` 必须是相同 Package ID/Source。当前版本未发布 crates.io，Git 消费需要实际包含本接口的提交。
 - 后续所有正式服务统一由 magicDataHub 项目编排与部署。modorch-fedengine 只作为库交付，无可发布服务二进制/镜像；开发测试宿主仅为 dev-dependency，不作为宿主依赖。
 - 宿主选择配置、路径、SecretRef、端口、Runtime、日志和信号。`Config::load` 不相对 TOML 重定位；准备绝对文件路径，保留原管理文件/WAL及引用，各实例独立分配可写目录/文件/端口。源 file 引用按各自凭据目录解析，PGWire 用户口令仍引用环境变量。
+- 自动组织对 PostgreSQL/MySQL 统一按产品、规范化实例身份和原生数据库精确名称分组：每个原生库独立成虚拟库，同库来源合并，同一连接登记可发现多个虚拟库。保留原 Schema；不要把实例内多个 MySQL database 合成一个自动库，也不要把所有来源放进测试汇总库作为默认交付。
 - `FedEngineBundle::new(config).profile(profile).register(&mut builder)` 仅注册 Factory。合并返回实际 IDs 与其他库的显式选择，归并资源建议后由宿主只 build/start 一个 Application。register 失败丢弃 Builder，不启动部分注册结果。
 - start 返回后 `registered.observe(&app)`，检查完整应用 Ready。启动失败保留 StartupError source/cleanup/handle；早于 Bundle setup 的失败可能无法见证身份，不强行关联或伪报 Ready。
 - 进程内调用仅在 Ready 后绑定 query_client/management_client。Principal 是可信宿主已认证身份断言，不是口令验证；管理 grant 默认拒绝，必须显式授予精确源/虚拟库与写权限，不从不可信输入铸造授权。参数化 SQL、opaque Prepared、预算和未知写入规则见[当前接入规则](references/integration.md)。

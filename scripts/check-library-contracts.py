@@ -28,7 +28,7 @@ def validate_mapping(root, mapping):
         rules.extend(RULE.findall(path.read_text()))
     if not rules or len(rules) != len(set(rules)):
         raise ValueError("contract rule IDs must be present and unique")
-    if mapping["revision"] != "1.1.1":
+    if mapping["revision"] != "1.1.2":
         raise ValueError("unsupported library contract revision")
     suites = mapping["suites"]
     seen, covered, used = set(), set(), set()
@@ -124,7 +124,7 @@ def validate_metadata(root):
     release = package["metadata"]["modorch-fedengine"]
     if (release["contract-revision"], release["framework-version"], release["framework-revision"],
         release["status"], release["embedded-core"], release["public-clients"]) != (
-        "1.1.1", "0.0.3", FRAMEWORK_REVISION, "development", False, True
+        "1.1.2", "0.0.3", FRAMEWORK_REVISION, "development", False, True
     ):
         raise ValueError("release metadata overstates or mismatches current capabilities")
     return {"package_version": workspace["version"], "framework_version": "0.0.3",

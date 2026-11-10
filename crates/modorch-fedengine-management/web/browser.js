@@ -44,7 +44,7 @@ export function createBrowser(ui) {
     const e = epoch;
     const latest = await get(`virtual-databases/${encodeURIComponent(w.db.config.name)}`);
     if (!active(w, e)) return;
-    if (latest.oid !== w.db.oid) throw new Error('该数据库已删除或被同名新库替换，请返回业务虚拟库列表重新进入。');
+    if (latest.oid !== w.db.oid) throw new Error('该数据库已删除或被同名新库替换，请返回数据库列表重新进入。');
     w.db = latest;
     w.stamp = null; w.changed = false; w.offset = 0; w.detail = null; w.sqlObject = null;
     if (w.tab !== 'objects') { render(w); return; }
@@ -106,7 +106,7 @@ export function createBrowser(ui) {
     const names = d.external && !o ? [['overview', '概览'], ['columns', '列']] : [['overview', '概览'], ['columns', '列'], ['constraints', d.external ? '来源约束' : '约束'], ['indexes', d.external ? '来源索引' : '索引'], ['definition', '定义'], ['statistics', '统计'], ['source', '来源与状态']];
     const body = el('div', { class: 'panel-body' });
     const back = () => { if (w.sourceView) { w.sourceView = false; renderDetail(w); } else { w.detail = null; renderObjectArea(w); } };
-    replace(host, el('div', { class: 'panel-heading' }, el('div', {}, button(w.sourceView ? '← 返回虚拟库对象' : '← 返回对象列表', back, 'link'),
+    replace(host, el('div', { class: 'panel-heading' }, el('div', {}, button(w.sourceView ? '← 返回数据库对象' : '← 返回对象列表', back, 'link'),
       el('h3', {}, w.sourceView ? `${sourceName}.${d.source.schema}.${d.name}` : `${w.db.config.name}.${d.schema}.${d.name}`)),
       el('span', { class: 'badge' }, w.sourceView ? '来源事实' : d.external ? '只读外部对象' : '系统目录')),
       el('details', { class: 'metadata-help' }, el('summary', {}, '元数据说明'), el('p', {}, d.external

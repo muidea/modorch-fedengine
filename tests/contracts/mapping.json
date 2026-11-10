@@ -1,5 +1,5 @@
 {
-  "revision": "1.1.1",
+  "revision": "1.1.2",
   "suites": {
     "bundle": {
       "command": [
@@ -132,6 +132,33 @@
       ],
       "scope": "local",
       "kind": "logical-message-cost-boundary"
+    },
+    "organization_local": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "--test",
+        "organization",
+        "--",
+        "--test-threads=1"
+      ],
+      "scope": "local",
+      "kind": "native-database-organization"
+    },
+    "organization_remote": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "--test",
+        "organization",
+        "--",
+        "--ignored",
+        "--test-threads=1"
+      ],
+      "scope": "remote",
+      "kind": "owned-native-database-fixtures"
     }
   },
   "tests": [
@@ -690,6 +717,51 @@
       "output": "message_budget_tests::query_payload_cost_accounts_for_variable_input_and_rejects_deep_arrays",
       "rules": [
         "FE-MESSAGE-001"
+      ]
+    },
+    {
+      "suite": "organization_local",
+      "source": "tests/organization.rs",
+      "name": "automatic_target_reservations_reject_collisions_before_network_io",
+      "output": "automatic_target_reservations_reject_collisions_before_network_io",
+      "rules": [
+        "FE-ORG-001"
+      ]
+    },
+    {
+      "suite": "organization_local",
+      "source": "tests/organization.rs",
+      "name": "mysql_native_databases_split_and_same_target_registrations_merge",
+      "output": "mysql_native_databases_split_and_same_target_registrations_merge",
+      "rules": [
+        "FE-ORG-001"
+      ]
+    },
+    {
+      "suite": "organization_remote",
+      "source": "tests/organization.rs",
+      "name": "native_discovery_merge_routing_grants_removal_and_restart",
+      "output": "native_discovery_merge_routing_grants_removal_and_restart",
+      "rules": [
+        "FE-ORG-001"
+      ]
+    },
+    {
+      "suite": "organization_remote",
+      "source": "tests/organization.rs",
+      "name": "mysql_instance_databases_have_distinct_virtual_databases",
+      "output": "mysql_instance_databases_have_distinct_virtual_databases",
+      "rules": [
+        "FE-ORG-001"
+      ]
+    },
+    {
+      "suite": "organization_remote",
+      "source": "tests/organization.rs",
+      "name": "mysql_strict_lifetimes_reset_all_contributors_together",
+      "output": "mysql_strict_lifetimes_reset_all_contributors_together",
+      "rules": [
+        "FE-ORG-001"
       ]
     }
   ]

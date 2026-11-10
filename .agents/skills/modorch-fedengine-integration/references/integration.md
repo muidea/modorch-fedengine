@@ -1,6 +1,6 @@
 # 当前 Facade 接入规则
 
-适用 0.1.0 开发树，业务契约 1.1.1。正式服务统一由 magicDataHub 编排与部署，FedEngine 只交付库。`tests/support/host` 和开发 example 不得作为服务依赖；没有库级服务二进制或 Docker 镜像。完整签名从预检匹配的 Facade 源码/Rustdoc查询；下表不是未来 API 清单。
+适用 0.1.0 开发树，业务契约 1.1.2。正式服务统一由 magicDataHub 编排与部署，FedEngine 只交付库。`tests/support/host` 和开发 example 不得作为服务依赖；没有库级服务二进制或 Docker 镜像。完整签名从预检匹配的 Facade 源码/Rustdoc查询；下表不是未来 API 清单。
 
 | 接口 | 已实现行为 |
 |---|---|
@@ -23,6 +23,8 @@
 组件 ID：核心 Initiator `duckdb-instance`、`datasource-registry`、`duckdb-runtime`；Module `catalog-manager`、`policy-manager`、`query-coordinator`、`source-manager`；可选入口 `pgwire-listener`、`management-api`。重复 Bundle 拒绝；晚期重复可能留下部分注册，丢弃 Builder。实际 ID 应取返回迭代器，不在宿主复制清单。
 
 配置规则：保留 `data/fedengine.duckdb` 的部署路径、WAL、SecretRef 和凭据格式。不同 App 独立文件/临时目录/端口；同进程共享环境变量不是自动命名空间。缺凭据明确失败/降级，不用默认值。源配置仅首次导入，之后管理状态优先。当前版本不匹配明确拒绝，无历史迁移/回退/自动修复。
+
+自动组织规则：PG/MySQL 均逐原生数据库独立成库，同产品/规范化实例/原生库精确名称相同的登记合并贡献。不同端口或原生库不得按同名合并；同一连接登记可对应多个虚拟库。PG 保留来源 Schema，MySQL 在独立虚拟库内保留原生 database 同名 Schema。来源范围、账号或凭据别名不代替原生目标身份；失败激活不等于已发布目录。
 
 资源规则：受管任务、ServiceLease、实际连接、源/实例屏障和文件占用持续到真实退出。同步扩展可能在客户端取消后继续，StopIncomplete 保留资源，Forced 不是 GracefullyStopped，未知写入不重放。默认 FailFast；监督闭包测试显式注入 Restart，不能据此使用不存在的策略 API。
 

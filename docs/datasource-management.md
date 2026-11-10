@@ -50,7 +50,7 @@
 
 第一版不支持修改 `id`、`kind` 和 `catalog_alias`；需要变更时先停用旧源，再登记新源。连接引用及 schema 范围可以在线修改。
 
-PostgreSQL 的一个数据源对应一个 database，可纳入其中多个 schema。MySQL 的一个执行目标限定为一个明确 database；同一连接登记可展开多个目标，并按源库名映射为同一虚拟库下的 Schema。不同贡献继续保留独立执行身份。MySQL schema/database 的实际映射必须通过目标扩展版本的集成验证。
+PostgreSQL 的一个数据源对应一个 database，可纳入其中多个 schema。MySQL 的一个执行目标限定为一个明确 database；同一连接登记可展开多个目标，每个原生数据库独立成虚拟库，并在库内保留源库同名 Schema。不同贡献继续保留独立执行身份。MySQL schema/database 的实际映射必须通过目标扩展版本的集成验证。
 
 ### 3.2 Schema 绑定
 

@@ -126,7 +126,7 @@ node scripts/web-smoke.mjs --chrome /opt/google/chrome/chrome
 
 `tests/browser.rs` 覆盖真实 HTTP 目录、精度保真的只读结果、只读 AST 拒绝、幂等提交、截断、取消、超时和退出；其 ignored 来源用例由 `scripts/test-federation.sh` 在一次性 PG/MySQL 上执行，核对映射、分页、来源详情、授权与快照变化。
 
-脚本启动独立临时状态库、随机端口和专用无头浏览器，验证数据库树仅在对象浏览/SQL 工作区显示（含退出后的桌面/窄屏隐藏）、库切换和查询取消、各库独立草稿、对象/列按需加载、原生双击与光标/选区插入、标识符转义、目录冲突重载、系统 Schema 默认隐藏、空 public、SQL 选中执行、NULL/int8、错误、截断分页和窄屏，以及登记、异步状态、失败探测、凭据引用与 Schema 配置、过期表单冲突、响应丢失后的原键重试、业务虚拟库完整映射编辑和删除、源停用/删除、操作记录。列表回归创建一次性数据源、虚拟库与超过 40 项的持久化操作记录，检查分页、条数切换、跳页、筛选重置、刷新/详情返回保留、删除后页码收缩、新浏览器完整历史及窄屏布局。JavaScript 语法检查及默认浏览器回归已接入 CI，使用 Node.js 24 和 runner 预置 Chrome。目录分页、快照冲突和不可信名称渲染使用浏览器层合成 HTTP 响应，不能替代真实远端目录采集验收。可通过 `FEDENGINE_WEB_POSTGRES_DSN` 和 `FEDENGINE_WEB_POSTGRES_SCHEMA` 显式指定含表的 PostgreSQL schema，额外验证只读探测、发现、激活、刷新及实际目录展示；需事先准备匹配扩展，脚本不执行远端业务 DDL。
+脚本启动独立临时状态库、随机端口和专用无头浏览器，验证数据库树仅在对象浏览/SQL 工作区显示（含退出后的桌面/窄屏隐藏）、库切换和查询取消、各库独立草稿、对象/列按需加载、原生双击与光标/选区插入、标识符转义、目录冲突重载、系统 Schema 默认隐藏、空 public、SQL 选中执行、NULL/int8、错误、截断分页和窄屏，以及登记、异步状态、失败探测、凭据引用与 Schema 配置、过期表单冲突、响应丢失后的原键重试、数据库完整映射编辑和删除、源停用/删除、操作记录。列表回归创建一次性数据源、虚拟库与超过 40 项的持久化操作记录，检查分页、条数切换、跳页、筛选重置、刷新/详情返回保留、删除后页码收缩、新浏览器完整历史及窄屏布局。JavaScript 语法检查及默认浏览器回归已接入 CI，使用 Node.js 24 和 runner 预置 Chrome。目录分页、快照冲突和不可信名称渲染使用浏览器层合成 HTTP 响应，不能替代真实远端目录采集验收。可通过 `FEDENGINE_WEB_POSTGRES_DSN` 和 `FEDENGINE_WEB_POSTGRES_SCHEMA` 显式指定含表的 PostgreSQL schema，额外验证只读探测、发现、激活、刷新及实际目录展示；需事先准备匹配扩展，脚本不执行远端业务 DDL。
 
 可选 `--binary` 指定构建程序，`--screenshot /tmp/页面.png` 生成临时检查截图。服务日志、状态库和浏览器配置退出时清理，截图由调用者验证后删除，不归档。
 
@@ -202,4 +202,4 @@ cargo test --locked --test organization -- --ignored --nocapture --test-threads=
 
 ## 业务库契约与发布准备
 
-[业务契约](../contracts/README.md)以 13 个稳定 ID 对应测试映射，`check-library-contracts.py` 默认只做静态检查，明确输出 execution_status=NotRun；`--run local`、`--run external` 才逐条核对实际测试成功行，不依据通过总数认定覆盖。原生 PG/MySQL 用例和测试注入 Restart 单独标明范围。发布与包元数据见[0.1.0 交付边界](releases/0.1.0.md)，所有包保留 publish=false。
+[业务契约](../contracts/README.md)以稳定 ID 对应测试映射，`check-library-contracts.py` 默认只做静态检查，明确输出 execution_status=NotRun；`--run local`、`--run external` 才逐条核对实际测试成功行，不依据通过总数认定覆盖。原生 PG/MySQL 用例和测试注入 Restart 单独标明范围。发布与包元数据见[0.1.0 交付边界](releases/0.1.0.md)，所有包保留 publish=false。

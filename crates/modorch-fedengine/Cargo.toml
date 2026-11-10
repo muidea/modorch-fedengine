@@ -14,7 +14,7 @@ categories = ["database", "network-programming"]
 
 [package.metadata.modorch-fedengine]
 status = "development"
-contract-revision = "1.1.1"
+contract-revision = "1.1.2"
 framework-version = "0.0.3"
 framework-revision = "336ba20196044e1b81fb2ca297a18b5e258a5800"
 embedded-core = false

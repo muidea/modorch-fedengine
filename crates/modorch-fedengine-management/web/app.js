@@ -235,7 +235,7 @@ function renderStats() {
   replace($('#stats'), ...[
     ['数据源总数', state.sources.length, '', '▤'],
     ['运行中', active, '', '↗'],
-    ['业务虚拟库', state.databases.length, '', '▦'],
+    ['数据库', state.databases.length, '', '▦'],
     ['进行中操作', pending.size, errors ? `${errors} 个源需要关注` : '', '◷'],
   ].map(([label, value, description, icon]) => el('div', { class: 'stat' },
     el('span', { class: 'stat-label' }, label), el('span', { class: 'stat-icon' }, icon),
@@ -283,13 +283,13 @@ function renderPage(workspaceTab) {
     const database = state.databases.find(d => d.oid === state.selected);
     if (!database) { navigate('databases'); return; }
     $('#stats').hidden = true;
-    $('#page-title').textContent = database.config.name; $('#breadcrumb').textContent = `业务虚拟库 / ${database.config.name}`;
+    $('#page-title').textContent = database.config.name; $('#breadcrumb').textContent = `数据库 / ${database.config.name}`;
     document.querySelectorAll('[data-page]').forEach(n => { const active = n.dataset.page === 'databases'; n.classList.toggle('active', active); if (active) n.setAttribute('aria-current', 'page'); else n.removeAttribute('aria-current'); });
-    replace($('#page-actions'), button('← 业务虚拟库', () => navigate('databases')), button('重新加载目录', () => browser.reload()), button('刷新来源元数据', () => browser.refresh(), '', true));
+    replace($('#page-actions'), button('← 数据库', () => navigate('databases')), button('重新加载目录', () => browser.reload()), button('刷新来源元数据', () => browser.refresh(), '', true));
     navigator.select(database); browser.mount($('#content'), database, workspaceTab); renderPending(); return;
   }
   $('#stats').hidden = false;
-  const titles = { sources: '数据源', databases: '业务虚拟库', operations: '操作记录' };
+  const titles = { sources: '数据源', databases: '数据库', operations: '操作记录' };
   $('#page-title').textContent = titles[state.page]; $('#breadcrumb').textContent = titles[state.page];
   document.querySelectorAll('[data-page]').forEach(node => {
     node.classList.toggle('active', node.dataset.page === state.page);
@@ -297,7 +297,7 @@ function renderPage(workspaceTab) {
   });
   const actions = [button('↻ 刷新状态', reload)];
   if (state.page === 'sources') actions.push(button('＋ 登记数据源', registerForm, 'primary', true));
-  if (state.page === 'databases') actions.push(button('＋ 创建业务库', () => databaseForm(), 'primary', true));
+  if (state.page === 'databases') actions.push(button('＋ 创建数据库', () => databaseForm(), 'primary', true));
   replace($('#page-actions'), ...actions);
   if (state.page === 'sources') { if (state.selected) renderSource(); else renderSources(); }
   else if (state.page === 'databases') renderDatabases(); else renderOperations();
@@ -352,7 +352,7 @@ function renderSourceOverview() {
     node.dataset.unavailable = String(busy || unavailable); return node;
   };
   const details = [
-    ['源 ID', source.id], ['虚拟数据库名', source.desired.definition.organization?.virtual_database ?? source.catalog_alias], ['连接登记', source.desired.definition.organization?.connection_id ?? source.id], ['源数据库', source.desired.definition.organization?.database ?? '连接串指定'], ['类型', source.kind],
+    ['源 ID', source.id], ['数据库名', source.desired.definition.organization?.virtual_database ?? source.catalog_alias], ['连接登记', source.desired.definition.organization?.connection_id ?? source.id], ['源数据库', source.desired.definition.organization?.database ?? '连接串指定'], ['类型', source.kind],
     ['凭据引用', definition.secret_ref], ['默认 Schema', definition.default_schema || '未设置'],
     ['生效 / 期望版本', `${source.applied_revision ?? '—'} / ${source.desired_revision}`],
     ['纳管 Schema', source.desired.bindings.map(binding => `${binding.remote_schema}${binding.enabled ? '' : '（停用）'}`).join(', ') || '未选择'],
@@ -500,7 +500,7 @@ function confirmSource(source, action) {
   const deleting = action === 'delete';
   openDialog(`${actionLabels[action]} · ${source.catalog_alias}`,
     el('div', { class: 'notice warning' }, deleting
-      ? '确认删除这个已停用数据源的登记？不会删除远端业务数据。关联业务虚拟库映射也需要核对。'
+      ? '确认删除这个已停用数据源的登记？不会删除远端业务数据。关联数据库映射也需要核对。'
       : '确认停用这个数据源？新的相关查询将停止准入，正在执行的查询和 Portal 需要实际排空。'),
     () => write(deleting ? 'DELETE' : 'POST', `${sourcePath(source.id)}${deleting ? '' : '/disable'}`,
       { target: sourceTarget(source) }, actionLabels[action]), deleting ? '确认删除登记' : '确认停用');
@@ -508,7 +508,7 @@ function confirmSource(source, action) {
 
 function renderDatabases() {
   replace($('#content'), el('section', { class: 'panel' }, el('div', { class: 'panel-heading' },
-    el('h3', {}, '虚拟数据库列表'), listSearch('databases', '搜索虚拟数据库', renderDatabaseRows))), el('div', { id: 'database-rows' }));
+    el('h3', {}, '数据库列表'), listSearch('databases', '搜索数据库', renderDatabaseRows))), el('div', { id: 'database-rows' }));
   renderDatabaseRows();
 }
 function renderDatabaseRows() {
@@ -529,7 +529,7 @@ function renderDatabaseRows() {
             el('div', {}, config.schemas.filter(mapping => mapping.name === name).map(mapping => el('div', {}, sourceLabel(state.sources.find(source => source.id === mapping.source)) ?? mapping.source,
               el('span', { class: 'subtext' }, mapping.remote_schema)))), el('span', { class: 'badge' }, '只读'))) : el('p', { class: 'small-note' }, '尚无外部 Schema 映射'),
           database.managed ? null : el('div', { class: 'actions form-section' }, button('编辑定义与映射', () => databaseForm(database), '', true), button('删除', () => deleteDatabase(database), 'danger', true))));
-    })) : empty(state.databases.length ? '没有匹配的虚拟数据库' : '尚未创建业务虚拟库'), listPager('databases', databases.length, renderDatabaseRows));
+    })) : empty(state.databases.length ? '没有匹配的数据库' : '尚未创建数据库'), listPager('databases', databases.length, renderDatabaseRows));
 }
 function databaseForm(database = null) {
   const config = database?.config ?? { name: '', owner: '', connect: [], allow_connections: true, schemas: [] };
@@ -548,7 +548,7 @@ function databaseForm(database = null) {
     row.append(button('移除', () => row.remove(), 'small')); rows.append(row);
   }
   config.schemas.forEach(add);
-  openDialog(database ? `编辑业务库 · ${config.name}` : '创建业务虚拟库', el('div', {},
+  openDialog(database ? `编辑数据库 · ${config.name}` : '创建数据库', el('div', {},
     el('div', { class: 'notice' }, '保存时完整替换定义。请保留仍需使用的映射；owner 和 CONNECT 账号必须已在服务配置中存在。'),
     el('div', { class: 'form-grid' }, field('数据库名', 'name', config.name, { required: true, readonly: database ? '' : null }),
       field('Owner 账号', 'owner', config.owner, { required: true, placeholder: '例如 fedengine' }),
@@ -567,14 +567,14 @@ function databaseForm(database = null) {
       }
       return write(database ? 'PUT' : 'POST', `virtual-databases${database ? `/${encodeURIComponent(config.name)}` : ''}`,
         database ? { target: { oid: database.oid, expected_revision: database.revision }, definition } : definition,
-        database ? '更新业务库' : '创建业务库');
-    }, '保存业务库');
+        database ? '更新数据库' : '创建数据库');
+    }, '保存数据库');
 }
 function deleteDatabase(database) {
-  openDialog(`删除业务库 · ${database.config.name}`, el('div', { class: 'notice warning' },
-    '删除后现有连接的后续查询将失败，需要重新选择业务库连接。此操作不删除来源数据。'),
+  openDialog(`删除数据库 · ${database.config.name}`, el('div', { class: 'notice warning' },
+    '删除后现有连接的后续查询将失败，需要重新选择数据库连接。此操作不删除来源数据。'),
     () => write('DELETE', `virtual-databases/${encodeURIComponent(database.config.name)}`,
-      { target: { oid: database.oid, expected_revision: database.revision } }, '删除业务库'), '确认删除业务库');
+      { target: { oid: database.oid, expected_revision: database.revision } }, '删除数据库'), '确认删除数据库');
 }
 let operationEpoch = 0;
 let operationTimer;

@@ -50,6 +50,9 @@ pub use profile::{FedEngineError, FedEngineProfile};
 /// Loading does not rebase paths against the configuration file's directory.
 /// Hosts should supply absolute filesystem paths and preserve deployed state paths
 /// and SecretRefs when changing application or package names.
+/// Organized PostgreSQL/MySQL sources expose one automatic database per native
+/// database. Registrations for the same native target contribute to that database;
+/// a connection discovering several native databases gives each a distinct name.
 pub use modorch_fedengine_core::Config as FedEngineConfig;
 
 /// Pure factory assembly for one FedEngine per Application (fixed component IDs).

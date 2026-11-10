@@ -260,7 +260,7 @@ try {
   console.log('Passed: catalog error, pagination, snapshot conflict and untrusted text rendering (synthetic HTTP facts)');
 
   await evaluate('document.querySelector("[data-page=databases]").click()');
-  await click('＋ 创建业务库'); await fill('[name=name]', 'web_account'); await fill('[name=owner]', 'fedengine');
+  await click('＋ 创建数据库'); await fill('[name=name]', 'web_account'); await fill('[name=owner]', 'fedengine');
   await click('＋ 添加映射'); await fill('.mapping-name', 'business'); await fill('.mapping-source', 'web_pg'); await fill('.mapping-remote', 'public');
   await submit(); await closed(); await waitText('web_account');
   await click('编辑定义与映射'); await click('＋ 添加映射');
@@ -373,12 +373,12 @@ try {
   assert.equal(await evaluate(`!document.querySelector('#database-navigation').hidden && getComputedStyle(document.querySelector('#toggle-database-tree')).display !== 'none' && document.querySelector('#toggle-database-tree').getAttribute('aria-expanded') === 'false'`),true,'mobile workspace tree can reopen');
   await cdp.send('Emulation.setDeviceMetricsOverride', {width:1440,height:1000,deviceScaleFactor:1,mobile:false});
   assert.equal(await evaluate(`getComputedStyle(document.querySelector('#database-navigation')).display !== 'none'`),true,'desktop workspace tree restored');
-  await click('← 业务虚拟库');
+  await click('← 数据库');
   const otherCurrent = await api('virtual-databases/web_other');
   assert.equal(otherDatabase.name,'web_other');
   await api('virtual-databases/web_other','DELETE',{target:{oid:otherCurrent.oid,expected_revision:otherCurrent.revision}}); await click('↻ 刷新状态');
   console.log('Passed: database entry, empty public schema, read-only SQL, precision/NULL, selection, errors, truncation/paging, cancel, editor persistence and narrow layouts');
-  await click('删除'); await click('确认删除业务库', 'document.querySelector("#dialog")'); await closed(); await waitText('尚未创建业务虚拟库');
+  await click('删除'); await click('确认删除数据库', 'document.querySelector("#dialog")'); await closed(); await waitText('尚未创建数据库');
   console.log('Passed: virtual database creation, full mapping preservation and deletion');
 
   await evaluate('document.querySelector("[data-page=sources]").click()'); await click('管理 →');
@@ -424,7 +424,7 @@ try {
     await waitText('mapped'); await waitText(catalog.objects[0].name); await click(catalog.objects[0].name);
     await waitText('只读外部对象'); await click('列'); await waitText(catalog.objects[0].columns[0].name);
     await click('来源约束'); await click('来源索引'); await click('定义'); await click('统计'); await click('来源与状态');
-    await waitText(catalog.snapshot_id); await click('查看来源对象'); await waitText('返回虚拟库对象'); await click('← 返回虚拟库对象');
+    await waitText(catalog.snapshot_id); await click('查看来源对象'); await waitText('返回数据库对象'); await click('← 返回数据库对象');
     await waitText('web_live_db.mapped.');
     await click('刷新来源元数据'); await fill('[aria-label="刷新来源"]','web_live'); await submit(); await closed();
     await until(async () => !(await api('sources/web_live')).current_operation, 'browser source refresh');
@@ -434,7 +434,7 @@ try {
       const screenshot = await cdp.send('Page.captureScreenshot', { format: 'png' });
       await writeFile(values.screenshot, Buffer.from(screenshot.data, 'base64'));
     }
-    await click('← 业务虚拟库'); await click('删除'); await click('确认删除业务库', 'document.querySelector("#dialog")'); await closed();
+    await click('← 数据库'); await click('删除'); await click('确认删除数据库', 'document.querySelector("#dialog")'); await closed();
     await evaluate('document.querySelector("[data-page=sources]").click()'); await click('管理 →');
     await click('停用'); await click('确认停用', 'document.querySelector("#dialog")'); await closed();
     await until(async () => (await api('sources/web_live')).status === 'Disabled', 'live source disabled');
@@ -460,7 +460,7 @@ try {
     await evaluate('document.querySelector("[data-page=databases]").click()'); await click('web_native');
     await waitText('public'); await click('SQL 调试');
     await fill('[aria-label="SQL 编辑器"]','SELECT current_database() AS native_database');await click('执行 SQL');await waitText('执行成功');await waitText('web_native');
-    await click('← 业务虚拟库');
+    await click('← 数据库');
     assert.equal(await evaluate('[...document.querySelectorAll("#content button")].some(b => b.textContent === "编辑定义与映射")'),false);
     const source=(await api('sources'))[0];
     await finished(await api(`sources/${source.id}/disable`,'POST',{target:{incarnation:source.incarnation,expected_revision:source.desired_revision}}));
@@ -491,11 +491,11 @@ try {
     await click('下一页',pager); await pageText('第 2 / 3 页');
     await click('↻ 刷新状态'); await sleep(300); await pageText('第 2 / 3 页');
     if (page==='sources') { await click('管理 →'); await click('← 返回数据源列表'); }
-    else { await click('paged_db_10','document.querySelector("#content")'); await click('← 业务虚拟库'); }
+    else { await click('paged_db_10','document.querySelector("#content")'); await click('← 数据库'); }
     await pageText('第 2 / 3 页');
     await goto(3); await pageText('第 3 / 3 页');
     assert.equal(await evaluate(`document.querySelectorAll('${items}').length`),1);
-    const search=page==='sources'?'搜索数据源':'搜索虚拟数据库';
+    const search=page==='sources'?'搜索数据源':'搜索数据库';
     await fill(`[aria-label="${search}"]`,page==='sources'?'paged_20':'paged_db_20'); await pageText('共 1 项 · 第 1 / 1 页');
     await evaluate(`document.querySelector('[aria-label="${search}"]').focus()`); await sleep(2800);
     assert.equal(await evaluate(`document.activeElement.getAttribute('aria-label')`),search);
@@ -505,7 +505,7 @@ try {
     assert.equal(await evaluate(`document.querySelectorAll('${items}').length`),20);
     await click('下一页',pager); await pageText('第 2 / 2 页');
     if (page==='databases') {
-      await click('删除'); await click('确认删除业务库','document.querySelector("#dialog")'); await closed();
+      await click('删除'); await click('确认删除数据库','document.querySelector("#dialog")'); await closed();
       await pageText('共 20 项 · 第 1 / 1 页');
     }
     await fill('[aria-label="每页条数"]','10');

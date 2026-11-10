@@ -1,11 +1,12 @@
 # FedEngine 业务库契约
 
-适用 `modorch-fedengine` 0.1.0 开发树；契约 revision **1.1.1**。Modorch-RS 固定 0.0.3 / `336ba20196044e1b81fb2ca297a18b5e258a5800`，框架契约 1.2.0。此目录定义当前可观察行为；公开签名以 [Facade Rustdoc 源码](../crates/modorch-fedengine/src/lib.rs)为准，不将设计草案视为已实现 API。
+适用 `modorch-fedengine` 0.1.0 开发树；契约 revision **1.1.2**。Modorch-RS 固定 0.0.3 / `336ba20196044e1b81fb2ca297a18b5e258a5800`，框架契约 1.2.0。此目录定义当前可观察行为；公开签名以 [Facade Rustdoc 源码](../crates/modorch-fedengine/src/lib.rs)为准，不将设计草案视为已实现 API。
 
 | 契约 | 范围 |
 |---|---|
 | [注册与观测](bundle.md) | 纯注册、显式选择、Profile、只读 Handle、宿主预算 |
 | [生命周期与资源](lifecycle.md) | 入口屏障、补偿、真实资源排空和失败/代际 |
+| [原生数据库组织](organization.md) | 按原生库拆分、同库贡献合并、Schema 与实例隔离 |
 | [查询与管理](execution.md) | PostgreSQL 协议子集、权限、单源写/DDL、管理发布和不重放 |
 | [进程内 Client](clients.md) | 宿主身份、管理授权、参数/结果预算、版本与未知写入 |
 | [配置与状态](configuration.md) | 路径、凭据、管理文件唯一占用及现有状态 |

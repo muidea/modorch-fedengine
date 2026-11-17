@@ -120,9 +120,14 @@ impl ExecutionPort for DuckdbRuntime {
                 return Err(framework_error(error));
             }
         };
+        let (prepare_job, ddl_job) = if prepare {
+            (Some(job), None)
+        } else {
+            (None, Some(job))
+        };
         if let Some(storage) = &self.storage
             && let Some(source) = ddl_source
-            && !prepare
+            && let Some(job) = ddl_job
         {
             let hub = self.hub.clone();
             let registry = self.registry.acquire().map_err(framework_error)?;
@@ -145,10 +150,15 @@ impl ExecutionPort for DuckdbRuntime {
             }).map_err(framework_error)?;
         }
         // Scheduler owns the worker independently of the waiting caller.
-        match meta_rx
+        let meta = meta_rx
             .await
-            .map_err(|_| EngineError::new("XX000", "worker exited without metadata"))??
-        {
+            .map_err(|_| EngineError::new("XX000", "worker exited without metadata"));
+        if let Some(job) = prepare_job {
+            // Prepare workers have already finished; wait for the blocking wrapper to drop
+            // its instance/source leases and slot permit before returning to the caller.
+            let _ = job.wait_finished().await;
+        }
+        match meta?? {
             Metadata {
                 columns,
                 parameters,

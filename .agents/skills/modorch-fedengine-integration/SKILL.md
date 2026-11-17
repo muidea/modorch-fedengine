@@ -3,7 +3,7 @@ name: modorch-fedengine-integration
 description: "在 Modorch 0.0.3 宿主中接入 modorch-fedengine Facade，处理 Bundle/Profile、宿主预算、路径和检查式退出时使用；含受控 Query/Management Client，不用于修改框架 Runtime 或使用未开放的 EmbeddedCore。"
 metadata:
   compatibility: "Rust/Cargo 1.94、Python 3.11+；modorch-fedengine 0.1.0 开发源码与 Modorch 0.0.3 的匹配指纹"
-  version: "1.1.4"
+  version: "1.1.5"
   framework-version: "0.0.3"
   library-contracts-revision: "1.1.2"
 ---

@@ -5,7 +5,7 @@
 | 接口 | 已实现行为 |
 |---|---|
 | `FedEngineConfig` | 当前 Config 别名，load/validate；路径仍按进程 CWD |
-| `FedEngineBundle` | new、profile、register；纯 Factory 注册，返回 FedEngineRegisteredComponents |
+| `FedEngineBundle` | new、profile、with_management_router_slot、register；纯 Factory 注册，返回 FedEngineRegisteredComponents |
 | `FedEngineProfile` | PgServer { management_api }、ManagedServer { pgwire }；EmbeddedCore 为明确拒绝的保留变体 |
 | 注册结果 | components、initiator_ids、module_ids、profile、resource_requirements、handle、observe |
 | `FedEngineResourceDemand` | blocking_io_threads、blocking_io_capacity、max_tasks_per_owner，建议值不自动配置宿主 |

@@ -30,6 +30,7 @@ modorch-fedengine-policy.workspace = true
 modorch-fedengine-query.workspace = true
 modorch-fedengine-pgwire.workspace = true
 modorch-fedengine-management.workspace = true
+axum.workspace = true
 modorch.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

@@ -44,6 +44,7 @@ mod profile;
 mod witness;
 pub use client::*;
 pub use handle::{FedEngineHandle, FedEngineMetrics, FedEngineObservation, FedEngineStatus};
+pub use modorch_fedengine_management::ManagementRouterSlot;
 pub use profile::{FedEngineError, FedEngineProfile};
 
 /// Existing FedEngine configuration; loading and path resolution belong to the host.
@@ -63,6 +64,7 @@ pub use modorch_fedengine_core::Config as FedEngineConfig;
 pub struct FedEngineBundle {
     config: FedEngineConfig,
     profile: FedEngineProfile,
+    management_router_slot: Option<ManagementRouterSlot>,
 }
 
 impl FedEngineBundle {
@@ -71,13 +73,25 @@ impl FedEngineBundle {
         let profile = FedEngineProfile::PgServer {
             management_api: config.management.enabled,
         };
-        Self { config, profile }
+        Self {
+            config,
+            profile,
+            management_router_slot: None,
+        }
     }
 
     /// Select network entry points independently of the internal management mode.
     /// Unsupported profiles are rejected by register before any builder mutation.
     pub fn profile(mut self, profile: FedEngineProfile) -> Self {
         self.profile = profile;
+        self
+    }
+
+    /// Export the FedEngine management Axum [`axum::Router`] into `slot` instead of
+    /// binding its own HTTP listener, allowing a host gateway to combine multiple
+    /// management UIs on one port.
+    pub fn with_management_router_slot(mut self, slot: ManagementRouterSlot) -> Self {
+        self.management_router_slot = Some(slot);
         self
     }
 
@@ -168,13 +182,23 @@ impl FedEngineBundle {
             },
         )?;
         if http {
-            registered.initiator(
-                builder,
-                modorch_fedengine_management::ManagementApiFactory {
-                    config: config.clone(),
-                    status: Arc::clone(&http_status),
-                },
-            )?;
+            if let Some(slot) = self.management_router_slot {
+                registered.initiator(
+                    builder,
+                    modorch_fedengine_management::EmbeddedManagementApiFactory {
+                        config: config.clone(),
+                        slot,
+                    },
+                )?;
+            } else {
+                registered.initiator(
+                    builder,
+                    modorch_fedengine_management::ManagementApiFactory {
+                        config: config.clone(),
+                        status: Arc::clone(&http_status),
+                    },
+                )?;
+            }
         }
         let handle = FedEngineHandle::new(
             registered.components.clone(),

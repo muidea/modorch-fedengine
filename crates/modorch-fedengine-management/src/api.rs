@@ -18,6 +18,9 @@ use std::{
 use tokio::net::TcpSocket;
 use tokio_util::sync::CancellationToken;
 
+/// Shared slot populated with FedEngine's Axum sub-router when hosted inside a unified gateway.
+pub type ManagementRouterSlot = Arc<Mutex<Option<Router>>>;
+
 #[derive(Default)]
 pub struct ManagementListenerStatus {
     address: Mutex<Option<SocketAddr>>,
@@ -32,11 +35,22 @@ pub struct ManagementApiFactory {
     pub config: Arc<Config>,
     pub status: Arc<ManagementListenerStatus>,
 }
+/// Embedded variant of [`ManagementApiFactory`] that exports its Axum [`Router`] into `slot`
+/// instead of binding a dedicated TCP listener.
+pub struct EmbeddedManagementApiFactory {
+    pub config: Arc<Config>,
+    pub slot: ManagementRouterSlot,
+}
 struct ApiInitiator {
     config: Arc<Config>,
     status: Arc<ManagementListenerStatus>,
     socket: Option<TcpSocket>,
     stop: CancellationToken,
+    registry: Option<ServiceHandle<modorch_fedengine_datasource::DataSourceRegistry>>,
+}
+struct EmbeddedApiInitiator {
+    config: Arc<Config>,
+    slot: ManagementRouterSlot,
     registry: Option<ServiceHandle<modorch_fedengine_datasource::DataSourceRegistry>>,
 }
 fn descriptor() -> ComponentDescriptor {
@@ -57,6 +71,18 @@ impl InitiatorFactory for ManagementApiFactory {
             status: self.status.clone(),
             socket: None,
             stop: CancellationToken::new(),
+            registry: None,
+        }))
+    }
+}
+impl InitiatorFactory for EmbeddedManagementApiFactory {
+    fn descriptor(&self) -> ComponentDescriptor {
+        descriptor()
+    }
+    fn create(&self, _: &ComponentConfig) -> FrameworkResult<Box<dyn Initiator>> {
+        Ok(Box::new(EmbeddedApiInitiator {
+            config: self.config.clone(),
+            slot: self.slot.clone(),
             registry: None,
         }))
     }
@@ -107,6 +133,69 @@ struct ApiState {
     timeout: Duration,
     browser: crate::browser::Browser,
 }
+fn build_router(state: ApiState, include_root_shell: bool) -> Router {
+    let mut router = Router::new()
+        .route("/manage/app.js", get(crate::web::javascript))
+        .route(
+            "/manage/organization.js",
+            get(crate::web::organization_javascript),
+        )
+        .route("/manage/browser.js", get(crate::web::browser_javascript))
+        .route(
+            "/manage/navigator.js",
+            get(crate::web::navigator_javascript),
+        )
+        .route("/manage/browser.css", get(crate::web::browser_stylesheet))
+        .route("/api/v1/{*path}", any(dispatch))
+        .layer(DefaultBodyLimit::max(65_536))
+        .with_state(state);
+    if include_root_shell {
+        router = router
+            .route("/", get(crate::web::index))
+            .route("/manage", get(crate::web::index))
+            .route("/manage/", get(crate::web::index))
+            .route("/manage/style.css", get(crate::web::stylesheet));
+    }
+    router
+}
+#[async_trait]
+impl Lifecycle for EmbeddedApiInitiator {
+    async fn setup(&mut self, ctx: &SetupContext) -> FrameworkResult<()> {
+        self.registry = Some(
+            ctx.services
+                .get(&ComponentRef::initiator("datasource-registry"), "registry")?,
+        );
+        Ok(())
+    }
+    async fn begin_shutdown(&mut self, _: &ShutdownContext) -> FrameworkResult<()> {
+        *self.slot.lock().unwrap() = None;
+        Ok(())
+    }
+    async fn teardown(&mut self, _: &ShutdownContext) -> FrameworkResult<()> {
+        *self.slot.lock().unwrap() = None;
+        Ok(())
+    }
+}
+#[async_trait]
+impl Initiator for EmbeddedApiInitiator {
+    fn descriptor(&self) -> ComponentDescriptor {
+        descriptor()
+    }
+    async fn activate_ingress(&mut self, ctx: &RuntimeContext) -> FrameworkResult<()> {
+        let state = ApiState {
+            browser: crate::browser::Browser::new(
+                self.config.clone(),
+                ctx.event_hub.external(),
+                self.registry.clone().unwrap(),
+                ctx.tasks.clone(),
+            ),
+            hub: ctx.event_hub.external(),
+            timeout: Duration::from_millis(self.config.management.request_timeout_ms),
+        };
+        *self.slot.lock().unwrap() = Some(build_router(state, false));
+        Ok(())
+    }
+}
 #[async_trait]
 impl Initiator for ApiInitiator {
     fn descriptor(&self) -> ComponentDescriptor {
@@ -126,25 +215,7 @@ impl Initiator for ApiInitiator {
             hub: ctx.event_hub.external(),
             timeout: Duration::from_millis(self.config.management.request_timeout_ms),
         };
-        let router = Router::new()
-            .route("/", get(crate::web::index))
-            .route("/manage", get(crate::web::index))
-            .route("/manage/", get(crate::web::index))
-            .route("/manage/app.js", get(crate::web::javascript))
-            .route(
-                "/manage/organization.js",
-                get(crate::web::organization_javascript),
-            )
-            .route("/manage/browser.js", get(crate::web::browser_javascript))
-            .route(
-                "/manage/navigator.js",
-                get(crate::web::navigator_javascript),
-            )
-            .route("/manage/browser.css", get(crate::web::browser_stylesheet))
-            .route("/manage/style.css", get(crate::web::stylesheet))
-            .route("/api/v1/{*path}", any(dispatch))
-            .layer(DefaultBodyLimit::max(65_536))
-            .with_state(state);
+        let router = build_router(state, true);
         let stop = self.stop.clone();
         ctx.tasks.spawn(move |shutdown| async move {
             axum::serve(listener, router)

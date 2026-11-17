@@ -20,8 +20,9 @@ function readSession(key, fallback) {
 function saveSession(key, value) {
   try { sessionStorage.setItem(key, JSON.stringify(value)); } catch { /* In-memory retry remains available. */ }
 }
+const fedPages = new Set(['sources', 'databases', 'operations', 'browser']);
 const state = {
-  sources: [], databases: [], operations: new Map(), page: 'sources', selected: null,
+  sources: [], databases: [], operations: new Map(), page: window.__MDH_INITIAL_PAGE ?? 'sources', selected: null,
   operationIds: readSession('fedengine.operations', []).slice(0, 40),
   pending: readSession('fedengine.pending', null), writing: false, loading: false,
   initialized: false, sourceSignature: '', databaseSignature: '',
@@ -104,11 +105,14 @@ function toast(message, error = false) {
   clearTimeout(toast.timer); toast.timer = setTimeout(() => { node.hidden = true; }, 6500);
 }
 async function request(path, options = {}) {
+  const extraHeaders = typeof window.__MDH_AUTH_HEADERS === 'function' ? window.__MDH_AUTH_HEADERS() : null;
+  const mergedHeaders = extraHeaders ? { ...extraHeaders, ...(options.headers ?? {}) } : options.headers;
   let response;
   try {
     response = await fetch(`${apiBase}/${path}`, {
       cache: 'no-store', mode: 'same-origin', credentials: 'same-origin',
       signal: AbortSignal.timeout(15000), ...options,
+      ...(mergedHeaders ? { headers: mergedHeaders } : {}),
     });
   } catch {
     throw Object.assign(new Error('网络中断或请求超时，操作结果尚未确认。'), { uncertain: true });
@@ -212,8 +216,9 @@ async function reload() {
     const databasesChanged = state.databaseSignature !== databaseSignature;
     if (databasesChanged || !state.initialized) navigator.update(databases);
     state.sourceSignature = sourceSignature; state.databaseSignature = databaseSignature;
-    renderStats();
-    if (!state.initialized) { state.initialized = true; renderPage(); }
+    $('#source-count').textContent = state.sources.length;
+    if (fedPages.has(state.page)) renderStats();
+    if (!state.initialized) { state.initialized = true; if (fedPages.has(state.page)) renderPage(); }
     else if (state.page === 'sources') {
       if (state.selected && (sourcesChanged || sources.some(source => source.id === state.selected && source.current_operation))) renderSourceOverview();
       else if (!state.selected && sourcesChanged) renderSourceRows();
@@ -221,7 +226,7 @@ async function reload() {
     if (state.page === 'operations') await loadOperations();
   } catch (error) {
     $('#connection').textContent = '● 管理服务暂不可用'; $('#connection').className = 'offline';
-    if (!state.initialized) replace($('#content'), empty('无法连接管理服务', '请检查服务状态，然后点击刷新重试。'));
+    if (!state.initialized && fedPages.has(state.page)) replace($('#content'), empty('无法连接管理服务', '请检查服务状态，然后点击刷新重试。'));
     throw error;
   } finally { state.loading = false; }
 }
@@ -267,9 +272,21 @@ function browserRefresh(ids) {
 }
 function navigate(page, selected = null, workspaceTab) {
   if (state.page === 'browser') browser.leave();
-  state.page = page; state.selected = selected; renderPage(workspaceTab);
+  state.page = page; state.selected = selected;
+  if (!fedPages.has(page)) {
+    const layout = document.querySelector('.workspace-body');
+    layout.classList.remove('database-workspace', 'directory-open');
+    $('#database-navigation').hidden = true;
+    $('#toggle-database-tree').hidden = true;
+    $('#toggle-database-tree').setAttribute('aria-expanded', 'false');
+    window.__MDH_ON_EXTERNAL_PAGE?.(page);
+    return;
+  }
+  window.__MDH_ON_EXTERNAL_PAGE?.(null);
+  renderPage(workspaceTab);
 }
 function renderPage(workspaceTab) {
+  if (!fedPages.has(state.page)) return;
   const workspace = state.page === 'browser';
   const layout = document.querySelector('.workspace-body');
   layout.classList.toggle('database-workspace', workspace);
@@ -624,7 +641,8 @@ $('#editor').addEventListener('submit', async event => {
     $('#dialog-error').textContent = error.message; $('#dialog-error').hidden = false;
   }
 });
-renderPage();
+window.__MDH_FEDENGINE = { navigate, reload };
+if (fedPages.has(state.page)) renderPage();
 guard(reload)();
 setInterval(() => { if (!document.hidden) reload().catch(() => {}); }, 2500);
 document.addEventListener('visibilitychange', () => { if (!document.hidden) reload().catch(() => {}); });

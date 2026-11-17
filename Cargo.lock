@@ -1308,6 +1308,7 @@ dependencies = [
 name = "modorch-fedengine"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "modorch",
  "modorch-fedengine-catalog",
  "modorch-fedengine-contract",

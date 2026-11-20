@@ -39,6 +39,7 @@ impl Lifecycle for SourceManager {
     async fn setup(&mut self, ctx: &SetupContext) -> FrameworkResult<()> {
         self.coordinator = Some(Coordinator {
             discovery: Default::default(),
+            demand_repair: Default::default(),
             config: self.config.clone(),
             tasks: ctx.tasks.clone(),
             storage: ctx
@@ -424,6 +425,15 @@ impl ManagerHandler {
                 .ok_or_else(|| EngineError::new("42704", "operation does not exist")),
             ManagementRequest::Catalog { .. } => unreachable!(),
             ManagementRequest::DdlInvalidated(id) => {
+                let _ = self.coordinator.demand_repair.enqueue(
+                    crate::demand_repair::RepairTarget {
+                        source: id.clone(),
+                        schema: "*".into(),
+                        table: "*".into(),
+                    },
+                    true,
+                    None,
+                );
                 let source = state.source(id)?;
                 let incarnation = source.incarnation.clone();
                 storage

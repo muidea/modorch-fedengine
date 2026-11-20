@@ -109,9 +109,12 @@ pub(super) fn initialize_local(config: &Config) -> FrameworkResult<Connection> {
     }
     std::fs::create_dir_all(&d.temp_directory)
         .map_err(|_| fw(EngineError::config("cannot create temp directory")))?;
+    crate::memory::cleanup_stale_spools(&d.temp_directory);
     let mut options = duckdb::Config::default();
+    // Dev-phase allowance for self-compiled custom *_scanner extensions;
+    // extensions remain gated by autoload=false, autoinstall=false and manifest SHA-256.
     options = options
-        .with("allow_unsigned_extensions", "false")
+        .with("allow_unsigned_extensions", "true")
         .map_err(engine_error)
         .map_err(fw)?;
     options = options
@@ -158,4 +161,100 @@ pub(super) fn initialize_local(config: &Config) -> FrameworkResult<Connection> {
         .map_err(engine_error)
         .map_err(fw)?;
     Ok(conn)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn initialize_local_loads_verified_custom_extensions() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/extensions");
+        if !dir.join("manifest.json").is_file() {
+            return;
+        }
+        let temp =
+            std::env::temp_dir().join(format!("fedengine-ext-load-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp).unwrap();
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(temp.clone());
+
+        let mut config = Config::load(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/application.toml"),
+        )
+        .unwrap();
+        config.duckdb.database_path = ":memory:".into();
+        config.duckdb.temp_directory = temp.to_string_lossy().into();
+        config.duckdb.extension_directory =
+            Some(dir.canonicalize().unwrap().to_string_lossy().into());
+        config.duckdb.install_extensions = false;
+
+        let conn = initialize_local(&config).unwrap();
+        let ext_dir = config.duckdb.extension_directory.as_deref().unwrap();
+        for logical in ["postgres", "mysql", "oracle", "sqlserver", "odbc_catalog"] {
+            crate::extensions::verify_extension(ext_dir, logical).unwrap();
+        }
+        for logical in ["postgres", "mysql"] {
+            let kind = if logical == "postgres" {
+                DataSourceKind::Postgres
+            } else {
+                DataSourceKind::Mysql
+            };
+            crate::control::load_extension(&conn, &config, kind).unwrap();
+        }
+        let mut odbc_loaded = Vec::new();
+        for logical in ["oracle", "sqlserver", "odbc_catalog"] {
+            let module = crate::extensions::extension_module_name(logical);
+            match conn.execute_batch(&format!("LOAD {module}")) {
+                Ok(()) => odbc_loaded.push(logical),
+                Err(err) if err.to_string().contains("libodbc.so.2") => {}
+                Err(err) => panic!("unexpected load failure for {module}: {err}"),
+            }
+        }
+        let versioned: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM duckdb_functions() WHERE regexp_matches(function_name, '_v[0-9]+$')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(versioned, 0);
+        let mut expected = vec![
+            "pg_clear_cache",
+            "mysql_clear_cache",
+            "postgres_crud_metadata",
+            "postgres_guarded_ddl",
+            "mysql_crud_metadata",
+            "mysql_guarded_ddl",
+        ];
+        if odbc_loaded.contains(&"oracle") {
+            expected.extend(["oracle_crud_metadata", "oracle_relational_metadata"]);
+        }
+        if odbc_loaded.contains(&"sqlserver") {
+            expected.extend(["sqlserver_crud_metadata", "sqlserver_relational_metadata"]);
+        }
+        if odbc_loaded.contains(&"odbc_catalog") {
+            expected.extend([
+                "dameng_crud_metadata",
+                "db2_crud_metadata",
+                "odbc_relational_metadata",
+            ]);
+        }
+        for required in expected {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM duckdb_functions() WHERE function_name=?",
+                    [required],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(count >= 1, "missing de-versioned function {required}");
+        }
+    }
 }

@@ -54,6 +54,64 @@ pub(super) fn run(
     }
     let tx = output.sender;
     let metadata = output.metadata;
+    let types: Vec<PgType> = r
+        .parameter_types
+        .iter()
+        .map(|p| {
+            p.ok_or_else(|| {
+                EngineError::new(
+                    "42P18",
+                    "parameter type cannot be determined; add an explicit SQL cast",
+                )
+            })
+        })
+        .collect::<Result<_>>()?;
+    if let Some(plan) = &r.guarded_ddl
+        && crate::guarded_crud::is_native_scanner_catalog(conn, &plan.catalog, plan.kind)
+    {
+        if r.prepare_only {
+            let _ = metadata.take().unwrap().send(Ok(Metadata {
+                columns: vec![],
+                parameters: types,
+            }));
+            return Ok(());
+        }
+        return crate::guarded_ddl::execute(
+            conn,
+            r,
+            plan,
+            &types,
+            WorkerOutput {
+                sender: tx,
+                completion: output.completion,
+                metadata,
+            },
+            crate::guarded_ddl::DdlExecEnv {
+                config: c,
+                registry,
+                metrics,
+            },
+        );
+    }
+    if let Some(plan) = &r.guarded_mutation
+        && !r.prepare_only
+        && crate::guarded_crud::is_native_scanner_catalog(conn, &plan.catalog, plan.kind)
+    {
+        if types.len() != r.parameters.len() {
+            return Err(EngineError::new("08P01", "parameter count mismatch"));
+        }
+        return crate::guarded_crud::execute(
+            conn,
+            r,
+            plan,
+            &types,
+            WorkerOutput {
+                sender: tx,
+                completion: output.completion,
+                metadata,
+            },
+        );
+    }
     let overrides = r.metadata.as_ref().map(|m| m.columns.as_slice());
     let sql = modorch_fedengine_pg_compat::execution_sql(&r.sql)?;
     let mut stmt = conn.prepare(&sql).map_err(engine_error)?;
@@ -70,21 +128,11 @@ pub(super) fn run(
             "parameter types require explicit OIDs or SQL casts",
         ));
     }
-    let types: Vec<PgType> = r
-        .parameter_types
-        .iter()
-        .map(|p| {
-            p.ok_or_else(|| {
-                EngineError::new(
-                    "42P18",
-                    "parameter type cannot be determined; add an explicit SQL cast",
-                )
-            })
-        })
-        .collect::<Result<_>>()?;
     if r.prepare_only {
         let columns = if r.kind == StatementKind::Query {
             describe(conn, &sql, count, overrides)?
+        } else if let Some(ret) = &r.returning {
+            vec![ColumnMeta::new(ret.column.clone(), PgType::Int8)]
         } else {
             vec![]
         };
@@ -98,6 +146,21 @@ pub(super) fn run(
         return Err(EngineError::new("08P01", "parameter count mismatch"));
     }
     if r.kind != StatementKind::Query {
+        if let Some(ret) = &r.returning {
+            drop(stmt);
+            return crate::guarded_crud::execute_local_returning(
+                conn,
+                r,
+                ret,
+                &sql,
+                &types,
+                WorkerOutput {
+                    sender: tx,
+                    completion: output.completion,
+                    metadata,
+                },
+            );
+        }
         let _ = metadata.take().unwrap().send(Ok(Metadata {
             columns: vec![],
             parameters: types,
@@ -128,9 +191,9 @@ pub(super) fn run(
                 registry.invalidate(source, false)?;
                 let source = registry.get(source)?;
                 if conn
-                    .execute_batch(&format!(
-                        "CALL {}_clear_cache()",
-                        source.definition.kind.extension()
+                    .execute_batch(&crate::extensions::clear_cache_sql(
+                        source.definition.kind.extension(),
+                        &source.definition.catalog_alias,
                     ))
                     .is_err()
                 {
@@ -296,7 +359,7 @@ fn regclass_names(
     names.insert(0, "-".into());
     Ok(names)
 }
-fn send_chunk(
+pub(super) fn send_chunk(
     tx: &mpsc::Sender<ResultChunk>,
     mut chunk: ResultChunk,
     r: &ExecuteRequest,

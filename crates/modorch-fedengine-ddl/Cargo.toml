@@ -9,6 +9,7 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
+modorch-fedengine-contract.workspace = true
 modorch-fedengine-core.workspace = true
 sqlparser.workspace = true
 

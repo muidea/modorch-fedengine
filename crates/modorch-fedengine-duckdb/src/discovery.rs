@@ -20,20 +20,28 @@ pub(super) fn discover(
         if cancel.is_cancelled() {
             return Err(EngineError::new("57014", "database discovery canceled"));
         }
-        let dsn = credentials::target_dsn(
+        let target_db = database.unwrap_or("information_schema");
+        let org = SourceOrganization {
+            connection_id: connection.id.clone(),
+            instance: connection.instance.clone(),
+            database: target_db.to_string(),
+            virtual_database: "discovery".into(),
+            owner: "discovery".into(),
+            connect: vec![],
+        };
+        let plan = credentials::attach_plan(
             &connection.secret_ref,
             &config.management.credentials_directory,
             connection.kind,
-            &connection.instance,
-            database,
+            alias,
+            true,
+            "",
+            Some(&org),
         )?;
-        conn.execute_batch(&format!(
-            "ATTACH {} AS {} (TYPE {}, READ_ONLY)",
-            quote_literal(&dsn),
-            quote_identifier(alias),
-            connection.kind.extension()
-        ))
-        .map_err(engine_error)
+        if let Some(secret_sql) = &plan.secret_sql {
+            conn.execute_batch(secret_sql).map_err(engine_error)?;
+        }
+        conn.execute_batch(&plan.attach_sql).map_err(engine_error)
     };
     let query = |sql: &str| {
         format!(
@@ -45,19 +53,39 @@ pub(super) fn discover(
     };
     let databases = if let Some(database) = &connection.database {
         vec![(database.clone(), true)]
+    } else if connection.kind.is_odbc_catalog_family() || connection.kind == DataSourceKind::Oracle
+    {
+        return Err(EngineError::config(
+            "database name is required for Oracle/ODBC catalog discovery",
+        ));
     } else {
-        attach(if connection.kind == DataSourceKind::Postgres {
+        attach(if connection.kind.is_postgres_family() {
             Some(
                 connection
                     .bootstrap_database
                     .as_deref()
                     .unwrap_or("postgres"),
             )
+        } else if connection.kind == DataSourceKind::Sqlserver {
+            Some(connection.bootstrap_database.as_deref().unwrap_or("master"))
         } else {
             Some("information_schema")
         })?;
-        let sql = if connection.kind == DataSourceKind::Postgres {
+        let sql = if connection.kind.is_postgres_family() {
             "SELECT datname::text, (datallowconn AND NOT datistemplate AND has_database_privilege(current_user, oid, 'CONNECT')) AS connectable FROM pg_catalog.pg_database ORDER BY datname LIMIT 129"
+        } else if connection.kind == DataSourceKind::Sqlserver {
+            let modern: i64 = conn
+                .query_row(
+                    &query("SELECT CASE WHEN OBJECT_ID('sys.objects') IS NULL THEN 0 ELSE 1 END"),
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(engine_error)?;
+            if modern == 1 {
+                "SELECT TOP 129 name, CASE WHEN state = 0 THEN 1 ELSE 0 END AS connectable FROM sys.databases ORDER BY name"
+            } else {
+                "SELECT TOP 129 name, 1 AS connectable FROM master.dbo.sysdatabases ORDER BY name"
+            }
         } else {
             "SELECT SCHEMA_NAME, TRUE AS connectable FROM information_schema.SCHEMATA ORDER BY SCHEMA_NAME LIMIT 129"
         };
@@ -67,8 +95,10 @@ pub(super) fn discover(
         while let Some(row) = rows.next().map_err(engine_error)? {
             databases.push((
                 metadata_text(row, 0)?,
-                if connection.kind == DataSourceKind::Postgres {
+                if connection.kind.is_postgres_family() {
                     row.get::<_, bool>(1).map_err(engine_error)?
+                } else if connection.kind == DataSourceKind::Sqlserver {
+                    row.get::<_, i32>(1).map_err(engine_error)? == 1
                 } else {
                     true
                 },
@@ -111,12 +141,38 @@ pub(super) fn discover(
         } else {
             let inspection = (|| {
                 attach(Some(&database))?;
-                let sql = if connection.kind == DataSourceKind::Postgres {
-                    "SELECT nspname::text FROM pg_catalog.pg_namespace WHERE has_schema_privilege(current_user, oid, 'USAGE') ORDER BY nspname LIMIT 1025"
+                let sql = if connection.kind.is_postgres_family() {
+                    query(
+                        "SELECT nspname::text FROM pg_catalog.pg_namespace WHERE has_schema_privilege(current_user, oid, 'USAGE') ORDER BY nspname LIMIT 1025",
+                    )
+                } else if connection.kind == DataSourceKind::Sqlserver {
+                    let modern: i64 = conn
+                        .query_row(
+                            &query("SELECT CASE WHEN OBJECT_ID('sys.objects') IS NULL THEN 0 ELSE 1 END"),
+                            [],
+                            |r| r.get(0),
+                        )
+                        .map_err(engine_error)?;
+                    if modern == 1 {
+                        query("SELECT TOP 1025 name FROM sys.schemas ORDER BY name")
+                    } else {
+                        query(
+                            "SELECT DISTINCT TOP 1025 TABLE_SCHEMA FROM INFORMATION_SCHEMA.TABLES ORDER BY TABLE_SCHEMA",
+                        )
+                    }
+                } else if connection.kind == DataSourceKind::Oracle {
+                    query(
+                        "SELECT username FROM (SELECT username FROM all_users ORDER BY username) WHERE ROWNUM <= 1025",
+                    )
+                } else if connection.kind.is_odbc_catalog_family() {
+                    format!(
+                        "SELECT DISTINCT table_schema FROM odbc_catalog_metadata({}) ORDER BY table_schema LIMIT 1025",
+                        quote_literal(alias)
+                    )
                 } else {
-                    "SELECT DATABASE() AS schema_name"
+                    query("SELECT DATABASE() AS schema_name")
                 };
-                let mut stmt = conn.prepare(&query(sql)).map_err(engine_error)?;
+                let mut stmt = conn.prepare(&sql).map_err(engine_error)?;
                 let mut rows = stmt.query([]).map_err(engine_error)?;
                 let mut schemas = Vec::new();
                 while let Some(row) = rows.next().map_err(engine_error)? {

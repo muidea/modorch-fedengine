@@ -416,7 +416,7 @@ fn native_epochs(conn: &Connection, state: &ManagementState) -> Result<BTreeMap<
     let mut groups: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
     for source in state.sources.values().filter(|s| {
         !s.deleted
-            && s.kind == DataSourceKind::Mysql
+            && s.kind.is_mysql_family()
             && s.applied_revision.is_some()
             && s.catalog_snapshot.is_some()
     }) {

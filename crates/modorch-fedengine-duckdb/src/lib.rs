@@ -9,6 +9,8 @@ mod error;
 mod extensions;
 mod file_claim;
 mod functions;
+mod guarded_crud;
+mod guarded_ddl;
 mod identity;
 mod init;
 mod instance;

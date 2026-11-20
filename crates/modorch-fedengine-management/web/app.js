@@ -1,4 +1,4 @@
-import { createRegistration } from './organization.js';
+import { createRegistration, dialectMeta } from './organization.js';
 import { createBrowser } from './browser.js';
 import { createNavigator } from './navigator.js';
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -325,7 +325,8 @@ function sourceLabel(source) {
   return target ? `${target.connection_id} / ${target.database}` : source?.catalog_alias;
 }
 function sourceName(source) {
-  return el('div', { class: 'source-name' }, el('span', { class: `db-icon ${source.kind}` }, source.kind === 'postgres' ? 'PG' : 'MY'),
+  const meta = dialectMeta(source.kind);
+  return el('div', { class: 'source-name' }, el('span', { class: `db-icon ${source.kind}` }, meta.icon),
     el('div', {}, button(sourceLabel(source), () => navigate('sources', source.id), 'link name-text'), el('span', { class: 'subtext' }, source.id)));
 }
 function renderSources() {
@@ -343,7 +344,7 @@ function renderSourceRows() {
   const visible = pageItems('sources', sources);
   replace(container, sources.length ? table(['数据源 / ID', '类型', '状态', '纳管范围', '版本', '操作'], visible.map(source => {
     const bindings = source.desired.bindings.filter(binding => binding.enabled).map(binding => binding.remote_schema);
-    return el('tr', {}, el('td', {}, sourceName(source)), el('td', {}, source.kind === 'postgres' ? 'PostgreSQL' : 'MySQL'),
+    return el('tr', {}, el('td', {}, sourceName(source)), el('td', {}, dialectMeta(source.kind).label),
       el('td', {}, badge(source.status), source.current_operation ? el('span', { class: 'subtext' }, '有进行中操作') : null),
       el('td', {}, bindings.join(', ') || '未选择'),
       el('td', {}, `${source.applied_revision ?? '—'} / ${source.desired_revision}`, el('span', { class: 'subtext' }, '生效 / 期望')),

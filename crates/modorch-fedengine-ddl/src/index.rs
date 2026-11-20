@@ -4,8 +4,13 @@ use sqlparser::ast::{ObjectName, ObjectType, Statement};
 impl IndexIntent {
     /// Generate only the limited remote DDL template; never concatenate original client SQL.
     pub fn duckdb_adapter_sql(&self, kind: DataSourceKind) -> Result<String> {
+        if !kind.is_postgres_family() && !kind.is_mysql_family() {
+            return Err(EngineError::unsupported(
+                "index DDL is not enabled for this data source dialect",
+            ));
+        }
         let q = |s: &str| {
-            if kind == DataSourceKind::Mysql {
+            if kind.is_mysql_family() {
                 format!("`{}`", s.replace('`', "``"))
             } else {
                 quote_identifier(s)
@@ -13,7 +18,7 @@ impl IndexIntent {
         };
         let table = format!("{}.{}", q(&self.table.schema), q(&self.table.name));
         let remote = if self.create {
-            if self.if_exists && kind == DataSourceKind::Mysql {
+            if self.if_exists && kind.is_mysql_family() {
                 return Err(EngineError::unsupported(
                     "MySQL index IF NOT EXISTS is not verified",
                 ));
@@ -30,7 +35,7 @@ impl IndexIntent {
                     .collect::<Vec<_>>()
                     .join(", ")
             )
-        } else if kind == DataSourceKind::Mysql {
+        } else if kind.is_mysql_family() {
             format!("DROP INDEX {} ON {}", q(&self.name), table)
         } else {
             format!("DROP INDEX {}.{}", q(&self.table.schema), q(&self.name))
@@ -45,12 +50,17 @@ impl IndexIntent {
 }
 
 pub fn drop_index_name(sql: &str) -> Result<Option<ObjectName>> {
+    Ok(index_ownership_target(sql)?.map(|(name, _)| name))
+}
+
+pub fn index_ownership_target(sql: &str) -> Result<Option<(ObjectName, &'static str)>> {
     Ok(match Analyzer::parse(sql)?.first() {
         Some(Statement::Drop {
             object_type: ObjectType::Index,
             names,
             ..
-        }) if names.len() == 1 => Some(names[0].clone()),
+        }) if names.len() == 1 => Some((names[0].clone(), "DROP_INDEX")),
+        Some(Statement::AlterIndex { name, .. }) => Some((name.clone(), "ALTER_INDEX")),
         _ => None,
     })
 }

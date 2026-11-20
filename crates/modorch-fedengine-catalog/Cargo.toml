@@ -14,3 +14,4 @@ modorch-fedengine-datasource.workspace = true
 modorch.workspace = true
 modorch-fedengine-contract.workspace = true
 modorch-fedengine-ddl.workspace = true
+tokio.workspace = true

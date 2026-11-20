@@ -11,7 +11,7 @@ pub enum MysqlIdentityPolicy {
 }
 impl MysqlIdentityPolicy {
     pub fn resets(self, kind: DataSourceKind) -> bool {
-        self == Self::Strict && kind == DataSourceKind::Mysql
+        self == Self::Strict && kind.is_mysql_family()
     }
 }
 
@@ -351,11 +351,11 @@ pub fn validate_source(source: &DataSourceDefinition) -> Result<()> {
                 "internal execution alias must differ from the virtual database name",
             ));
         }
-        if source.kind == DataSourceKind::Mysql
+        if source.kind.is_mysql_family()
             && source.allowed_schemas.iter().any(|s| s != &target.database)
         {
             return Err(EngineError::config(
-                "MySQL schemas must match the native target database",
+                "MySQL-family schemas must match the native target database",
             ));
         }
     }

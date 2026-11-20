@@ -76,6 +76,7 @@ impl Analyzer {
         let mut binder = Binder::new(self);
         let mut primary = None;
         let mut index = None;
+        let mut returning = None;
         match &mut statement {
             Statement::CreateSchema {
                 schema_name,
@@ -265,7 +266,8 @@ impl Analyzer {
                         drop_behavior: None | Some(DropBehavior::Restrict),
                         ..
                     }
-                    | AlterTableOperation::RenameColumn { .. } => {}
+                    | AlterTableOperation::RenameColumn { .. }
+                    | AlterTableOperation::RenameTable { .. } => {}
                     AlterTableOperation::AlterColumn { op, .. } => match op {
                         AlterColumnOperation::SetNotNull
                         | AlterColumnOperation::DropNotNull
@@ -282,13 +284,77 @@ impl Analyzer {
                             ));
                         }
                     },
-                    // Renames and schema migrations need explicit destination binding, currently fail closed.
+                    AlterTableOperation::AddConstraint {
+                        constraint,
+                        not_valid: false,
+                    } => match constraint {
+                        TableConstraint::PrimaryKey(_)
+                        | TableConstraint::Unique(_)
+                        | TableConstraint::Check(_) => {}
+                        TableConstraint::ForeignKey(fk) => {
+                            let target = self.bind(&fk.foreign_table, false)?;
+                            if let Some(p) = &primary
+                                && p.source != target.source
+                            {
+                                return Err(EngineError::unsupported(
+                                    "cross-source foreign keys are disabled",
+                                ));
+                            }
+                            fk.foreign_table =
+                                object_name(&[&target.catalog, &target.schema, &target.name]);
+                            binder.objects.insert(target);
+                        }
+                        _ => {
+                            return Err(EngineError::unsupported(
+                                "ALTER TABLE ADD CONSTRAINT variant is not enabled",
+                            ));
+                        }
+                    },
+                    AlterTableOperation::DropConstraint {
+                        drop_behavior: None | Some(DropBehavior::Restrict),
+                        ..
+                    } => {}
+                    // Other renames and schema migrations fail closed.
                     _ => return Err(EngineError::unsupported("ALTER operation is not enabled")),
                 }
             }
+            Statement::AlterIndex {
+                name,
+                operation: AlterIndexOperation::RenameIndex { .. },
+            } => {
+                let object = self.bind(name, false)?;
+                let candidates: Vec<_> =
+                    self.indexes.iter().filter(|i| i.index == object).collect();
+                if candidates.len() != 1 {
+                    return Err(EngineError::new(
+                        "42704",
+                        "index table ownership is unknown or ambiguous",
+                    ));
+                }
+                let owner = candidates[0];
+                if owner.protected {
+                    return Err(EngineError::denied(
+                        "constraint/protected indexes cannot be altered",
+                    ));
+                }
+                binder.objects.insert(owner.table.clone());
+                primary = Some(owner.table.clone());
+                *name = object_name(&[&object.catalog, &object.schema, &object.name]);
+                binder.objects.insert(object);
+            }
+            Statement::Truncate(tr) => {
+                if tr.table_names.len() != 1
+                    || tr.partitions.is_some()
+                    || tr.on_cluster.is_some()
+                    || matches!(tr.cascade, Some(CascadeOption::Cascade))
+                {
+                    return Err(EngineError::unsupported("TRUNCATE variant is not enabled"));
+                }
+                let target = self.bind(&tr.table_names[0].name, false)?;
+                primary = Some(target);
+            }
             Statement::Insert(i) => {
-                if i.returning.is_some()
-                    || i.overwrite
+                if i.overwrite
                     || i.replace_into
                     || i.or.is_some()
                     || i.ignore
@@ -302,6 +368,24 @@ impl Analyzer {
                 {
                     return Err(EngineError::unsupported("INSERT variant is not enabled"));
                 }
+                if let Some(items) = &i.returning {
+                    if items.len() != 1 {
+                        return Err(EngineError::unsupported(
+                            "INSERT RETURNING only supports a single identifier column",
+                        ));
+                    }
+                    let SelectItem::UnnamedExpr(Expr::Identifier(col)) = &items[0] else {
+                        return Err(EngineError::unsupported(
+                            "INSERT RETURNING only supports a single identifier column",
+                        ));
+                    };
+                    returning = Some(modorch_fedengine_contract::ReturningPlan {
+                        column: col.value.clone(),
+                    });
+                }
+                if let TableObject::TableName(name) = &i.table {
+                    primary = Some(self.bind(name, false)?);
+                }
             }
             Statement::Update(u) => {
                 if u.returning.is_some()
@@ -311,10 +395,21 @@ impl Analyzer {
                 {
                     return Err(EngineError::unsupported("UPDATE variant is not enabled"));
                 }
+                if let TableFactor::Table { name, .. } = &u.table.relation {
+                    primary = Some(self.bind(name, false)?);
+                }
             }
             Statement::Delete(d) => {
                 if d.returning.is_some() || !d.tables.is_empty() || d.output.is_some() {
                     return Err(EngineError::unsupported("DELETE variant is not enabled"));
+                }
+                let from = match &d.from {
+                    FromTable::WithFromKeyword(v) | FromTable::WithoutKeyword(v) => v,
+                };
+                if from.len() == 1
+                    && let TableFactor::Table { name, .. } = &from[0].relation
+                {
+                    primary = Some(self.bind(name, false)?);
                 }
             }
             _ => {}
@@ -333,6 +428,9 @@ impl Analyzer {
                 AlterTableOperation::AddColumn { .. } => "ALTER_TABLE_ADD_COLUMN",
                 AlterTableOperation::DropColumn { .. } => "ALTER_TABLE_DROP_COLUMN",
                 AlterTableOperation::RenameColumn { .. } => "ALTER_TABLE_RENAME_COLUMN",
+                AlterTableOperation::RenameTable { .. } => "ALTER_TABLE_RENAME_TABLE",
+                AlterTableOperation::AddConstraint { .. } => "ALTER_TABLE_ADD_CONSTRAINT",
+                AlterTableOperation::DropConstraint { .. } => "ALTER_TABLE_DROP_CONSTRAINT",
                 AlterTableOperation::AlterColumn { op, .. } => match op {
                     AlterColumnOperation::SetDataType { .. } => "ALTER_TABLE_COLUMN_TYPE",
                     AlterColumnOperation::SetDefault { .. } | AlterColumnOperation::DropDefault => {
@@ -342,11 +440,17 @@ impl Analyzer {
                 },
                 _ => unreachable!(),
             },
+            Statement::AlterIndex { .. } => "RENAME_INDEX",
             Statement::CreateIndex(i) if i.unique => "CREATE_INDEX_UNIQUE_BTREE",
             Statement::CreateIndex(_) => "CREATE_INDEX_BTREE",
             _ => action.as_str(),
         }
         .to_string();
+        let ddl_intent = if kind == Kind::Ddl {
+            crate::ddl_intent::extract_ddl_intent(&statement, primary.as_ref(), index.as_ref())?
+        } else {
+            None
+        };
         Ok(Analysis {
             capability,
             sql: statement.to_string(),
@@ -357,6 +461,8 @@ impl Analyzer {
             sources,
             primary,
             index,
+            returning,
+            ddl_intent,
         })
     }
 }
@@ -377,7 +483,9 @@ pub(super) fn classify(s: &Statement) -> Result<(Kind, String, String)> {
         ),
         Statement::CreateSchema { .. } => (Kind::Ddl, "CREATE_SCHEMA", "CREATE SCHEMA"),
         Statement::CreateIndex(_) => (Kind::Ddl, "CREATE_INDEX", "CREATE INDEX"),
+        Statement::AlterIndex { .. } => (Kind::Ddl, "ALTER_INDEX", "ALTER INDEX"),
         Statement::AlterTable(_) => (Kind::Ddl, "ALTER_TABLE", "ALTER TABLE"),
+        Statement::Truncate(_) => (Kind::Ddl, "TRUNCATE", "TRUNCATE TABLE"),
         Statement::Drop { object_type, .. } => match object_type {
             ObjectType::Schema => (Kind::Ddl, "DROP_SCHEMA", "DROP SCHEMA"),
             ObjectType::Table => (Kind::Ddl, "DROP_TABLE", "DROP TABLE"),

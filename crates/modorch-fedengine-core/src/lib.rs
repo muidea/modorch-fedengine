@@ -46,14 +46,63 @@ pub struct DataSourceId(pub String);
 #[serde(rename_all = "lowercase")]
 pub enum DataSourceKind {
     Postgres,
+    Greenplum,
+    Kingbasees,
     Mysql,
+    Mariadb,
+    Starrocks,
+    Oracle,
+    Sqlserver,
+    Dameng,
+    Db2,
+    Hana,
 }
 impl DataSourceKind {
-    pub fn extension(self) -> &'static str {
+    pub fn dialect_name(self) -> &'static str {
         match self {
             Self::Postgres => "postgres",
+            Self::Greenplum => "greenplum",
+            Self::Kingbasees => "kingbasees",
             Self::Mysql => "mysql",
+            Self::Mariadb => "mariadb",
+            Self::Starrocks => "starrocks",
+            Self::Oracle => "oracle",
+            Self::Sqlserver => "sqlserver",
+            Self::Dameng => "dameng",
+            Self::Db2 => "db2",
+            Self::Hana => "hana",
         }
+    }
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::Postgres | Self::Greenplum | Self::Kingbasees => "postgres",
+            Self::Mysql | Self::Mariadb | Self::Starrocks => "mysql",
+            Self::Oracle => "oracle",
+            Self::Sqlserver => "sqlserver",
+            Self::Dameng | Self::Db2 | Self::Hana => "odbc_catalog",
+        }
+    }
+    pub fn attach_type(self) -> &'static str {
+        match self.extension() {
+            "oracle" => "oracle_scanner",
+            "sqlserver" => "sqlserver_scanner",
+            other => other,
+        }
+    }
+    pub fn is_postgres_family(self) -> bool {
+        matches!(self, Self::Postgres | Self::Greenplum | Self::Kingbasees)
+    }
+    pub fn is_mysql_family(self) -> bool {
+        matches!(self, Self::Mysql | Self::Mariadb | Self::Starrocks)
+    }
+    pub fn is_odbc_catalog_family(self) -> bool {
+        matches!(self, Self::Dameng | Self::Db2 | Self::Hana)
+    }
+    pub fn is_read_only_scanner(self) -> bool {
+        matches!(
+            self,
+            Self::Oracle | Self::Sqlserver | Self::Dameng | Self::Db2 | Self::Hana
+        )
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]

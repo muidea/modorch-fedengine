@@ -1063,6 +1063,7 @@ pub(super) fn initialize(conn: &Connection, config: &Config) -> Result<()> {
             conn.execute_batch(&format!("CREATE TABLE IF NOT EXISTS _fedengine.{table}(key VARCHAR PRIMARY KEY, payload VARCHAR NOT NULL)")).map_err(engine_error)?;
         }
         conn.execute_batch("CREATE TABLE IF NOT EXISTS _fedengine.catalog_objects(key VARCHAR PRIMARY KEY,snapshot_id VARCHAR NOT NULL,schema_name VARCHAR NOT NULL,object_name VARCHAR NOT NULL,object_type VARCHAR NOT NULL,native_id VARCHAR,fact_digest VARCHAR NOT NULL,payload BLOB NOT NULL)").map_err(engine_error)?;
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS _fedengine.ddl_operations(operation_id VARCHAR PRIMARY KEY,source_id VARCHAR NOT NULL,action VARCHAR NOT NULL,target VARCHAR NOT NULL,status VARCHAR NOT NULL,sqlstate VARCHAR NOT NULL,stage VARCHAR NOT NULL,warning_count BIGINT NOT NULL,source_error VARCHAR,created_at VARCHAR NOT NULL,updated_at VARCHAR NOT NULL)").map_err(engine_error)?;
         crate::identity::initialize(conn)?;
         crate::projection::initialize(conn)?;
         crate::projection::initialize_roles(conn, &config.users)?;

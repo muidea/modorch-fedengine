@@ -1,5 +1,5 @@
 //! Versioned control messages and protocol independent streaming contracts.
-use modorch_fedengine_core::{DataSourceId, EngineError, Result, SourceVersion};
+use modorch_fedengine_core::{DataSourceId, DataSourceKind, EngineError, Result, SourceVersion};
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
@@ -40,6 +40,8 @@ pub enum PgType {
     Time,
     Timestamp,
     Timestamptz,
+    Interval,
+    Point,
     Uuid,
     Json,
 }
@@ -52,7 +54,19 @@ impl PgType {
             Self::Catalog(1007) => "INTEGER[]",
             Self::Catalog(1016) => "BIGINT[]",
             Self::Catalog(1000) => "BOOLEAN[]",
+            Self::Catalog(1001) => "BLOB[]",
             Self::Catalog(1002 | 1003 | 1009 | 1014 | 1015 | 1034) => "VARCHAR[]",
+            Self::Catalog(1017) => "STRUCT(x DOUBLE, y DOUBLE)[]",
+            Self::Catalog(1021) => "FLOAT[]",
+            Self::Catalog(1022) => "DOUBLE[]",
+            Self::Catalog(1115) => "TIMESTAMP[]",
+            Self::Catalog(1182) => "DATE[]",
+            Self::Catalog(1183) => "TIME[]",
+            Self::Catalog(1185) => "TIMESTAMPTZ[]",
+            Self::Catalog(1187) => "INTERVAL[]",
+            Self::Catalog(1231) => "DECIMAL(38,10)[]",
+            Self::Catalog(2951) => "UUID[]",
+            Self::Catalog(199) => "JSON[]",
             Self::Catalog(_) => "VARCHAR",
             Self::Bool => "BOOLEAN",
             Self::Int2 => "SMALLINT",
@@ -67,6 +81,8 @@ impl PgType {
             Self::Time => "TIME",
             Self::Timestamp => "TIMESTAMP",
             Self::Timestamptz => "TIMESTAMPTZ",
+            Self::Interval => "INTERVAL",
+            Self::Point => "STRUCT(x DOUBLE, y DOUBLE)",
             Self::Uuid => "UUID",
             Self::Json => "JSON",
         }
@@ -87,16 +103,17 @@ impl PgType {
             Self::Time => 1083,
             Self::Timestamp => 1114,
             Self::Timestamptz => 1184,
+            Self::Interval => 1186,
+            Self::Point => 600,
             Self::Uuid => 2950,
             Self::Json => 114,
         }
     }
     pub fn from_oid(oid: u32) -> Option<Self> {
         Some(match oid {
-            18 | 19 | 22 | 24 | 26 | 28 | 29 | 30 | 194 | 1000 | 1002 | 1003 | 1005 | 1007
-            | 1009 | 1014 | 1015 | 1016 | 1021 | 1022 | 1028 | 1034 | 2205 | 2206 | 2277 => {
-                Self::Catalog(oid)
-            }
+            18 | 19 | 22 | 24 | 26 | 28 | 29 | 30 | 194 | 199 | 1000 | 1001 | 1002 | 1003
+            | 1005 | 1007 | 1009 | 1014 | 1015 | 1016 | 1017 | 1021 | 1022 | 1028 | 1034 | 1115
+            | 1182 | 1183 | 1185 | 1187 | 1231 | 2205 | 2206 | 2277 | 2951 => Self::Catalog(oid),
             16 => Self::Bool,
             21 => Self::Int2,
             23 => Self::Int4,
@@ -110,6 +127,8 @@ impl PgType {
             1083 => Self::Time,
             1114 => Self::Timestamp,
             1184 => Self::Timestamptz,
+            1186 => Self::Interval,
+            600 => Self::Point,
             2950 => Self::Uuid,
             114 => Self::Json,
             _ => return None,
@@ -141,6 +160,15 @@ pub enum Cell {
     Date(i32),
     Time(i64),
     Timestamp(i64),
+    Interval {
+        months: i32,
+        days: i32,
+        micros: i64,
+    },
+    Point {
+        x: f64,
+        y: f64,
+    },
     Uuid([u8; 16]),
 }
 #[derive(Debug, Clone)]
@@ -274,6 +302,62 @@ impl Drop for ExecutionStream {
 pub struct ExecutionService {
     pub port: Arc<dyn ExecutionPort>,
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReturningPlan {
+    pub column: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuardedMutationPlan {
+    pub source: DataSourceId,
+    pub kind: DataSourceKind,
+    pub catalog: String,
+    pub schema: String,
+    pub table: String,
+    pub native_sql: String,
+    pub returning: Option<ReturningPlan>,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DdlColumnSpec {
+    pub name: String,
+    pub type_name: String,
+    pub length: i32,
+    pub precision: i32,
+    pub scale: i32,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DdlConstraintSpec {
+    pub name: String,
+    pub kind: String,
+    pub columns: Vec<String>,
+    pub reference_schema: String,
+    pub reference_table: String,
+    pub reference_columns: Vec<String>,
+    pub check_column: String,
+    pub check_operator: String,
+    pub check_value: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuardedDdlPlan {
+    pub source: DataSourceId,
+    pub kind: DataSourceKind,
+    pub catalog: String,
+    pub database: String,
+    pub schema: String,
+    pub action: String,
+    pub table_name: String,
+    pub index_name: String,
+    pub owner: String,
+    pub new_name: String,
+    pub column_name: String,
+    pub default_kind: String,
+    pub default_value: String,
+    pub constraint_name: String,
+    pub constraint: Option<DdlConstraintSpec>,
+    pub identity_mode: String,
+    pub columns: Vec<DdlColumnSpec>,
+    pub keys: Vec<String>,
+    pub contract_version: i32,
+}
 pub struct ExecuteRequest {
     /// Present only for the validated, local-only system metadata execution path.
     pub metadata: Option<MetadataExecution>,
@@ -289,6 +373,9 @@ pub struct ExecuteRequest {
     pub cancel: CancellationToken,
     pub ddl_source: Option<DataSourceId>,
     pub command: String,
+    pub returning: Option<ReturningPlan>,
+    pub guarded_mutation: Option<GuardedMutationPlan>,
+    pub guarded_ddl: Option<GuardedDdlPlan>,
 }
 
 #[derive(Debug, Clone)]
@@ -362,6 +449,9 @@ pub struct EngineMetrics {
     pub metadata_stale: std::sync::atomic::AtomicU64,
     pub rows_streamed: std::sync::atomic::AtomicU64,
     pub execution_micros: std::sync::atomic::AtomicU64,
+    pub memory_pressure_events: std::sync::atomic::AtomicU64,
+    pub spool_bytes_written: std::sync::atomic::AtomicU64,
+    pub demand_repairs_coalesced: std::sync::atomic::AtomicU64,
 }
 #[derive(Debug, Clone, Copy)]
 pub struct MetricsSnapshot {
@@ -377,6 +467,9 @@ pub struct MetricsSnapshot {
     pub metadata_stale: u64,
     pub rows_streamed: u64,
     pub execution_micros: u64,
+    pub memory_pressure_events: u64,
+    pub spool_bytes_written: u64,
+    pub demand_repairs_coalesced: u64,
 }
 impl EngineMetrics {
     /// Gauges and counters are individually atomic; a snapshot is not a global transaction.
@@ -395,6 +488,9 @@ impl EngineMetrics {
             metadata_stale: self.metadata_stale.load(Relaxed),
             rows_streamed: self.rows_streamed.load(Relaxed),
             execution_micros: self.execution_micros.load(Relaxed),
+            memory_pressure_events: self.memory_pressure_events.load(Relaxed),
+            spool_bytes_written: self.spool_bytes_written.load(Relaxed),
+            demand_repairs_coalesced: self.demand_repairs_coalesced.load(Relaxed),
         }
     }
 }

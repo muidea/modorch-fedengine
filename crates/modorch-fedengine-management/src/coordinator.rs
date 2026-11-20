@@ -10,6 +10,7 @@ use tokio_util::sync::CancellationToken;
 pub(super) struct Coordinator {
     pub config: Arc<Config>,
     pub discovery: crate::discovery::DiscoveryJobs,
+    pub demand_repair: crate::demand_repair::DemandRepairQueue,
     pub tasks: TaskScheduler,
     pub storage: ServiceHandle<ManagementStorage>,
     pub registry: ServiceHandle<DataSourceRegistry>,
@@ -632,7 +633,17 @@ impl Coordinator {
                 .await?;
             return Ok(());
         }
-        tracing::debug!(operation=%id,elapsed_ms=barrier_started.elapsed().as_secs_f64()*1000.,"management publication finalization finished");
+        while let Some(target) = self.demand_repair.pop_next() {
+            if target.source == source.id {
+                self.demand_repair.complete(&target);
+            } else {
+                let _ = self.demand_repair.enqueue(target, false, None);
+                break;
+            }
+        }
+        self.demand_repair.clear_source(&source.id);
+        let repair_stats = self.demand_repair.stats();
+        tracing::debug!(operation=%id,elapsed_ms=barrier_started.elapsed().as_secs_f64()*1000.,repair_pending=repair_stats.pending,repair_coalesced=repair_stats.coalesced,"management publication finalization finished");
         Ok(())
     }
 }
@@ -680,9 +691,9 @@ fn scanner_cache_reusable(
     previous: Option<&CatalogSnapshot>,
     next: &CatalogSnapshot,
 ) -> bool {
-    // MySQL lacks reliable table identities across offline same-name rebuilds.
-    // A digest match alone must not preserve its scanner's old table binding.
-    kind == DataSourceKind::Postgres
+    // MySQL and ODBC catalogs lack reliable table identities across offline rebuilds.
+    // A digest match alone must not preserve the scanner's old table binding.
+    kind.is_postgres_family()
         && previous.is_some_and(|old| {
             old.complete && !old.stale && old.structure_digest == next.structure_digest
         })

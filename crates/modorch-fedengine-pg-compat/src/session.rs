@@ -85,7 +85,11 @@ pub fn effective_path(session: &SessionContext, scope: &MetadataScope) -> Vec<St
     result
 }
 pub fn setting(session: &SessionContext, scope: &MetadataScope, name: &str) -> Result<String> {
-    let name = name.to_ascii_lowercase();
+    let name = match name.to_ascii_lowercase().as_str() {
+        "time.zone" => "timezone".to_string(),
+        "transaction.isolation.level" => "transaction_isolation".to_string(),
+        other => other.to_string(),
+    };
     if name == "search_path" {
         let names = session
             .search_path
@@ -116,6 +120,8 @@ pub fn setting(session: &SessionContext, scope: &MetadataScope, name: &str) -> R
         "application_name" => "",
         "extra_float_digits" => "3",
         "client_min_messages" => "notice",
+        "transaction_isolation" | "default_transaction_isolation" => "read committed",
+        "transaction_read_only" | "default_transaction_read_only" => "off",
         _ => {
             return Err(EngineError::new(
                 "42704",

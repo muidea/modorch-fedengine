@@ -715,14 +715,15 @@ pub fn plan_with_parameters(
     }
     let mut statement = parsed.remove(0);
     let types = visit_expressions(&statement, |expr| {
-        if let Expr::Cast {
-            data_type: DataType::JSONB,
-            ..
-        } = expr
-        {
-            return ControlFlow::Break(EngineError::unsupported(
-                "JSONB encoding is not implemented",
-            ));
+        if let Expr::Cast { data_type, .. } = expr {
+            let dt_name = data_type.to_string().to_ascii_lowercase();
+            if matches!(data_type, DataType::JSONB)
+                || matches!(dt_name.as_str(), "jsonb" | "pg_catalog.jsonb")
+            {
+                return ControlFlow::Break(EngineError::unsupported(
+                    "JSONB encoding is not implemented",
+                ));
+            }
         }
         ControlFlow::Continue(())
     });

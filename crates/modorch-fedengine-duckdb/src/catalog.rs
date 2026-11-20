@@ -159,15 +159,43 @@ fn remote_sql(source: &DataSourceDefinition, query: &str) -> String {
         quote_literal(query)
     )
 }
-pub(super) fn discover(conn: &Connection, source: &DataSourceDefinition) -> Result<Vec<String>> {
-    let query = if source.kind == DataSourceKind::Postgres {
-        "SELECT schema_name FROM information_schema.schemata ORDER BY schema_name"
-    } else {
-        "SELECT DATABASE() AS schema_name"
-    };
-    let mut statement = conn
-        .prepare(&remote_sql(source, query))
+fn sqlserver_has_sys_objects(conn: &Connection, source: &DataSourceDefinition) -> Result<bool> {
+    let probe = remote_sql(
+        source,
+        "SELECT CASE WHEN OBJECT_ID('sys.objects') IS NULL THEN 0 ELSE 1 END",
+    );
+    let modern: i64 = conn
+        .query_row(&probe, [], |r| r.get(0))
         .map_err(engine_error)?;
+    Ok(modern == 1)
+}
+pub(super) fn discover(conn: &Connection, source: &DataSourceDefinition) -> Result<Vec<String>> {
+    let sql = if source.kind.is_postgres_family() {
+        remote_sql(
+            source,
+            "SELECT schema_name FROM information_schema.schemata ORDER BY schema_name",
+        )
+    } else if source.kind.is_mysql_family() {
+        remote_sql(source, "SELECT DATABASE() AS schema_name")
+    } else if source.kind == DataSourceKind::Oracle {
+        remote_sql(
+            source,
+            "SELECT username AS schema_name FROM all_users ORDER BY username",
+        )
+    } else if source.kind == DataSourceKind::Sqlserver {
+        let query = if sqlserver_has_sys_objects(conn, source)? {
+            "SELECT name AS schema_name FROM sys.schemas ORDER BY name"
+        } else {
+            "SELECT DISTINCT TABLE_SCHEMA AS schema_name FROM INFORMATION_SCHEMA.TABLES ORDER BY TABLE_SCHEMA"
+        };
+        remote_sql(source, query)
+    } else {
+        format!(
+            "SELECT DISTINCT table_schema FROM odbc_catalog_metadata({}) ORDER BY table_schema",
+            quote_literal(&source.catalog_alias)
+        )
+    };
+    let mut statement = conn.prepare(&sql).map_err(engine_error)?;
     let mut rows = statement.query([]).map_err(engine_error)?;
     let mut schemas = Vec::new();
     while let Some(row) = rows.next().map_err(engine_error)? {
@@ -191,9 +219,9 @@ pub(super) fn capture_bounded(
 ) -> Result<CatalogSnapshot> {
     for attempt in 0..3 {
         if attempt > 0 {
-            conn.execute_batch(&format!(
-                "CALL {}_clear_cache()",
-                revision.definition.kind.extension()
+            conn.execute_batch(&crate::extensions::clear_cache_sql(
+                revision.definition.kind.extension(),
+                &revision.definition.catalog_alias,
             ))
             .map_err(engine_error)?;
         }
@@ -229,6 +257,11 @@ fn capture_once(
     let mapping_started = std::time::Instant::now();
     // Ask the pinned extension for its actual mapping; do not guess remote types.
     for object in objects.values_mut() {
+        // Zero-column relations (e.g. `CREATE TABLE t ()` in PostgreSQL) have no columns
+        // to map and cannot be bound via `SELECT *` in extension scanners.
+        if object.columns.is_empty() {
+            continue;
+        }
         let sql = format!(
             "DESCRIBE SELECT * FROM {}.{}.{} LIMIT 0",
             quote_identifier(&source.catalog_alias),
@@ -363,13 +396,48 @@ fn read_core(
     source: &DataSourceDefinition,
     budget: usize,
 ) -> Result<CoreObjects> {
+    if source.kind.is_odbc_catalog_family() {
+        return read_odbc_catalog_core(conn, source, budget);
+    }
     let mut objects = BTreeMap::new();
-    let query = if source.kind == DataSourceKind::Postgres {
-        "SELECT n.nspname AS table_schema,c.relname AS table_name,CASE c.relkind WHEN 'v' THEN 'VIEW' WHEN 'm' THEN 'MATERIALIZED VIEW' WHEN 'f' THEN 'FOREIGN TABLE' ELSE 'BASE TABLE' END AS table_type,c.oid::text AS source_id FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind IN ('r','v','m','f','p') AND has_schema_privilege(current_user,n.oid,'USAGE') AND has_table_privilege(current_user,c.oid,'SELECT') ORDER BY n.nspname,c.relname"
+    let schemas_in = source
+        .allowed_schemas
+        .iter()
+        .map(|s| quote_literal(s))
+        .collect::<Vec<_>>()
+        .join(",");
+    let schemas_in = if schemas_in.is_empty() {
+        "NULL".to_string()
     } else {
-        "SELECT table_schema, table_name, table_type,NULL AS source_id FROM information_schema.tables WHERE table_schema=DATABASE() ORDER BY table_schema, table_name"
+        schemas_in
     };
-    let query = scoped_query(source, query);
+    let modern_sqlserver = if source.kind == DataSourceKind::Sqlserver {
+        sqlserver_has_sys_objects(conn, source)?
+    } else {
+        true
+    };
+    let query = if source.kind.is_postgres_family() {
+        scoped_query(
+            source,
+            "SELECT n.nspname AS table_schema,c.relname AS table_name,CASE c.relkind WHEN 'v' THEN 'VIEW' WHEN 'm' THEN 'MATERIALIZED VIEW' WHEN 'f' THEN 'FOREIGN TABLE' ELSE 'BASE TABLE' END AS table_type,c.oid::text AS source_id FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind IN ('r','v','m','f','p') AND has_schema_privilege(current_user,n.oid,'USAGE') AND has_table_privilege(current_user,c.oid,'SELECT') ORDER BY n.nspname,c.relname",
+        )
+    } else if source.kind == DataSourceKind::Oracle {
+        format!(
+            "SELECT owner AS table_schema, object_name AS table_name, CASE object_type WHEN 'VIEW' THEN 'VIEW' ELSE 'BASE TABLE' END AS table_type, TO_CHAR(object_id) AS source_id FROM all_objects WHERE object_type IN ('TABLE','VIEW') AND owner IN ({schemas_in}) ORDER BY owner, object_name"
+        )
+    } else if source.kind == DataSourceKind::Sqlserver {
+        if modern_sqlserver {
+            format!(
+                "SELECT s.name AS table_schema, t.name AS table_name, CASE t.type WHEN 'V' THEN 'VIEW' ELSE 'BASE TABLE' END AS table_type, CAST(t.object_id AS varchar(30)) AS source_id FROM sys.objects t JOIN sys.schemas s ON s.schema_id=t.schema_id WHERE t.is_ms_shipped=0 AND t.type IN ('U','V') AND s.name IN ({schemas_in}) ORDER BY s.name, t.name"
+            )
+        } else {
+            format!(
+                "SELECT TABLE_SCHEMA AS table_schema, TABLE_NAME AS table_name, CASE TABLE_TYPE WHEN 'VIEW' THEN 'VIEW' ELSE 'BASE TABLE' END AS table_type, CAST(OBJECT_ID(QUOTENAME(TABLE_SCHEMA)+'.'+QUOTENAME(TABLE_NAME)) AS varchar(30)) AS source_id FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA IN ({schemas_in}) ORDER BY TABLE_SCHEMA, TABLE_NAME"
+            )
+        }
+    } else {
+        "SELECT table_schema, table_name, table_type,NULL AS source_id FROM information_schema.tables WHERE table_schema=DATABASE() ORDER BY table_schema, table_name".into()
+    };
     let mut statement = conn
         .prepare(&remote_sql(source, &query))
         .map_err(engine_error)?;
@@ -398,12 +466,28 @@ fn read_core(
             return Err(EngineError::new("54000", "catalog object limit exceeded"));
         }
     }
-    let query = if source.kind == DataSourceKind::Postgres {
-        "SELECT n.nspname AS table_schema,c.relname AS table_name,a.attname AS column_name,a.attnum AS ordinal_position,pg_catalog.format_type(a.atttypid,a.atttypmod) AS data_type,CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END AS is_nullable FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace JOIN pg_catalog.pg_attribute a ON a.attrelid=c.oid WHERE a.attnum>0 AND NOT a.attisdropped AND c.relkind IN ('r','v','m','f','p') AND has_schema_privilege(current_user,n.oid,'USAGE') AND has_table_privilege(current_user,c.oid,'SELECT') ORDER BY n.nspname,c.relname,a.attnum"
+    let query = if source.kind.is_postgres_family() {
+        scoped_query(
+            source,
+            "SELECT n.nspname AS table_schema,c.relname AS table_name,a.attname AS column_name,a.attnum AS ordinal_position,pg_catalog.format_type(a.atttypid,a.atttypmod) AS data_type,CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END AS is_nullable FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace JOIN pg_catalog.pg_attribute a ON a.attrelid=c.oid WHERE a.attnum>0 AND NOT a.attisdropped AND c.relkind IN ('r','v','m','f','p') AND has_schema_privilege(current_user,n.oid,'USAGE') AND has_table_privilege(current_user,c.oid,'SELECT') ORDER BY n.nspname,c.relname,a.attnum",
+        )
+    } else if source.kind == DataSourceKind::Oracle {
+        format!(
+            "SELECT owner AS table_schema, table_name, column_name, column_id AS ordinal_position, data_type, CASE WHEN nullable = 'Y' THEN 'YES' ELSE 'NO' END AS is_nullable FROM all_tab_columns WHERE owner IN ({schemas_in}) ORDER BY owner, table_name, column_id"
+        )
+    } else if source.kind == DataSourceKind::Sqlserver {
+        if modern_sqlserver {
+            format!(
+                "SELECT s.name AS table_schema, t.name AS table_name, c.name AS column_name, c.column_id AS ordinal_position, ty.name AS data_type, CASE WHEN c.is_nullable = 1 THEN 'YES' ELSE 'NO' END AS is_nullable FROM sys.objects t JOIN sys.schemas s ON s.schema_id=t.schema_id JOIN sys.columns c ON c.object_id=t.object_id JOIN sys.types ty ON ty.user_type_id=c.user_type_id WHERE t.is_ms_shipped=0 AND t.type IN ('U','V') AND s.name IN ({schemas_in}) ORDER BY s.name, t.name, c.column_id"
+            )
+        } else {
+            format!(
+                "SELECT TABLE_SCHEMA AS table_schema, TABLE_NAME AS table_name, COLUMN_NAME AS column_name, ORDINAL_POSITION AS ordinal_position, DATA_TYPE AS data_type, IS_NULLABLE AS is_nullable FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA IN ({schemas_in}) ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION"
+            )
+        }
     } else {
-        "SELECT table_schema,table_name,column_name,ordinal_position,column_type AS data_type,is_nullable FROM information_schema.columns WHERE table_schema=DATABASE() ORDER BY table_schema,table_name,ordinal_position"
+        "SELECT table_schema,table_name,column_name,ordinal_position,column_type AS data_type,is_nullable FROM information_schema.columns WHERE table_schema=DATABASE() ORDER BY table_schema,table_name,ordinal_position".into()
     };
-    let query = scoped_query(source, query);
     let mut statement = conn
         .prepare(&remote_sql(source, &query))
         .map_err(engine_error)?;
@@ -436,8 +520,63 @@ fn read_core(
     }
     Ok(objects)
 }
+fn read_odbc_catalog_core(
+    conn: &Connection,
+    source: &DataSourceDefinition,
+    budget: usize,
+) -> Result<CoreObjects> {
+    let sql = format!(
+        "SELECT table_schema, table_name, table_type, column_name, data_type, ordinal_position FROM odbc_catalog_metadata({}) ORDER BY table_schema, table_name, ordinal_position",
+        quote_literal(&source.catalog_alias)
+    );
+    let mut statement = conn.prepare(&sql).map_err(engine_error)?;
+    let mut rows = statement.query([]).map_err(engine_error)?;
+    let mut objects = BTreeMap::new();
+    let mut count = 0usize;
+    let mut bytes = 0usize;
+    while let Some(row) = rows.next().map_err(engine_error)? {
+        let schema = metadata_text(row, 0)?;
+        if !source.allowed_schemas.contains(&schema) {
+            continue;
+        }
+        let table = metadata_text(row, 1)?;
+        let table_type = metadata_text(row, 2)?;
+        let column_name = metadata_text(row, 3)?;
+        let remote_type = metadata_text(row, 4)?;
+        let ordinal = row.get::<_, u32>(5).map_err(engine_error)?;
+        let key = (schema.clone(), table.clone());
+        if !objects.contains_key(&key) && objects.len() >= 10_000 {
+            return Err(EngineError::new("54000", "catalog object limit exceeded"));
+        }
+        let object = objects.entry(key).or_insert_with(|| CatalogObject {
+            metadata: ObjectMetadata::default(),
+            schema,
+            name: table,
+            object_type: table_type,
+            columns: vec![],
+            indexes: vec![],
+        });
+        object.columns.push(CatalogColumn {
+            name: column_name,
+            ordinal,
+            remote_type,
+            supported: false,
+            mapped_type: None,
+            nullable: true,
+        });
+        count += 1;
+        let col = object.columns.last().unwrap();
+        bytes = bytes.saturating_add(
+            col.name.len() + col.remote_type.len() + std::mem::size_of::<CatalogColumn>() + 128,
+        );
+        if count > 100_000 || bytes > budget {
+            return Err(EngineError::new("54000", "catalog column limit exceeded"));
+        }
+    }
+    Ok(objects)
+}
 fn scoped_query(source: &DataSourceDefinition, query: &str) -> String {
-    if source.kind == DataSourceKind::Postgres {
+    if source.kind.is_postgres_family() {
         let schemas = source
             .allowed_schemas
             .iter()

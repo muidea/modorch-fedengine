@@ -3,18 +3,33 @@ use bytes::{BufMut, BytesMut};
 use modorch_fedengine_contract::{Cell, PgType};
 use modorch_fedengine_core::*;
 
-fn element(oid: u32) -> Option<PgType> {
+pub fn array_element_type(oid: u32) -> Option<PgType> {
     Some(match oid {
         22 | 1005 => PgType::Int2,
         30 | 1028 => PgType::Catalog(26),
-        1007 => PgType::Int4,
-        1016 => PgType::Int8,
+        199 => PgType::Json,
         1000 => PgType::Bool,
+        1001 => PgType::Bytea,
         1002 => PgType::Catalog(18),
         1003 => PgType::Catalog(19),
+        1007 => PgType::Int4,
         1009 | 1014 | 1015 | 1034 => PgType::Text,
+        1016 => PgType::Int8,
+        1017 => PgType::Point,
+        1021 => PgType::Float4,
+        1022 => PgType::Float8,
+        1115 => PgType::Timestamp,
+        1182 => PgType::Date,
+        1183 => PgType::Time,
+        1185 => PgType::Timestamptz,
+        1187 => PgType::Interval,
+        1231 => PgType::Numeric,
+        2951 => PgType::Uuid,
         _ => return None,
     })
+}
+fn element(oid: u32) -> Option<PgType> {
+    array_element_type(oid)
 }
 fn oid_value(c: &Cell) -> Result<u32> {
     match c {

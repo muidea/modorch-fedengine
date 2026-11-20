@@ -235,6 +235,13 @@ impl DuckdbRuntime {
         F: FnOnce(&Connection, &Config, &CancellationToken) -> Result<T> + Send + 'static,
     {
         let mut config = (*self.config).clone();
+        let budget = crate::memory::parse_memory_limit_bytes(&config.duckdb.memory_limit)
+            .unwrap_or(1024 * 1024 * 1024)
+            .saturating_add((config.management.metadata_operation_memory_mb as u64) * 1024 * 1024);
+        let (pressure, rss) = crate::memory::sample_pressure(budget, Some(&self.metrics));
+        if pressure != crate::memory::MemoryPressure::Normal {
+            tracing::warn!(?pressure, rss_bytes=?rss, budget_bytes=budget, "isolated collector observed elevated memory pressure");
+        }
         config.duckdb.database_path = ":memory:".into();
         config.duckdb.threads = 1;
         config.duckdb.memory_limit = format!(
@@ -310,11 +317,26 @@ impl DuckdbRuntime {
                     .bindings
                     .retain(|b| available.contains(&b.remote_schema));
             }
-            let snapshot = crate::catalog::capture_bounded(
+            let mut snapshot = crate::catalog::capture_bounded(
                 conn,
                 &revision,
                 (config.management.metadata_operation_memory_mb as usize) * 1024 * 1024 / 8,
             )?;
+            let spool_limit =
+                (config.management.metadata_operation_memory_mb as u64).saturating_mul(1024 * 1024);
+            if snapshot.objects.len() >= 512 {
+                let mut spool = crate::memory::BoundedTempSpool::new(
+                    &config.duckdb.temp_directory,
+                    spool_limit,
+                );
+                let payload = serde_json::to_vec(&snapshot)
+                    .map_err(|_| EngineError::new("XX000", "snapshot serialization failed"))?;
+                spool.write_chunk(&payload, None)?;
+                let restored: CatalogSnapshot = serde_json::from_slice(&spool.read_all()?)
+                    .map_err(|_| EngineError::new("XX000", "snapshot spool decode failed"))?;
+                let _ = spool.bytes_written();
+                snapshot = restored;
+            }
             if cancel.is_cancelled() {
                 return Err(EngineError::new("57014", "metadata capture canceled"));
             }
@@ -453,6 +475,60 @@ mod cancellation_tests {
         }
         let error = result.unwrap().unwrap().unwrap_err();
         assert_eq!(engine_error(error).sqlstate, "57014");
+        tokio::time::timeout(Duration::from_secs(1), monitor)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn isolated_extension_cancellation_holds_leases_until_worker_exits() {
+        use std::sync::atomic::AtomicBool;
+        struct LeaseWitness(Arc<AtomicBool>);
+        impl Drop for LeaseWitness {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let released = Arc::new(AtomicBool::new(false));
+        let witness = LeaseWitness(released.clone());
+        let done = CancellationToken::new();
+        let cancel = CancellationToken::new();
+        let conn = Connection::open_in_memory().unwrap();
+        let interrupt = conn.interrupt_handle();
+        let handle = Arc::new(Mutex::new(Some(interrupt)));
+        let cancel_mon = cancel.clone();
+        let done_mon = done.clone();
+        let monitor = tokio::spawn(async move {
+            tokio::select! {
+                biased;
+                _ = done_mon.cancelled() => return,
+                _ = cancel_mon.cancelled() => {}
+            }
+            interrupt_until_finished(handle, done_mon).await;
+        });
+
+        let guard = done.drop_guard();
+        let worker = tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            let _lease = witness;
+            conn.query_row(
+                "SELECT count(*) FROM range(100000000) a(i), range(100000000) b(i)",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Before interrupting/exit, lease MUST still be held!
+        assert!(!released.load(Ordering::SeqCst));
+        cancel.cancel();
+        let res = tokio::time::timeout(Duration::from_secs(3), worker)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(res.is_err());
+        assert!(released.load(Ordering::SeqCst));
         tokio::time::timeout(Duration::from_secs(1), monitor)
             .await
             .unwrap()

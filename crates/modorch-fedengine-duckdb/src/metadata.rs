@@ -37,7 +37,10 @@ pub(super) fn discover_indexes(
     conn: &Connection,
     source: &DataSourceDefinition,
 ) -> Result<Vec<RemoteIndex>> {
-    let remote = if source.kind == DataSourceKind::Postgres {
+    if !source.kind.is_postgres_family() && !source.kind.is_mysql_family() {
+        return Ok(vec![]);
+    }
+    let remote = if source.kind.is_postgres_family() {
         "SELECT n.nspname AS schema_name, i.relname AS index_name, t.relname AS table_name, (x.indisprimary OR EXISTS(SELECT 1 FROM pg_catalog.pg_constraint c WHERE c.conindid=i.oid)) AS protected FROM pg_catalog.pg_index x JOIN pg_catalog.pg_class i ON i.oid=x.indexrelid JOIN pg_catalog.pg_class t ON t.oid=x.indrelid JOIN pg_catalog.pg_namespace n ON n.oid=t.relnamespace"
     } else {
         "SELECT table_schema AS schema_name,index_name,table_name,(index_name='PRIMARY' OR non_unique=0) AS protected FROM information_schema.statistics GROUP BY table_schema,index_name,table_name,non_unique"

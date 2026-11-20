@@ -464,6 +464,11 @@ impl VisitorMut for Binder<'_> {
         ControlFlow::Continue(())
     }
     fn pre_visit_expr(&mut self, e: &mut Expr) -> ControlFlow<EngineError> {
+        if let Expr::Cast { data_type, .. } = e
+            && let Err(err) = validate_cast_type(data_type)
+        {
+            return ControlFlow::Break(err);
+        }
         if self.analyzer.namespace.is_some()
             && let Expr::CompoundIdentifier(parts) = e
         {
@@ -623,4 +628,220 @@ pub(super) fn validate_scalar_type(ty: &DataType) -> Result<()> {
         ));
     }
     Ok(())
+}
+fn validate_decimal_info(info: &ExactNumberInfo) -> Result<()> {
+    match info {
+        ExactNumberInfo::None => Ok(()),
+        ExactNumberInfo::Precision(p) => {
+            if *p == 0 || *p > 38 {
+                Err(EngineError::unsupported(
+                    "DECIMAL precision is outside DuckDB DECIMAL(38) range",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        ExactNumberInfo::PrecisionAndScale(p, s) => {
+            if *p == 0 || *p > 38 {
+                Err(EngineError::unsupported(
+                    "DECIMAL precision is outside DuckDB DECIMAL(38) range",
+                ))
+            } else if *s < 0 || *s > *p as i64 {
+                Err(EngineError::new(
+                    "22023",
+                    "DECIMAL scale must be between 0 and precision",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
+pub(super) fn validate_cast_type(ty: &DataType) -> Result<()> {
+    match ty {
+        DataType::JSONB => {
+            return Err(EngineError::unsupported(
+                "JSONB encoding is not implemented",
+            ));
+        }
+        DataType::Numeric(info) | DataType::Decimal(info) => return validate_decimal_info(info),
+        DataType::Array(ArrayElemTypeDef::AngleBracket(inner))
+        | DataType::Array(ArrayElemTypeDef::SquareBracket(inner, _)) => {
+            if matches!(inner.as_ref(), DataType::Array(_)) {
+                return Err(EngineError::unsupported(
+                    "multi-dimensional arrays are not implemented",
+                ));
+            }
+            return validate_cast_type(inner);
+        }
+        DataType::Custom(name, modifiers) => {
+            let parts = Analyzer::parts(name)?;
+            let raw = name.to_string().to_ascii_lowercase();
+            let base = raw.split('(').next().unwrap().trim();
+            if parts.len() == 2 && parts[0] == "pg_catalog" {
+                let pg_name = parts[1].as_str();
+                if matches!(
+                    pg_name,
+                    "integer"
+                        | "bigint"
+                        | "boolean"
+                        | "float"
+                        | "double"
+                        | "double precision"
+                        | "decimal"
+                ) {
+                    return Err(EngineError::new(
+                        "42704",
+                        "type does not exist in pg_catalog",
+                    ));
+                }
+                if pg_name == "jsonb" {
+                    return Err(EngineError::unsupported(
+                        "JSONB encoding is not implemented",
+                    ));
+                }
+                if matches!(
+                    pg_name,
+                    "bool"
+                        | "int2"
+                        | "int4"
+                        | "int8"
+                        | "float4"
+                        | "float8"
+                        | "numeric"
+                        | "varchar"
+                        | "bpchar"
+                        | "text"
+                        | "bytea"
+                        | "date"
+                        | "time"
+                        | "timestamp"
+                        | "timestamptz"
+                        | "interval"
+                        | "uuid"
+                        | "json"
+                        | "point"
+                ) {
+                    return Ok(());
+                }
+                return Err(EngineError::new(
+                    "42704",
+                    "type does not exist in pg_catalog",
+                ));
+            }
+            if base == "jsonb" {
+                return Err(EngineError::unsupported(
+                    "JSONB encoding is not implemented",
+                ));
+            }
+            if matches!(
+                base,
+                "money"
+                    | "inet"
+                    | "cidr"
+                    | "macaddr"
+                    | "macaddr8"
+                    | "xml"
+                    | "bit"
+                    | "varbit"
+                    | "timetz"
+                    | "tsvector"
+                    | "tsquery"
+                    | "line"
+                    | "lseg"
+                    | "box"
+                    | "path"
+                    | "polygon"
+                    | "circle"
+            ) {
+                return Err(EngineError::unsupported(
+                    "cast target type is not supported",
+                ));
+            }
+            if matches!(
+                base,
+                "int1"
+                    | "tinyint"
+                    | "utinyint"
+                    | "usmallint"
+                    | "uinteger"
+                    | "ubigint"
+                    | "hugeint"
+                    | "uhugeint"
+                    | "int2"
+                    | "int4"
+                    | "int8"
+                    | "float4"
+                    | "float8"
+                    | "bpchar"
+                    | "timestamptz"
+                    | "point"
+            ) && modifiers.is_empty()
+            {
+                return Ok(());
+            }
+            if parts.len() > 1 {
+                return Err(EngineError::new("42704", "cast target type does not exist"));
+            }
+            return Err(EngineError::new(
+                "42704",
+                "cast target type is not a supported built-in type",
+            ));
+        }
+        _ => {}
+    }
+    let name = ty.to_string().to_uppercase();
+    let base = name.split('(').next().unwrap().trim();
+    if [
+        "BOOLEAN",
+        "BOOL",
+        "TINYINT",
+        "INT1",
+        "SMALLINT",
+        "INT2",
+        "INTEGER",
+        "INT",
+        "INT4",
+        "BIGINT",
+        "INT8",
+        "UTINYINT",
+        "USMALLINT",
+        "UINTEGER",
+        "UBIGINT",
+        "HUGEINT",
+        "UHUGEINT",
+        "REAL",
+        "FLOAT",
+        "FLOAT4",
+        "DOUBLE",
+        "DOUBLE PRECISION",
+        "FLOAT8",
+        "DECIMAL",
+        "NUMERIC",
+        "VARCHAR",
+        "CHAR",
+        "CHARACTER",
+        "CHARACTER VARYING",
+        "BPCHAR",
+        "TEXT",
+        "BLOB",
+        "BYTEA",
+        "DATE",
+        "TIME",
+        "TIMESTAMP",
+        "TIMESTAMP WITHOUT TIME ZONE",
+        "TIMESTAMPTZ",
+        "TIMESTAMP WITH TIME ZONE",
+        "INTERVAL",
+        "UUID",
+        "JSON",
+        "POINT",
+    ]
+    .contains(&base)
+    {
+        return Ok(());
+    }
+    Err(EngineError::unsupported(
+        "cast target type is not supported",
+    ))
 }

@@ -557,3 +557,205 @@ async fn omitted_and_empty_startup_database_use_login_user_database() {
     }
     engine.shutdown().await.unwrap();
 }
+
+#[derive(Debug, Clone, PartialEq)]
+struct PgPointParam(f64, f64);
+impl tokio_postgres::types::ToSql for PgPointParam {
+    fn to_sql(
+        &self,
+        _: &tokio_postgres::types::Type,
+        out: &mut tokio_postgres::types::private::BytesMut,
+    ) -> Result<tokio_postgres::types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        out.extend_from_slice(&self.0.to_be_bytes());
+        out.extend_from_slice(&self.1.to_be_bytes());
+        Ok(tokio_postgres::types::IsNull::No)
+    }
+    fn accepts(ty: &tokio_postgres::types::Type) -> bool {
+        *ty == tokio_postgres::types::Type::POINT
+    }
+    tokio_postgres::types::to_sql_checked!();
+}
+impl<'a> tokio_postgres::types::FromSql<'a> for PgPointParam {
+    fn from_sql(
+        _: &tokio_postgres::types::Type,
+        raw: &'a [u8],
+    ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        if raw.len() != 16 {
+            return Err("invalid POINT binary length".into());
+        }
+        Ok(Self(
+            f64::from_be_bytes(raw[..8].try_into()?),
+            f64::from_be_bytes(raw[8..].try_into()?),
+        ))
+    }
+    fn accepts(ty: &tokio_postgres::types::Type) -> bool {
+        *ty == tokio_postgres::types::Type::POINT
+    }
+}
+
+#[derive(Debug)]
+struct PgNumericWire(Vec<u8>);
+impl tokio_postgres::types::ToSql for PgNumericWire {
+    fn to_sql(
+        &self,
+        _: &tokio_postgres::types::Type,
+        out: &mut tokio_postgres::types::private::BytesMut,
+    ) -> Result<tokio_postgres::types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        out.extend_from_slice(&self.0);
+        Ok(tokio_postgres::types::IsNull::No)
+    }
+    fn accepts(ty: &tokio_postgres::types::Type) -> bool {
+        *ty == tokio_postgres::types::Type::NUMERIC
+    }
+    tokio_postgres::types::to_sql_checked!();
+}
+impl<'a> tokio_postgres::types::FromSql<'a> for PgNumericWire {
+    fn from_sql(
+        _: &tokio_postgres::types::Type,
+        raw: &'a [u8],
+    ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        Ok(Self(raw.to_vec()))
+    }
+    fn accepts(ty: &tokio_postgres::types::Type) -> bool {
+        *ty == tokio_postgres::types::Type::NUMERIC
+    }
+}
+
+#[tokio::test]
+async fn batch1_numeric_interval_point_array_guc_and_cast_contracts() {
+    let (config, _temporary) = config();
+    let e = FedEngine::start(config).await.unwrap();
+    let (c, t) = connect(&e).await;
+
+    // C1-1: Unconstrained NUMERIC parameters preserve 38 digits & scale end-to-end.
+    let num38_bytes = {
+        let mut b = Vec::new();
+        // 12345678901234567890123456789012345678 => ndigits=10, weight=9, sign=0, scale=0
+        b.extend_from_slice(&10_i16.to_be_bytes());
+        b.extend_from_slice(&9_i16.to_be_bytes());
+        b.extend_from_slice(&0_i16.to_be_bytes());
+        b.extend_from_slice(&0_i16.to_be_bytes());
+        for d in [12_i16, 3456, 7890, 1234, 5678, 9012, 3456, 7890, 1234, 5678] {
+            b.extend_from_slice(&d.to_be_bytes());
+        }
+        b
+    };
+    let stmt = c
+        .prepare_typed(
+            "SELECT $1::numeric, $2",
+            &[
+                tokio_postgres::types::Type::NUMERIC,
+                tokio_postgres::types::Type::NUMERIC,
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(stmt.params().len(), 2);
+    let num_scale_bytes = {
+        let mut b = Vec::new();
+        b.extend_from_slice(&2_i16.to_be_bytes());
+        b.extend_from_slice(&0_i16.to_be_bytes());
+        b.extend_from_slice(&0_i16.to_be_bytes());
+        b.extend_from_slice(&4_i16.to_be_bytes());
+        for d in [123_i16, 4500] {
+            b.extend_from_slice(&d.to_be_bytes());
+        }
+        b
+    };
+    let num_row = c
+        .query_one(
+            &stmt,
+            &[
+                &PgNumericWire(num38_bytes.clone()),
+                &PgNumericWire(num_scale_bytes.clone()),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(num_row.get::<_, PgNumericWire>(0).0, num38_bytes);
+    assert_eq!(num_row.get::<_, PgNumericWire>(1).0, num_scale_bytes);
+
+    let rows = c
+        .simple_query(
+            "SELECT '12345678901234567890123456789012345678'::DECIMAL(38,0), '123.4500'::DECIMAL(7,4)",
+        )
+        .await
+        .unwrap();
+    let tokio_postgres::SimpleQueryMessage::Row(row) = &rows[1] else {
+        panic!("expected row");
+    };
+    assert_eq!(row.get(0), Some("12345678901234567890123456789012345678"));
+    assert_eq!(row.get(1), Some("123.4500"));
+
+    // C1-2: Mixed explicit cast + bare placeholder for the same parameter executes accurately.
+    let row = c
+        .query_one("SELECT $1::INT + $1", &[&21_i32])
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, i32>(0), 42);
+    let gap_err = c.prepare("SELECT $1::INT, $3::INT").await.unwrap_err();
+    assert_eq!(gap_err.code().unwrap().code(), "42P18");
+
+    // C1-3: INTERVAL, POINT, 1D arrays, and invalid CAST rejections.
+    let point_stmt = c
+        .prepare_typed("SELECT $1", &[tokio_postgres::types::Type::POINT])
+        .await
+        .unwrap();
+    let point_row = c
+        .query_one(&point_stmt, &[&PgPointParam(1.5, -2.25)])
+        .await
+        .unwrap();
+    assert_eq!(
+        point_row.get::<_, PgPointParam>(0),
+        PgPointParam(1.5, -2.25)
+    );
+
+    let rows = c
+        .simple_query(
+            "SELECT INTERVAL '1 year 2 mons 3 days 04:05:06.123456', ARRAY[10, 20, NULL]::INTEGER[], ARRAY['a,b', NULL]::VARCHAR[]",
+        )
+        .await
+        .unwrap();
+    let tokio_postgres::SimpleQueryMessage::Row(row) = &rows[1] else {
+        panic!("expected row");
+    };
+    assert_eq!(row.get(0), Some("1 year 2 mons 3 days 04:05:06.123456"));
+    assert_eq!(row.get(1), Some("{\"10\",\"20\",NULL}"));
+    assert_eq!(row.get(2), Some("{\"a,b\",NULL}"));
+
+    let int_array = c
+        .query_one("SELECT ARRAY[1, 2, 3]::INTEGER[]", &[])
+        .await
+        .unwrap();
+    assert_eq!(int_array.get::<_, Vec<i32>>(0), vec![1, 2, 3]);
+
+    for (bad_sql, expected_state) in [
+        ("SELECT 1::JSONB", "0A000"),
+        ("SELECT 1::pg_catalog.integer", "42704"),
+        ("SELECT ARRAY[ARRAY[1]]", "0A000"),
+        ("SHOW unknown_guc_setting", "42704"),
+        ("SELECT current_setting('unknown_guc_setting')", "42704"),
+    ] {
+        let err = c.simple_query(bad_sql).await.unwrap_err();
+        assert_eq!(err.code().unwrap().code(), expected_state, "{bad_sql}");
+    }
+
+    // C1-4: SHOW & current_setting AST responses.
+    let tz = c.simple_query("SHOW TIME ZONE").await.unwrap();
+    let tokio_postgres::SimpleQueryMessage::Row(tz_row) = &tz[1] else {
+        panic!("expected TimeZone row");
+    };
+    assert_eq!(tz_row.get(0), Some("UTC"));
+    let iso = c
+        .simple_query("SHOW TRANSACTION ISOLATION LEVEL")
+        .await
+        .unwrap();
+    let tokio_postgres::SimpleQueryMessage::Row(iso_row) = &iso[1] else {
+        panic!("expected isolation row");
+    };
+    assert_eq!(iso_row.get(0), Some("read committed"));
+
+    drop(c);
+    t.await.unwrap();
+    e.shutdown().await.unwrap();
+}

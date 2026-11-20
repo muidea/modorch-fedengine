@@ -81,11 +81,11 @@ impl MetadataExpression {
         if text.is_empty() {
             return None;
         }
-        let postgres = kind == DataSourceKind::Postgres;
+        let postgres = kind.is_postgres_family();
         Some(Self {
             pg_text: postgres.then(|| text.clone()),
             source_text: text,
-            source_dialect: kind.extension().into(),
+            source_dialect: kind.dialect_name().into(),
             translation_status: if postgres {
                 TranslationStatus::Exact
             } else {

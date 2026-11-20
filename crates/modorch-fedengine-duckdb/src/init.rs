@@ -56,12 +56,30 @@ impl Lifecycle for DuckdbInitiator {
                 let conn = setup_root.lock().unwrap();
                 // Explicitly provisioned extensions can be verified and initialized
                 // before admitting PG sessions, avoiding first-use LOAD in a live barrier.
+                // Enable every provisioned database dialect family by default with no config toggle.
                 if let Some(directory) = &config.duckdb.extension_directory {
-                    for kind in [DataSourceKind::Postgres, DataSourceKind::Mysql] {
+                    for kind in [
+                        DataSourceKind::Postgres,
+                        DataSourceKind::Mysql,
+                        DataSourceKind::Oracle,
+                        DataSourceKind::Sqlserver,
+                        DataSourceKind::Dameng,
+                    ] {
                         if crate::extensions::provisioned(directory, kind.extension())
                             .map_err(fw)?
+                            && let Err(error) = crate::control::load_extension(&conn, &config, kind)
                         {
-                            crate::control::load_extension(&conn, &config, kind).map_err(fw)?;
+                            if kind.is_read_only_scanner()
+                                && error.sqlstate == "0A000"
+                                && error.message.contains("libodbc.so.2")
+                            {
+                                tracing::warn!(
+                                    extension = kind.extension(),
+                                    "skipping eager ODBC extension preload without libodbc.so.2"
+                                );
+                            } else {
+                                return Err(fw(error));
+                            }
                         }
                     }
                 }

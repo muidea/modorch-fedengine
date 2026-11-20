@@ -1,7 +1,6 @@
 use super::{Backend, send};
 use futures::{Sink, SinkExt};
 use modorch::prelude::async_trait;
-use modorch_fedengine_contract::StatementKind;
 use modorch_fedengine_core::EngineError;
 use modorch_fedengine_ddl::Analyzer;
 use modorch_fedengine_pg_compat::{encode_row, fields, pg_error};
@@ -43,7 +42,7 @@ impl SimpleQueryHandler for Backend {
                 .cursor(client, sql, vec![], vec![], Default::default(), None)
                 .await?;
             self.send_notices(client, &mut cursor).await?;
-            if cursor.kind == StatementKind::Query {
+            if !cursor.columns.is_empty() {
                 client
                     .send(PgWireBackendMessage::RowDescription(
                         pgwire::messages::data::RowDescription::new(

@@ -13,4 +13,5 @@ pub use api::{
 };
 pub use module::SourceManagerFactory;
 
+mod demand_repair;
 mod discovery;

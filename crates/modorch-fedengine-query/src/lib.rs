@@ -4,7 +4,7 @@ use modorch_fedengine_catalog::{CATALOG_TOPIC, CatalogReply, CatalogRequest};
 use modorch_fedengine_contract::*;
 use modorch_fedengine_core::*;
 use modorch_fedengine_datasource::DataSourceRegistry;
-use modorch_fedengine_ddl::{Analyzer, Kind, drop_index_name};
+use modorch_fedengine_ddl::{Analyzer, Kind, build_guarded_mutation_plan, index_ownership_target};
 use modorch_fedengine_policy::{Authorize, POLICY_TOPIC};
 use std::{
     num::NonZeroUsize,
@@ -213,7 +213,11 @@ impl QueryHandler {
                 } else {
                     slots.iter().map(|i| parameters[*i].clone()).collect()
                 };
-                let sql = typed_sql(&sql, &parameter_types)?;
+                let sql = typed_sql(
+                    &sql,
+                    &parameter_types,
+                    (!prepare_only).then_some(parameters.as_slice()),
+                )?;
                 let notices=scope.catalogs.iter().filter(|c|c.stale).take(8).map(|c|(c.snapshot_id.clone(),format!("catalog {} uses a stale metadata snapshot; inspect the management API catalog status",c.catalog))).collect::<Vec<_>>();
                 let runtime = self.runtime.acquire().map_err(message_error)?;
                 let mut reply = runtime
@@ -239,6 +243,9 @@ impl QueryHandler {
                             cancel: r.cancel.clone(),
                             ddl_source: None,
                             command: plan.command,
+                            returning: None,
+                            guarded_mutation: None,
+                            guarded_ddl: None,
                         },
                         Box::new((
                             self.runtime.acquire().map_err(message_error)?,
@@ -349,17 +356,19 @@ impl QueryHandler {
             bindings,
             routes: scope.virtual_database.as_ref().map(|_| routes),
         });
-        // Inspect the actual AST to discover DROP INDEX ownership; never trust textual prefixes.
+        // Inspect the actual AST to discover index ownership for DROP/ALTER INDEX; never trust textual prefixes.
         let statements = Analyzer::parse(&business_sql)?;
         if statements.len() != 1 {
             return Err(EngineError::unsupported("one SQL statement is required"));
         }
-        if let Some(name) = drop_index_name(&business_sql)? {
+        if let Some((name, required_action)) = index_ownership_target(&business_sql)? {
             let source = analyzer.bind(&name, false)?.source;
             if !self.config.grants.iter().any(|g| {
-                g.principal == r.principal && g.source == source && g.actions.contains("DROP_INDEX")
+                g.principal == r.principal
+                    && g.source == source
+                    && g.actions.contains(required_action)
             }) {
-                return Err(EngineError::denied("DROP_INDEX is not granted"));
+                return Err(EngineError::denied("index operation is not granted"));
             }
             let hub_payload = CatalogRequest::Indexes(source);
             let hub_options = modorch::MessageOptions {
@@ -445,6 +454,7 @@ impl QueryHandler {
             }
         }
         registry.check(&analyzed_versions)?;
+        let mut verified_index_owner: Option<String> = None;
         if let Some(index) = &analysis.index
             && !index.create
         {
@@ -465,6 +475,29 @@ impl QueryHandler {
                     "index ownership changed while awaiting the DDL fence",
                 ));
             }
+            verified_index_owner = Some(owners[0].table.clone());
+        } else if let Some(intent) = &analysis.ddl_intent
+            && intent.action == "rename_index"
+            && let Some(primary) = &analysis.primary
+        {
+            let runtime = self.runtime.acquire().map_err(message_error)?;
+            let current = runtime
+                .port
+                .indexes(
+                    primary.source.clone(),
+                    Box::new(self.runtime.acquire().map_err(message_error)?),
+                )
+                .await?;
+            let owners: Vec<_> = current
+                .iter()
+                .filter(|i| i.schema == primary.schema && i.index == intent.table_name)
+                .collect();
+            if owners.len() != 1 || owners[0].table != primary.name || owners[0].protected {
+                return Err(EngineError::denied(
+                    "index ownership changed while awaiting the DDL fence",
+                ));
+            }
+            verified_index_owner = Some(owners[0].table.clone());
         }
         let generations = registry.generations(analysis.sources.iter().cloned());
         let (prepare, parameters, wire_types) =
@@ -475,12 +508,15 @@ impl QueryHandler {
                 t.ok_or_else(|| EngineError::new("42P18", "parameter type cannot be determined"))
             })
             .collect::<Result<Vec<_>>>()?;
+        let returning = analysis.returning.clone();
         let sql = if let Some(index) = &analysis.index {
             let source = definitions
                 .iter()
                 .find(|s| s.id == index.table.source)
                 .unwrap();
             index.duckdb_adapter_sql(source.kind)?
+        } else if analysis.kind == Kind::Query {
+            modorch_fedengine_ddl::rewrite_pushdown(&analysis.sql, &analysis.sources, &definitions)?
         } else {
             analysis.sql
         };
@@ -494,33 +530,38 @@ impl QueryHandler {
         } else {
             slots.iter().map(|i| parameters[*i].clone()).collect()
         };
-        let explicit_hints = modorch_fedengine_ddl::parameter_hints(&sql)?;
-        let resolved_types: Vec<String> = parameter_types
-            .iter()
-            .enumerate()
-            .map(|(i, p)| {
-                if explicit_hints.get(i).is_some_and(|h| h.is_some()) {
-                    return Ok("SKIP".into());
-                }
-                if *p == Some(PgType::Numeric) {
-                    return Err(EngineError::new(
-                        "42P18",
-                        "NUMERIC parameters need an explicit DECIMAL precision/scale cast",
-                    ));
-                }
-                p.map(|t| t.duckdb_name().to_string()).ok_or_else(|| {
-                    EngineError::new(
-                        "42P18",
-                        "parameter type requires an OID or explicit SQL cast",
-                    )
-                })
-            })
-            .collect::<Result<_>>()?;
-        let sql = if resolved_types.is_empty() {
-            sql
+        let guarded_mutation =
+            if matches!(analysis.kind, Kind::Insert | Kind::Update | Kind::Delete)
+                && let Some(primary) = &analysis.primary
+                && let Some(source) = definitions.iter().find(|s| s.id == primary.source)
+            {
+                build_guarded_mutation_plan(&sql, source, primary, returning.as_ref())?
+            } else {
+                None
+            };
+        let guarded_ddl = if analysis.kind == Kind::Ddl
+            && let Some(intent) = analysis.ddl_intent
+            && let Some(primary) = &analysis.primary
+            && let Some(source) = definitions.iter().find(|s| s.id == primary.source)
+        {
+            let owner = if matches!(
+                intent.action.as_str(),
+                "drop_index" | "rename_index" | "reindex"
+            ) {
+                verified_index_owner.unwrap_or_else(|| intent.owner.clone())
+            } else {
+                String::new()
+            };
+            let schema = primary.schema.clone();
+            intent.into_guarded_plan(source, schema.clone(), schema, owner)?
         } else {
-            modorch_fedengine_ddl::cast_parameters(&sql, &resolved_types)?
+            None
         };
+        let sql = typed_sql(
+            &sql,
+            &parameter_types,
+            (!prepare).then_some(parameters.as_slice()),
+        )?;
         let kind = match analysis.kind {
             Kind::Query => StatementKind::Query,
             Kind::Insert => StatementKind::Insert,
@@ -557,6 +598,9 @@ impl QueryHandler {
                         None
                     },
                     command: analysis.command,
+                    returning,
+                    guarded_mutation,
+                    guarded_ddl,
                 },
                 ownership,
             )
@@ -584,22 +628,55 @@ fn remaining(r: &QueryRequest) -> Result<Duration> {
     }
 }
 fn hint_type(t: &str) -> Option<PgType> {
-    Some(match t.to_uppercase().as_str() {
+    let normalized = t.trim().to_ascii_uppercase();
+    let normalized = normalized
+        .strip_prefix("PG_CATALOG.")
+        .unwrap_or(&normalized);
+    if let Some(elem) = normalized.strip_suffix("[]") {
+        let oid = match elem.trim() {
+            "BOOLEAN" | "BOOL" => 1000,
+            "BYTEA" | "BLOB" => 1001,
+            "SMALLINT" | "INT2" => 1005,
+            "INT" | "INTEGER" | "INT4" => 1007,
+            "BIGINT" | "INT8" => 1016,
+            "POINT" => 1017,
+            "REAL" | "FLOAT4" => 1021,
+            "DOUBLE" | "DOUBLE PRECISION" | "FLOAT8" => 1022,
+            "TEXT" | "VARCHAR" | "CHARACTER VARYING" | "CHAR" | "BPCHAR" | "NAME" => 1009,
+            "DATE" => 1182,
+            "TIME" => 1183,
+            "TIMESTAMP" => 1115,
+            "TIMESTAMPTZ" | "TIMESTAMP WITH TIME ZONE" => 1185,
+            "INTERVAL" => 1187,
+            "UUID" => 2951,
+            "JSON" => 199,
+            v if v.starts_with("DECIMAL") || v.starts_with("NUMERIC") => 1231,
+            _ => return None,
+        };
+        return Some(PgType::Catalog(oid));
+    }
+    let base = normalized.split('(').next().unwrap().trim();
+    Some(match base {
         "INT" | "INTEGER" | "INT4" => PgType::Int4,
         "BIGINT" | "INT8" => PgType::Int8,
         "SMALLINT" | "INT2" => PgType::Int2,
         "BOOLEAN" | "BOOL" => PgType::Bool,
-        "REAL" | "FLOAT4" => PgType::Float4,
+        "REAL" | "FLOAT" | "FLOAT4" => PgType::Float4,
         "DOUBLE" | "DOUBLE PRECISION" | "FLOAT8" => PgType::Float8,
-        "TEXT" | "VARCHAR" => PgType::Text,
+        "TEXT" | "VARCHAR" | "CHARACTER VARYING" | "CHAR" | "CHARACTER" | "BPCHAR" => PgType::Text,
         "BLOB" | "BYTEA" => PgType::Bytea,
         "DATE" => PgType::Date,
-        "TIME" => PgType::Time,
-        "TIMESTAMP" => PgType::Timestamp,
+        "TIME" | "TIME WITHOUT TIME ZONE" => PgType::Time,
+        "TIMESTAMP" | "TIMESTAMP WITHOUT TIME ZONE" => PgType::Timestamp,
         "TIMESTAMPTZ" | "TIMESTAMP WITH TIME ZONE" => PgType::Timestamptz,
+        "INTERVAL" => PgType::Interval,
+        "POINT" => PgType::Point,
         "UUID" => PgType::Uuid,
         "JSON" => PgType::Json,
-        v if v.starts_with("DECIMAL") || v.starts_with("NUMERIC") => PgType::Numeric,
+        "OID" => PgType::Catalog(26),
+        "REGCLASS" => PgType::Catalog(2205),
+        "NAME" => PgType::Catalog(19),
+        "DECIMAL" | "NUMERIC" => PgType::Numeric,
         _ => return None,
     })
 }
@@ -684,14 +761,46 @@ fn query_parameters(
         }
     }
 }
-fn typed_sql(sql: &str, types: &[Option<PgType>]) -> Result<String> {
+fn numeric_duckdb_cast(value: Option<&Cell>) -> Result<String> {
+    let Some(value) = value else {
+        return Ok("DECIMAL(38,10)".into());
+    };
+    match value {
+        Cell::Numeric(s) | Cell::Text(s) => {
+            let (p, scale) = modorch_fedengine_pg_compat::numeric_precision_scale(s)?;
+            Ok(format!("DECIMAL({p},{scale})"))
+        }
+        Cell::Null => Ok("DECIMAL(38,0)".into()),
+        _ => Err(EngineError::new("22P02", "invalid numeric parameter value")),
+    }
+}
+fn typed_sql(sql: &str, types: &[Option<PgType>], parameters: Option<&[Cell]>) -> Result<String> {
+    if types.is_empty() {
+        return Ok(sql.into());
+    }
     let hints = modorch_fedengine_ddl::parameter_hints(sql)?;
     let types = types
         .iter()
         .enumerate()
         .map(|(i, p)| {
-            if hints.get(i).is_some_and(Option::is_some) {
-                return Ok("SKIP".into());
+            if let Some(Some(hint)) = hints.get(i) {
+                let normalized = hint.trim().to_ascii_uppercase();
+                let bare_numeric = matches!(
+                    normalized
+                        .strip_prefix("PG_CATALOG.")
+                        .unwrap_or(&normalized),
+                    "NUMERIC" | "DECIMAL"
+                );
+                if bare_numeric && *p == Some(PgType::Numeric) {
+                    return numeric_duckdb_cast(parameters.and_then(|vals| vals.get(i)));
+                }
+            }
+            if *p == Some(PgType::Numeric)
+                && hints
+                    .get(i)
+                    .is_none_or(|h| h.as_ref().is_none_or(|s| !s.contains('(')))
+            {
+                return numeric_duckdb_cast(parameters.and_then(|vals| vals.get(i)));
             }
             p.map(|t| t.duckdb_name().into()).ok_or_else(|| {
                 EngineError::new(
@@ -701,9 +810,5 @@ fn typed_sql(sql: &str, types: &[Option<PgType>]) -> Result<String> {
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    if types.is_empty() {
-        Ok(sql.into())
-    } else {
-        modorch_fedengine_ddl::cast_parameters(sql, &types)
-    }
+    modorch_fedengine_ddl::cast_parameters(sql, &types)
 }

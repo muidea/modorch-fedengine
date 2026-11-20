@@ -1,6 +1,5 @@
 use crate::{
     catalog::{capture, discover},
-    credentials::resolve,
     error::engine_error,
     extensions::verify_extension,
     storage,
@@ -16,12 +15,14 @@ pub(super) fn load_extension(
     kind: DataSourceKind,
 ) -> Result<()> {
     let extension = kind.extension();
+    let canonical = crate::extensions::canonical_extension_key(extension);
+    let ext_name = crate::extensions::extension_module_name(extension);
     // The verified native code belongs to the instance. Subsequent attachments
     // must not re-read its on-disk binary while holding the instance barrier.
     let loaded: bool = conn
         .query_row(
             "SELECT loaded FROM duckdb_extensions() WHERE extension_name=?",
-            [format!("{extension}_scanner")],
+            [&ext_name],
             |row| row.get(0),
         )
         .map_err(engine_error)?;
@@ -29,29 +30,49 @@ pub(super) fn load_extension(
         return Ok(());
     }
     let d = &config.duckdb;
-    if d.install_extensions {
+    let is_local_custom = d
+        .extension_directory
+        .as_deref()
+        .and_then(|dir| crate::extensions::provisioned(dir, extension).ok())
+        .unwrap_or(false);
+    // Never overwrite locally provisioned custom extensions from the upstream repo.
+    if d.install_extensions && !is_local_custom {
         conn.execute_batch("SET custom_extension_repository='https://extensions.duckdb.org'")
             .map_err(engine_error)?;
-        conn.execute_batch(&format!("INSTALL {extension}"))
+        conn.execute_batch(&format!("INSTALL {canonical}"))
             .map_err(engine_error)?;
     }
     if let Some(directory) = &d.extension_directory {
         verify_extension(directory, extension)?;
     }
-    conn.execute_batch(&format!("LOAD {extension}"))
+    conn.execute_batch(&format!("LOAD {ext_name}"))
         .map_err(engine_error)?;
-    let settings = if kind == DataSourceKind::Postgres {
-        format!(
-            "SET pg_pool_acquire_mode='wait'; SET pg_pool_max_connections={}; SET pg_pool_wait_timeout_millis={}",
+    let settings = match canonical {
+        "postgres" => format!(
+            "SET pg_connection_cache=true; SET pg_connection_limit={}",
+            d.pool_max_connections
+        ),
+        "mysql" => format!(
+            "SET mysql_pool_size={}; SET mysql_pool_acquire_mode='wait'; SET mysql_pool_wait_timeout_millis={}",
             d.pool_max_connections, d.pool_wait_timeout_ms
-        )
-    } else {
-        format!(
-            "SET mysql_pool_acquire_mode='wait'; SET mysql_pool_size={}; SET mysql_pool_wait_timeout_millis={}",
+        ),
+        "oracle" => format!(
+            "SET oracle_connection_cache=true; SET oracle_connection_limit={}",
+            d.pool_max_connections
+        ),
+        "sqlserver" => format!(
+            "SET sqlserver_connection_cache=true; SET sqlserver_connection_limit={}",
+            d.pool_max_connections
+        ),
+        "odbc_catalog" => format!(
+            "SET odbc_catalog_connection_cache=true; SET odbc_catalog_connection_limit={}; SET odbc_catalog_pool_wait_timeout_millis={}",
             d.pool_max_connections, d.pool_wait_timeout_ms
-        )
+        ),
+        _ => String::new(),
     };
-    conn.execute_batch(&settings).map_err(engine_error)?;
+    if !settings.is_empty() {
+        conn.execute_batch(&settings).map_err(engine_error)?;
+    }
     Ok(())
 }
 pub(super) fn attach(
@@ -61,26 +82,20 @@ pub(super) fn attach(
 ) -> Result<()> {
     validate_source(source)?;
     let kind = source.kind;
-    let extension = kind.extension();
     load_extension(conn, config, kind)?;
-    let secret = if let Some(target) = &source.organization {
-        crate::credentials::target_dsn(
-            &source.secret_ref,
-            &config.management.credentials_directory,
-            kind,
-            &target.instance,
-            Some(&target.database),
-        )?
-    } else {
-        resolve(&source.secret_ref, &config.management.credentials_directory)?
-    };
-    conn.execute_batch(&format!(
-        "ATTACH {} AS {} (TYPE {extension}{})",
-        quote_literal(&secret),
-        quote_identifier(&source.catalog_alias),
-        if source.read_only { ", READ_ONLY" } else { "" }
-    ))
-    .map_err(engine_error)?;
+    let plan = crate::credentials::attach_plan(
+        &source.secret_ref,
+        &config.management.credentials_directory,
+        kind,
+        &source.catalog_alias,
+        source.read_only,
+        &source.default_schema,
+        source.organization.as_ref().map(|o| o.as_ref()),
+    )?;
+    if let Some(secret_sql) = &plan.secret_sql {
+        conn.execute_batch(secret_sql).map_err(engine_error)?;
+    }
+    conn.execute_batch(&plan.attach_sql).map_err(engine_error)?;
     let result = verify_capability(conn, config, source);
     if result.is_err() {
         let _ = detach(conn, &source.catalog_alias);
@@ -101,25 +116,37 @@ fn verify_capability(
                 |r| r.get(0),
             )
             .map_err(engine_error)?;
-        let query = if source.kind == DataSourceKind::Postgres {
-            "SELECT current_setting('server_version') AS version"
+        let query = if source.kind.is_postgres_family() {
+            Some("SELECT current_setting('server_version') AS version")
+        } else if source.kind.is_mysql_family() {
+            Some("SELECT VERSION() AS version")
+        } else if source.kind == DataSourceKind::Oracle {
+            Some("SELECT banner AS version FROM v$version WHERE ROWNUM = 1")
+        } else if source.kind == DataSourceKind::Sqlserver {
+            Some("SELECT CAST(SERVERPROPERTY('ProductVersion') AS VARCHAR(128)) AS version")
         } else {
-            "SELECT VERSION() AS version"
+            None
         };
-        let remote: String = conn
-            .query_row(
-                &format!(
-                    "SELECT version FROM {extension}_query({}, {})",
-                    quote_literal(&source.catalog_alias),
-                    quote_literal(query)
-                ),
-                [],
-                |r| r.get(0),
-            )
-            .map_err(engine_error)?;
-        if version != capability.extension_version || remote != capability.remote_version {
+        if let Some(query) = query {
+            let remote: String = conn
+                .query_row(
+                    &format!(
+                        "SELECT version FROM {extension}_query({}, {})",
+                        quote_literal(&source.catalog_alias),
+                        quote_literal(query)
+                    ),
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(engine_error)?;
+            if version != capability.extension_version || remote != capability.remote_version {
+                return Err(EngineError::config(
+                    "capability extension/remote version does not match",
+                ));
+            }
+        } else if version != capability.extension_version {
             return Err(EngineError::config(
-                "capability extension/remote version does not match",
+                "capability extension version does not match",
             ));
         }
     }
@@ -160,9 +187,9 @@ pub(super) fn execute(
             }
         }
         ControlAction::ClearCache(revision) => {
-            conn.execute_batch(&format!(
-                "CALL {}_clear_cache()",
-                revision.definition.kind.extension()
+            conn.execute_batch(&crate::extensions::clear_cache_sql(
+                revision.definition.kind.extension(),
+                &revision.definition.catalog_alias,
             ))
             .map_err(engine_error)?;
         }

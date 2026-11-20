@@ -1,28 +1,41 @@
 # 剩余项分阶段收口方案
 
-本文依据[协议兼容边界](protocol-compatibility.md)与[管理 API 契约](management-api.md)制定实施与验收方案，状态为**用户已确认，分批实施中**，不代表下列能力已经实现。目标继续保持对外尽量符合 PostgreSQL SQL/协议行为。以对外声明的 PG 版本锁定语义和目录验收基线，不同远端版本通过适配层处理差异。已确认的账号同名虚拟库、默认隐藏系统对象、权限范围、认证成功报文时机及普通停用恢复身份策略保持原契约。
+本文依据[协议兼容边界](protocol-compatibility.md)与[管理 API 契约](management-api.md)制定实施与验收方案，并同步整合从参考实现（`federated-query-engine`）评估接纳的关系型扩展与查询准确度能力（已明确排除 UNS、vxBase、iSYS 及独立工具扩展 `pg_adapter`）。目标继续保持对外尽量符合 PostgreSQL SQL/协议行为，以对外声明的 PG 版本锁定语义和目录验收基线，不同远端版本通过适配层处理差异。已确认的账号同名虚拟库、默认隐藏系统对象、权限范围、认证成功报文时机及普通停用恢复身份策略保持原契约。
 
-开发阶段约束：按当前版本直接设计存储和 DTO，不新增历史迁移、旧格式回退、历史回填或兼容分支。配置缺省值、来源能力未知值、当前版本的幂等初始化、运行中失败保留及稳定身份不属于历史数据兼容；继续保留。已有运行实例的升级备份与匹配回退仍须执行，不能借本约束丢弃当前管理状态或凭据。
+开发阶段约束：按当前版本直接设计存储、接口和 DTO，不新增历史迁移、旧格式回退、历史回填或兼容分支，也不保留带 `_v1`..`_v5`、`_scoped_v1`..`_scoped_v4` 等历史阶段版本号的冗余扩展函数名。配置缺省值、来源能力未知值、当前版本的幂等初始化、运行中失败保留及稳定对象身份不属于历史数据兼容；继续保留。已有运行实例的升级备份与匹配回退仍须执行，不能借本约束丢弃当前管理状态或凭据。
 
-实施期间用户进一步明确：扩展模块的问题后续处理；本轮不调整锁定的 DuckDB 扩展或引入新执行后端。numeric/JSONB/业务数组相关原型结果保留为边界证据，不计为类型能力完成。当前阶段不做历史数据兼容已固化为 [开发规约](../AGENTS.md)。
+架构与安全红线：
+- **纯可嵌入库边界**：严禁引入子进程采集（如 `--metadata-scanner-worker`）或覆写宿主全局进程配额；所有阻塞 I/O、资源预算与启停受 Modorch-RS 0.0.3 `TaskScheduler` / `blocking_io` / `FedEngineBundle` 控制，不新增独立 `.duckdb` 账本或审计文件（统一落在唯一 `_fedengine` 库）；`FedEngineBundle::new`/`register` 保持零 I/O 副作用。
+- **扩展加载边界**：核心仅接纳 5 个定制 `*_scanner.duckdb_extension` 连接器扩展（`postgres_scanner`、`mysql_scanner`、`oracle_scanner`、`sqlserver_scanner`、`odbc_catalog_scanner`）。当前开发阶段显式允许 `allow_unsigned_extensions = true` 以加载自编定制扩展，同时继续关闭 `autoload`/`autoinstall` 并强制 `manifest.json` 路径约束与 SHA-256 校验；生产发布前须切换为扩展验签或静态编入定制 `libduckdb`。所有内部扩展函数均在 `modorch-fedengine-ddl` 白名单外显式封堵。
 
 ## 1. 参考采用与实施顺序
 
-参考实现：`federated-query-engine-9.00.00.00`。该外部工程按开发环境单独获取，不依赖维护者机器上的绝对路径。
+参考实现：`federated-query-engine-9.00.00.00`（排除 UNS/vxBase/iSYS、独立宿主服务、supOS 鉴权许可及 `pg_adapter`）。
 
-| 参考文件 | 可采用的机制 | 不能据此推断的能力 |
+| 参考文件 | 可采用的机制 | 不能据此推断的能力 / 禁止照搬项 |
 | --- | --- | --- |
 | pkg/utils/query_parameters.go | 在原始 AST 上确定参数数量、声明类型和显式 cast，冲突/未解析类型明确报错 | 该文件也有类型支持白名单，不是完整 PG 参数推断器 |
 | pkg/utils/numeric_parameter.go | 文本/二进制 numeric 解码、精度/scale 检查、精确 SQLSTATE | 明确限制为 DECIMAL(38)，不能作为任意精度 numeric 或 PG 除法已经实现的证据 |
 | pkg/utils/query_result_encoding.go | PG 文本/二进制编码独立于 HTTP；数组保留元素类型与 NULL | 二进制数组实现有一维限制，不能据此承诺任意多维数组 |
-| internal/modules/kernel/pgserver/biz/fed/pg_compat_rewrite.go | AST 改写、目录上下文分流 | 部分大小/扫描函数使用常量占位；regclass 查找模板不足以覆盖完整名称解析与权限，不能照搬为最终行为 |
-| internal/initiators/duckdb/biz/relational_metadata_* | 分类事实、稳定身份、完整枚举后淘汰、失败保留、原子投影 | 参考本身的局部测试和历史部署不能替代本项目验收 |
+| internal/modules/kernel/pgserver/biz/fed/{pg_compat_rewrite.go,pg_settings.go} | AST 改写、GUC/SHOW 响应与目录上下文分流 | 部分大小/扫描函数使用常量占位、regclass 模板猜测不得照搬；不照搬 BEGIN/COMMIT No-Op 假事务 |
+| internal/initiators/duckdb/biz/{util.go,mysql_cast.go,mysql_pushdown*,greenplum_cross_pushdown.go,pushdown_projection.go} | 跨源类型映射、非法 CAST 拦截、方言/标识符纠偏与受控读下推 | 必须受 `modorch-fedengine-policy` / `ddl` 绑定与授权门禁约束，绝不绕过虚拟库权限 |
+| internal/initiators/duckdb/biz/{metadata_pressure.go,remote_metadata_spool.go,remote_metadata_repair.go} | 库内内存压力控制、有界磁盘 Spool、按需修复队列 | 不照搬 `--metadata-scanner-worker` 子进程与修改宿主全局参数 |
+| internal/mutation/ + internal/ddl/ | 各源写入精度规则与能力校验原则 | Rust 侧直接基于 `_fedengine` 快照与 AST 绑定组装参数调用去版本化扩展接口，不经 `pg_bind_*` |
 
-建议顺序为：**批次 A 协议与名称解析 → 首次升级回归 → 批次 B 元数据完善 → 批次 C 类型执行能力 → 批次 D 规模与生产验证 → 最终发布验收**。类型执行能力先做对照原型，再分项交付；第一版修复发布不必等待全部复杂类型完成。任何未通过项仍保留在整体遗留清单。
+建议收口顺序为：**批次 0（5 扩展去版本化与 DuckDB v2.0 接入底座）→ 批次 1（查询准确度、参数契约与 PG 协议）→ 批次 2（多数据源接入与受控读下推）→ 批次 3（Rust 原生 Guarded CRUD/DDL 闭环）→ 批次 4（高级元数据、库内压力治理与规模/耐久/生产遗留）**。任何未通过原型及实库对照验收的变体保持 `0A000` 关闭。
 
-## 2. 批次 A：参数契约与 regclass
+## 2. 批次 0：5 扩展去版本化与 DuckDB v2.0 接入底座
 
-### 2.1 原始参数描述与执行参数映射分离
+1. **5 扩展 `2.0.0` 分支接口去版本化**：在 `duckdb-postgres`、`duckdb-mysql`、`oracle_scanner`、`sqlserver_scanner`、`odbc_catalog_scanner` 的 `2.0.0` 分支移除全部 `_v1`..`_v5`、`_scoped_v1`..`_scoped_v4` 冗余命名及历史分叉：
+   - CRUD：`<product>_crud_metadata`、`<product>_guarded_mutation`、`<product>_guarded_insert_returning`；
+   - DDL：`postgres_ddl_capabilities`/`mysql_ddl_capabilities`、`postgres_ddl_describe`/`mysql_ddl_describe`、`postgres_guarded_ddl`/`mysql_guarded_ddl`；
+   - 缓存与关系元数据：使用 DuckDB `TableFunctionSet` 重载统一 **`pg_clear_cache`**、**`mysql_clear_cache`**（0 参/1 参）、**`oracle_relational_metadata`**、**`odbc_relational_metadata`**（3 参/4 参）。
+2. **开发期加载与 N 对 1 扩展映射**：在 `modorch-fedengine-duckdb` 启用开发期 `allow_unsigned_extensions = true`（主实例与隔离采集实例一致），保持 `autoload`/`autoinstall = false` 与 `manifest.json` SHA-256 校验；支持多方言映射到 5 个 `*_scanner.duckdb_extension`，禁止定制扩展触发官方在线 `INSTALL` 覆盖，并按扩展对齐版本探测查询。（注：`oracle_scanner`、`sqlserver_scanner`、`odbc_catalog_scanner` 运行时依赖宿主环境的 `libodbc.so.2` 与对应厂商 ODBC 驱动。）
+3. **内部函数安全封堵**：`modorch-fedengine-ddl` 显式拒绝业务 SQL 调用上述 5 个扩展的任何内部/管理函数。
+
+## 3. 批次 1（原批次 A 与 DECIMAL(38)）：准确度、参数契约与 regclass
+
+### 3.1 原始参数描述与执行参数映射分离
 
 1. 在任何兼容改写前，从原始 SQL AST 建立参数表，记录序号、客户端声明 OID、显式 cast、函数签名和解析结果。不能再从被改成 NULL 的 SQL 推导客户端参数数量。
 2. 分开维护客户端参数契约和执行参数映射。客户端 ParameterDescription/Bind 使用原始序号和类型；DuckDB 使用执行 SQL 实际引用的参数。若执行 SQL 不再引用某些参数，保留客户端槽并在完成数量、格式和值校验后，不将其传给 DuckDB。
@@ -32,102 +45,53 @@
 
 主要落点为 pg-compat/planner、query 参数处理、contract 中的描述符/执行请求及 pgwire extended 路径；复用既有模块，不新增无必要的组件。
 
-验收以真实 PG 为基线：四个问题函数的参数数量和 OID 正确；显式声明、无声明、NULL、文本/二进制、错误长度、重复参数、参数间隙及混合表达式均对照。消除合法请求的错误 08P01，同时保留真正 Bind 数量不符的协议错误。
+验收以真实 PG 为基线：参数数量和 OID 正确；显式声明、无声明、NULL、文本/二进制、错误长度、重复参数、参数间隙及混合表达式均对照。消除合法请求的错误 08P01，同时保留真正 Bind 数量不符的协议错误。
 
-### 2.2 名称解析与输入/输出语义分离
+### 3.2 `DECIMAL(38)` 精确数值、Wire 类型与非法 CAST 拦截
+
+1. 结合 5 个定制扩展自带的 `*_exact_numeric` / `mysql_exact_decimal` 标量与排序规则，完成文本及 base-10000 二进制 `DECIMAL(38)` 解码与输出编码（保留 scale 尾部零与 `-0`），消除无界 `numeric` 退化 `DOUBLE` 导致的精度/排序失真；联动核对 `__fed_pg_divide` 护栏（超出能力维持 `0A000`）。
+2. 补齐 `TINYINT`/`UTINYINT`/`USMALLINT`/`UINTEGER`/`UBIGINT`、`UUID`、`INTERVAL`、`POINT(STRUCT(x,y))` 及标准 1D 数组 Wire 编码闭环；在绑定阶段拦截非法类型 `CAST` 返回 `0A000`/`42704`。
+
+### 3.3 名称解析、`SHOW` 与错误规范化
 
 - regclass 参数解码区分二进制 OID、文本数值 OID和待解析名称。名称在有当前用户、数据库、search_path、权限及快照上下文的位置解析，不在无上下文的标量 codec 中猜测。
 - 常量 cast、to_regclass 和参数绑定共享名称解析器，覆盖 schema 限定、带引号名称、大小写、同名遮蔽、可见性和当前库三段名称。
 - 文本输出按 PG 规则选择可见的简写名或限定名并正确引用；无法解析的数值 OID 按 PG 规则处理。二进制仍输出 OID，不改变为名称字符串。
 - regtype/regproc 等单独制定查找与显示规则；函数重载语义不能复用表名称解析冒充完成。
+- 补齐基于 AST 的 `SHOW`/`current_setting` 完整响应集合（未知 GUC 返回 `42704`）与标准化 SQLSTATE 错误映射及凭据/原始 SQL 脱敏。
 - Bind 后的值解释与实际执行纳入快照/代际校验，跨刷新或删除重建不能命中另一对象；既有 Prepared 失效和租约约束继续生效。
 
 验收包括目前复现的 22P02 名称绑定、regclass 文本显示，以及跨 search_path、权限隐藏、删除重建、刷新、不同结果格式的 PG 对照。
 
-## 3. 首次升级与回归
+## 4. 批次 2：多数据源扩展与受控读下推
 
-批次 A 达标后，先把已完成的在线虚拟库 API、表级统计等累计代码和本批修复一起形成可追溯版本，结束长期运行旧版而只验证工作区的状态。
+1. 扩充 `DataSourceKind`、凭据 JSON / Secret 挂载与发现流程，通过 5 个定制扩展覆盖：`postgres` / `greenplum` / `kingbasees`、`mysql` / `mariadb` / `starrocks`、`oracle`、`sqlserver`、`dameng` / `db2` / `hana`，并纳入源端类型映射与统一按作用域清理缓存（`CALL pg_clear_cache('alias')` / `CALL mysql_clear_cache('alias')` / `sqlserver_clear_cache()` / `odbc_catalog_clear_cache()`）。
+2. 在 `modorch-fedengine-ddl` AST 绑定、`modorch-fedengine-policy` 授权及 `DDLReadFence` 之后实施受控单源/特定跨源读下推与方言纠偏（MySQL/StarRocks 标识符与方言改写、Greenplum 跨源下推、大小写折叠重名投影列去重）。
 
-发布前完成独立候选实例验证；正常排空旧进程，备份配置与管理库，记录 schema 版本、二进制摘要和回退方式，再切换当前本地服务。涉及持久化格式不兼容时，回退程序与管理库备份必须匹配。
+## 5. 批次 3：Rust 原生 Guarded CRUD / DDL 闭环（已实现并本地自验）
 
-部署后验收实际进程路径/摘要、空 database 登录、虚拟库与源库枚举、默认系统对象隐藏、CRUD、跨源查询、权限、在线管理、Prepared、取消/Portal、DDL 后刷新、重启恢复，以及 DBeaver GUI、JDBC 和当前可用业务源。已确认不可用源继续跳过并明确标记；不以不存在的外部条件阻塞其他验收。
+1. **Guarded DML**：`modorch-fedengine-ddl` 支持单标识列 `INSERT ... RETURNING <col>` 与多方言 Guarded Mutation AST 重写；`modorch-fedengine-duckdb::guarded_crud` 对接 `<product>_crud_metadata` / `<product>_guarded_mutation` / `<product>_guarded_insert_returning` 及 `source_diagnostics`，严格区分 `COMMITTED` / `CONFIRMED_NOT_EXECUTED` / `CONFIRMED_ROLLED_BACK` / `COMMIT_STATUS_UNKNOWN`（`.unknown()`）；`pgwire/simple.rs` 与 `worker.rs` 支持 returning 结果集返回。
+2. **Guarded DDL**：`modorch-fedengine-ddl` 支持 `RENAME TABLE` / `RENAME INDEX` / `ADD|DROP CONSTRAINT` / `TRUNCATE` 等 AST 与 v2..v5 类型意图抽取；`modorch-fedengine-duckdb::guarded_ddl` 实现 `<product>_ddl_capabilities` 校验、`<product>_guarded_ddl` 调用与唯一 `_fedengine.ddl_operations` 账本落库，保持 DDL 后异步刷新与 `MetadataStale` 状态流转（详细动作门禁见 [DDL 能力矩阵](ddl-capability-matrix.md)）。
+   - 说明：本地单元测试与 `analyze`/`struct_pack`/returning 解码/账本测试均已通过；真库 live PG/MySQL/Oracle/SQLServer/Dameng/DB2 Guarded 端到端待连接对应远端环境与扩展 `make` 构建验证。
 
-这次发布可以是明确列出剩余类型边界的版本，不能将其标为完整 PG 兼容验收完成。
+## 6. 批次 4（原批次 B、C 长期项与批次 D）：高级元数据、压力治理与规模/耐久验收
 
-## 4. 批次 B：高级元数据、统计和源身份
+### 6.1 表达式、约束与统计完善（库内实现已就绪）
 
-### 4.1 表达式与约束
+- 11 种数据源元数据能力矩阵（`MetadataSupportMatrix`）覆盖核心结构、列属性、约束、索引（含单体大小/扫描计数 `pg_stat_all_indexes`）、关系与非值列统计（`null_frac`/`avg_width`/`n_distinct`）及存储/活跃计数，未认证部分保持显式 `unsupported`，不造假定义。
+- `modorch-fedengine-catalog` 增加 `NamesCache` + `SingleFlight` 并发合并，避免相同快照并发查重击穿透存储；`modorch-fedengine-management::demand_repair` 增加有界单飞优先级按需修复队列。
 
-按源产品、版本、对象种类、字段建立支持矩阵，为每个 partial/unknown 记录原因。原生事实、可安全翻译的 PG 展示文本、引用解析和完整枚举分别验收。
+### 6.2 高阶复杂类型与生产发布专项目标（独立长期项，不阻塞当前开发收口）
 
-优先补齐确定性的默认值、生成式、索引键项/谓词和约束属性；翻译走 AST 和明确能力规则，覆盖引号、列顺序和 NULL 语义。所有依赖均纳入授权检查。不同数据库语义无法忠实表示的对象保留原始事实及明确 unsupported 状态，不因客户端需要而造定义。
+- **超过 38 位任意精度 numeric、JSONB（OID 3802）及多维/非 1 下界业务数组**：必须经独立原型验证通过源读取、值表示、算术/运算符与 PG Wire 全链路后按单独里程碑验收；未达标前继续返回 `0A000`。
+- **生产发布扩展验签**：生产打包阶段将开发期 `allow_unsigned_extensions = true` 收紧为自有公钥验签或静态编入定制 `libduckdb`。
+- **与 `magicDataHub` 联合宿主验收**：完成 MQTT + FedEngine 同 Application 联合资源预算与双库组合验收。
 
-### 4.2 统计完善
+### 6.3 规模、库内压力治理与故障验收（库内机制就绪，10k 本地规模回归已实测）
 
-- 采集索引单体大小和扫描计数，绑定稳定索引身份；索引分类失败时保留旧事实，成功完整枚举才允许淘汰。
-- 补 pg_stat_all_tables/pg_stat_user_tables/索引统计等实际需要的 PG 目录字段契约。严格区分远端统计、刷新时刻和 FedEngine 本地运行统计，继续按授权范围投影。
-- 动态 fork 参数参与正常 text 类型解析和执行；NULL、非法 fork、参数与表达式的错误行为对照 PG。
-- 数据库大小必须先明确物理数据库与授权/纳管范围的归属。只有归属和授权成立时才暴露源物理库总量；虚拟库的共享来源不去重后冒充独占空间，也不简单重复累加。未知值保持 NULL。
-- 列统计先补 null_frac、avg_width、n_distinct 等非值指标。most_common_vals/histogram_bounds 可能包含业务值，若纳入目标，需要额外验证源端可见性及本地授权，不默认通过管理采集公开。非值指标完成不能记作完整列分布已经实现。
-
-验收包括源端值对照、索引重建身份、授权隐藏、旧快照、分类失败保留、成功 NULL 清除、并发变化下的事实标记及真实客户端读取。MySQL 原生长度指标不转换为 PG fork，虚拟 foreign table 的本地物理占用继续按已定义边界处理。
-
-### 4.3 MySQL 离线同名重建
-
-缺少可靠源身份时，无法仅凭当前表名和结构证明离线期间没有删除重建，需要把能力与恢复策略显式化：
-
-1. 有可靠源身份或连续 DDL 证据时据此追踪；连续证据需要另行定义接入、缺口判断和权限，不能默认启动 CDC 或写入远端标记。
-2. 没有证据时，保留现有普通停用恢复策略，并报告身份连续性未被证明。
-3. 新增可选严格恢复模式：发生无法证明连续性的离线区间时，切换身份 epoch、重建本地身份并使旧 Prepared/缓存失效。它保证不误用旧身份，但不声称只识别并更新真正重建的表。
-
-建议不默认改变此前确认的普通停用恢复行为；要求强身份保证的部署显式采用严格模式。两种策略分别验收，并把无法精确识别的范围保留在能力说明。
-
-## 5. 批次 C：numeric、JSONB 和业务数组
-
-这是一项类型与执行能力工程。必须贯通源读取、值表示、表达式、结果元数据、参数、计算和 wire；仅补 codec 或单个除法函数无法完成。
-
-### 5.1 精确 numeric
-
-先用 PG 对照原型验证任意精度十进制值、scale/typmod、舍入、溢出和特殊值的表示及算术规则。推荐独立的精确数值执行路径；源端读取超过 DuckDB 原生精度的值也必须无损进入该路径。内部序列化不能直接作为普通文本参与比较、排序或聚合。
-
-原型必须同时打通：超过 38 位的输入/输出、除法结果 scale、嵌套算术、比较、ORDER BY、GROUP BY、JOIN 键、sum/avg、NULL、错误 SQLSTATE、Describe 稳定类型，以及文本/二进制参数和结果。要有跨源实际执行证据，不能只证明单源下推或常量计算。
-
-以原型决定采用经过验证的自定义类型/算子执行方案，或引入独立精确执行层；尚未证明 DuckDB 当前扩展接口能承载全部操作，不能提前把 UDF 路线标为确定可行。若需要增加执行后端，应另附架构与依赖评审，复用现有授权、取消、资源配额和服务租约。
-
-原型未达标前保留 0A000，不以 DOUBLE、VARCHAR 或固定 scale 冒充完整 PG numeric。DECIMAL(38) 子集即使改善，也应单独验收，完整任意精度目标仍列为未完成。
-
-### 5.2 JSONB
-
-补 OID 3802 及对应数组关联、文本输入和二进制版本头，采用保留数值精度的 JSON 值表示。明确重复键、键顺序、JSON null/SQL NULL、数字范围、非法输入及规范化输出规则。
-
-随后按实际 SQL 矩阵实现 cast、字段/路径读取、相等与包含、排序/分组等需要的运算；源端类型映射和查询结果同样验收。wire 传输、构造与查询算子分别标记能力；编解码完成不能记为完整 JSONB 运算完成。
-
-### 5.3 业务数组
-
-模型保留元素 OID、维数、每维长度、下界、NULL 数组和 NULL 元素，普通数组与目录 vector 分开。先交付常用标量的一维数组完整参数/结果闭环，再补矩形多维数组；空数组、不同下界、下标、切片、比较及 ANY/ALL 按 PG 规则逐项验证。
-
-DuckDB List 不携带全部 PG 数组信息，需要显式保存或在执行层处理；不能统一重置下界为 1。不能忠实表示的结构保持明确不支持，多维能力仍留在剩余清单。
-
-## 6. 批次 D：规模、资源和故障验证
-
-基准覆盖 1k/10k 远端对象，分别记录采集、类型探测、身份分配、持久化、投影和全实例屏障时间；同时测查询 p95/p99、最大停顿、RSS、临时空间及远端请求数。先根据目标硬件和业务 SLO确定预算，再判定达标，不能由本地投影耗时推断整条链路合格。
-
-并发场景覆盖查询与刷新、在线修改、Prepared、悬停 Portal、取消和停用。保持远端 I/O 在短发布事务之外；先完成事实准备，再在固定顺序的实例屏障/单写事务内发布。必要优化必须保留原子快照和身份/授权语义。
-
-当前代码已将远端采集隔离到独立实例，加入共享及单操作内存额度、按源批量身份处理、按行数和估算字节数刷新的投影批次、不可见事务准备和短屏障提交；checkpoint 在屏障释放后执行。进一步移除完整旧目录载入、VARCHAR 投影暂存和虚拟对象图复制：旧事实逐对象访问，源目录直接写入有类型的表，虚拟映射从源投影生成；启动和控制路径只读目录头。OID、分类失败保留、授权过滤及快照原子性保持原契约，不增加历史格式兼容分支。
-
-PostgreSQL 在 Active、完整结构事实未变化且非 stale 时，普通刷新保留正式扫描器缓存；结构摘要包含默认值、约束、索引和视图定义，动态统计不参与。结构变化、事实不完整、stale 恢复以及 MySQL 继续清缓存。锁定扩展的清理仍为产品级，结构变化时的跨来源冷绑定与来源级缓存清理仍需后续扩展专项处理，不能把无变化刷新优化视为解决所有 DDL 冷启动场景。
-
-可复用的 10k 表／100k 列连续刷新及独立 release 进程重复回归入口见[开发文档](development.md#实际-release-进程规模回归)，锁顺序、阶段 RSS 观测及部署预算见[管理 API](management-api.md#目录刷新与资源预算)。固定元数据工作负载继续以 RSS ≤1024MiB、最大停顿 ≤1s、p99 ≤空载基线+100ms、末三轮 RSS 波动 ≤64MiB、查询零错误验收；800MiB/500ms 是进一步优化目标。1GiB 不是所有部署的进程硬限额；部署定容必须加入正式查询、并发采集、Rust/原生开销及外部 cgroup 文件缓存，不能用加大额度代替效率验收。这些改动不替代开放环吞吐量、临时空间、远端请求数以及下述故障和耐久专项验收。
-
-故障矩阵覆盖源断连、超时、网络中断、磁盘满、资源额度耗尽以及 Intent/Attach/Snapshot/Publish 各阶段进程强杀。验收无半份目录、无旧代次覆盖、无已确认提交的 DDL 自动重放，取消后 worker/租约/额度真实归还，恢复结果可观察。
-
-长时测试的时长、并发和硬件规格需记录；建议以至少一个 24 小时代表性负载作为首轮耐久验证，仍不等于覆盖全部生产环境。生产验收记录与单元测试、隔离容器结果分别保留。
+- `modorch-fedengine-duckdb::memory` 提供预算内 RSS 压力分级采样（`Normal`/`Elevated`/`Critical`）、`temp_directory` 有界磁盘 Spool（`BoundedTempSpool`）及残留清理；`runtime::isolated_io` 结合中断监控确保取消后真实释放租约与工作连接；可复用的本地 10k 表投影规模基线与发布验证命令见[开发文档](development.md#规模与故障验证边界)。
+- 外部多源实库 24 小时耐久与强杀故障矩阵需在真实环境独立执行。
 
 ## 7. 每批交付与完成定义
 
-每批必须交付实现差异、支持矩阵更新、真实 PG 对照、正常/异常/权限/取消/恢复证据、适用的 fmt/test/clippy/doc/build/smoke 和机器报告。发布另记录运行版本、迁移/回退和部署后验收。未运行的项目标 NotRun，外部不可用条件标环境缺口，不记为通过。
-
-已实现并通过验证的条目从功能遗留清单移出；只确认了能力边界、原型未通过或尚未部署的条目分别保留状态。若要将某项排除本期目标，须明确确认范围调整，不能靠改成 NULL 或文档标注宣称功能已完成。
-
-用户已确认本方案中的三项新增范围选择：任意精度 numeric 采用原型验证后确定执行路线；数组按一维/多维独立里程碑验收；MySQL 保持当前默认身份策略并提供可选严格恢复模式。批次 A 的参数和 regclass 行为以真实 PG 对照为直接标准。
+每批必须交付实现差异、支持矩阵更新、真实 PG/源端对照、正常/异常/权限/取消/恢复证据、适用的 fmt/test/clippy/doc/build/smoke 和机器报告。未运行的项目标 `NotRun`，外部不可用条件标环境缺口，不记为通过。已实现并通过验证的条目方可从清单移出。

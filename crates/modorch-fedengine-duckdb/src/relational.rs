@@ -42,7 +42,7 @@ fn rows(
         }
         let mut value: Value = serde_json::from_str(&json)
             .map_err(|_| EngineError::new("55000", "invalid collector JSON"))?;
-        if source.kind == DataSourceKind::Mysql {
+        if source.kind.is_mysql_family() {
             for field in [
                 "unique",
                 "primary",
@@ -185,7 +185,7 @@ fn apply(
                     ));
                 }
                 let mut props: ColumnProperties = decode(value.clone())?;
-                props.default = if kind == DataSourceKind::Mysql {
+                props.default = if kind.is_mysql_family() {
                     mysql_default(&value)
                 } else {
                     expr(&value, "_default", kind)
@@ -505,6 +505,34 @@ pub(super) fn capture(
     objects: &mut Objects,
     budget: usize,
 ) -> Result<()> {
+    if !source.kind.is_postgres_family() && !source.kind.is_mysql_family() {
+        for obj in objects.values_mut() {
+            for category in [
+                "details",
+                "column_properties",
+                "constraints",
+                "indexes",
+                "statistics",
+                "storage",
+                "column_statistics",
+                "activity",
+                "identity",
+            ] {
+                obj.metadata.status.insert(
+                    category.into(),
+                    MetadataStatus {
+                        support: MetadataSupport::Partial,
+                        unsupported_fields: vec!["extended_dialect_relational_metadata".into()],
+                        ..MetadataStatus::default()
+                    },
+                );
+            }
+            obj.metadata
+                .status
+                .insert("details".into(), MetadataStatus::success());
+        }
+        return Ok(());
+    }
     let scope = source
         .allowed_schemas
         .iter()
@@ -516,7 +544,7 @@ pub(super) fn capture(
     } else {
         scope
     };
-    let probe = if source.kind == DataSourceKind::Postgres {
+    let probe = if source.kind.is_postgres_family() {
         "SELECT current_setting('server_version_num')::text"
     } else {
         "SELECT VERSION()"
@@ -531,7 +559,7 @@ pub(super) fn capture(
         .query_row(&probe, [], |r| r.get(0))
         .map_err(engine_error)?;
     let mut mysql_checks = false;
-    let queries = if source.kind == DataSourceKind::Postgres {
+    let queries = if source.kind.is_postgres_family() {
         pg_queries(
             version
                 .parse()
@@ -580,7 +608,7 @@ pub(super) fn capture(
             Err(error) => MetadataStatus::failure(&error),
         };
         if category == "constraints"
-            && source.kind == DataSourceKind::Mysql
+            && source.kind.is_mysql_family()
             && !mysql_checks
             && status.complete
         {
@@ -588,11 +616,11 @@ pub(super) fn capture(
             status.scan_state = MetadataScanState::Partial;
             status.unsupported_fields.push("check_constraints".into());
         }
-        if category == "statistics" && source.kind == DataSourceKind::Mysql && status.complete {
+        if category == "statistics" && source.kind.is_mysql_family() && status.complete {
             status.support = MetadataSupport::Partial;
             status.unsupported_fields.push("page_counts".into());
         }
-        if category == "storage" && source.kind == DataSourceKind::Mysql && status.complete {
+        if category == "storage" && source.kind.is_mysql_family() && status.complete {
             status.support = MetadataSupport::Partial;
             status.scan_state = MetadataScanState::Partial;
             status
@@ -647,30 +675,52 @@ pub(super) fn capture(
             obj.metadata.status.insert(category.into(), status);
         }
     }
+    let matrix = MetadataSupportMatrix::for_kind(source.kind);
     let targets: std::collections::BTreeSet<_> = objects.keys().cloned().collect();
     for obj in objects.values_mut() {
-        if source.kind == DataSourceKind::Mysql {
+        for (cat, support, reason) in [
+            ("details", matrix.details, "dialect_details_unsupported"),
+            (
+                "column_properties",
+                matrix.column_properties,
+                "dialect_column_properties_unsupported",
+            ),
+            (
+                "constraints",
+                matrix.constraints,
+                "dialect_constraints_unsupported",
+            ),
+            ("indexes", matrix.indexes, "dialect_indexes_unsupported"),
+            (
+                "statistics",
+                matrix.statistics,
+                "dialect_statistics_unsupported",
+            ),
+            (
+                "column_statistics",
+                matrix.column_statistics,
+                "non_value_column_statistics",
+            ),
+            ("storage", matrix.storage, "dialect_storage_unsupported"),
+            ("activity", matrix.activity, "postgresql_activity_counters"),
+        ] {
+            if !obj.metadata.status.contains_key(cat) && support == MetadataSupport::Unsupported {
+                obj.metadata.status.insert(
+                    cat.into(),
+                    MetadataStatus {
+                        support,
+                        unsupported_fields: vec![reason.into()],
+                        ..MetadataStatus::default()
+                    },
+                );
+            }
+        }
+        if source.kind.is_mysql_family() {
             obj.metadata.status.insert(
                 "identity".into(),
                 MetadataStatus {
                     support: MetadataSupport::Partial,
                     unsupported_fields: vec!["offline_identity_continuity_unproven".into()],
-                    ..MetadataStatus::default()
-                },
-            );
-            obj.metadata.status.insert(
-                "column_statistics".into(),
-                MetadataStatus {
-                    support: MetadataSupport::Unsupported,
-                    unsupported_fields: vec!["non_value_column_statistics".into()],
-                    ..MetadataStatus::default()
-                },
-            );
-            obj.metadata.status.insert(
-                "activity".into(),
-                MetadataStatus {
-                    support: MetadataSupport::Unsupported,
-                    unsupported_fields: vec!["postgresql_activity_counters".into()],
                     ..MetadataStatus::default()
                 },
             );
@@ -741,6 +791,67 @@ pub(super) fn capture(
             .collect();
     }
     Ok(())
+}
+
+/// Explicit metadata category support matrix per data source dialect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct MetadataSupportMatrix {
+    pub(super) dialect: &'static str,
+    pub(super) core: MetadataSupport,
+    pub(super) details: MetadataSupport,
+    pub(super) column_properties: MetadataSupport,
+    pub(super) constraints: MetadataSupport,
+    pub(super) indexes: MetadataSupport,
+    pub(super) statistics: MetadataSupport,
+    pub(super) column_statistics: MetadataSupport,
+    pub(super) storage: MetadataSupport,
+    pub(super) activity: MetadataSupport,
+}
+
+impl MetadataSupportMatrix {
+    pub(super) fn for_kind(kind: DataSourceKind) -> Self {
+        let dialect = kind.dialect_name();
+        if kind.is_postgres_family() {
+            Self {
+                dialect,
+                core: MetadataSupport::Supported,
+                details: MetadataSupport::Supported,
+                column_properties: MetadataSupport::Supported,
+                constraints: MetadataSupport::Supported,
+                indexes: MetadataSupport::Supported,
+                statistics: MetadataSupport::Supported,
+                column_statistics: MetadataSupport::Supported,
+                storage: MetadataSupport::Supported,
+                activity: MetadataSupport::Supported,
+            }
+        } else if kind.is_mysql_family() {
+            Self {
+                dialect,
+                core: MetadataSupport::Supported,
+                details: MetadataSupport::Supported,
+                column_properties: MetadataSupport::Partial,
+                constraints: MetadataSupport::Partial,
+                indexes: MetadataSupport::Partial,
+                statistics: MetadataSupport::Supported,
+                column_statistics: MetadataSupport::Unsupported,
+                storage: MetadataSupport::Supported,
+                activity: MetadataSupport::Unsupported,
+            }
+        } else {
+            Self {
+                dialect,
+                core: MetadataSupport::Supported,
+                details: MetadataSupport::Unsupported,
+                column_properties: MetadataSupport::Unsupported,
+                constraints: MetadataSupport::Unsupported,
+                indexes: MetadataSupport::Unsupported,
+                statistics: MetadataSupport::Unsupported,
+                column_statistics: MetadataSupport::Unsupported,
+                storage: MetadataSupport::Unsupported,
+                activity: MetadataSupport::Unsupported,
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -888,5 +999,29 @@ mod tests {
             );
         }
         assert!(mysql_default(&json!({"_literal_type":"varchar","_default":null})).is_none());
+    }
+
+    #[test]
+    fn dialect_support_matrix_covers_all_sources_without_inventing_unsupported_facts() {
+        let pg = MetadataSupportMatrix::for_kind(DataSourceKind::Postgres);
+        assert_eq!(pg.activity, MetadataSupport::Supported);
+        assert_eq!(pg.column_statistics, MetadataSupport::Supported);
+
+        let sr = MetadataSupportMatrix::for_kind(DataSourceKind::Starrocks);
+        assert_eq!(sr.core, MetadataSupport::Supported);
+        assert_eq!(sr.activity, MetadataSupport::Unsupported);
+
+        for kind in [
+            DataSourceKind::Oracle,
+            DataSourceKind::Sqlserver,
+            DataSourceKind::Dameng,
+            DataSourceKind::Db2,
+            DataSourceKind::Hana,
+        ] {
+            let m = MetadataSupportMatrix::for_kind(kind);
+            assert_eq!(m.core, MetadataSupport::Supported);
+            assert_eq!(m.storage, MetadataSupport::Unsupported);
+            assert_eq!(m.constraints, MetadataSupport::Unsupported);
+        }
     }
 }

@@ -82,7 +82,7 @@ pub struct SourceOrganization {
 }
 impl SourceOrganization {
     pub fn native_key(&self, kind: DataSourceKind) -> String {
-        serde_json::to_string(&(kind.extension(), self.instance.key(), &self.database))
+        serde_json::to_string(&(kind.dialect_name(), self.instance.key(), &self.database))
             .expect("string tuple")
     }
     pub fn validate(&self, kind: DataSourceKind) -> Result<()> {
@@ -110,15 +110,23 @@ impl SourceOrganization {
 }
 pub fn system_database(kind: DataSourceKind, name: &str) -> bool {
     let name = name.to_ascii_lowercase();
-    match kind {
-        DataSourceKind::Postgres => matches!(
+    if kind.is_postgres_family() {
+        matches!(
             name.as_str(),
             "postgres" | "template0" | "template1" | "_fedengine"
-        ),
-        DataSourceKind::Mysql => matches!(
+        )
+    } else if kind.is_mysql_family() {
+        matches!(
             name.as_str(),
             "mysql" | "information_schema" | "performance_schema" | "sys" | "_fedengine"
-        ),
+        )
+    } else if kind == DataSourceKind::Sqlserver {
+        matches!(
+            name.as_str(),
+            "master" | "model" | "msdb" | "tempdb" | "_fedengine"
+        )
+    } else {
+        name == "_fedengine"
     }
 }
 /// A desired target reserves its outward identity before asynchronous activation.

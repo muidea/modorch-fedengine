@@ -552,11 +552,11 @@ pub(crate) fn build_guarded_plan(
     schema: String,
     owner: String,
 ) -> Result<Option<GuardedDdlPlan>> {
-    // Native *_guarded_ddl contract covers PostgreSQL and MySQL scanners; other sources stay on
+    // Native *_guarded_ddl contract covers PostgreSQL and MySQL/MariaDB scanners; other sources stay on
     // their configured adapter or fail closed in policy/execution.
     if !matches!(
         source.kind,
-        DataSourceKind::Postgres | DataSourceKind::Mysql
+        DataSourceKind::Postgres | DataSourceKind::Mysql | DataSourceKind::Mariadb
     ) {
         return Ok(None);
     }
@@ -565,7 +565,7 @@ pub(crate) fn build_guarded_plan(
             "ONLY and conditional DDL modifiers are disabled on guarded native DDL",
         ));
     }
-    let mysql = source.kind == DataSourceKind::Mysql;
+    let mysql = matches!(source.kind, DataSourceKind::Mysql | DataSourceKind::Mariadb);
     for name in [
         database.as_str(),
         schema.as_str(),

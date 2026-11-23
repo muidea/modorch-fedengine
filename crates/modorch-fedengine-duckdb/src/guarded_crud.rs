@@ -12,12 +12,12 @@ pub(super) fn crud_product(kind: DataSourceKind) -> Option<&'static str> {
         DataSourceKind::Postgres => Some("postgres"),
         DataSourceKind::Greenplum => Some("greenplum"),
         DataSourceKind::Kingbasees => Some("kingbase"),
-        DataSourceKind::Mysql => Some("mysql"),
+        DataSourceKind::Mysql | DataSourceKind::Mariadb => Some("mysql"),
         DataSourceKind::Oracle => Some("oracle"),
         DataSourceKind::Sqlserver => Some("sqlserver"),
         DataSourceKind::Dameng => Some("dameng"),
         DataSourceKind::Db2 => Some("db2"),
-        DataSourceKind::Mariadb | DataSourceKind::Starrocks | DataSourceKind::Hana => None,
+        DataSourceKind::Starrocks | DataSourceKind::Hana => None,
     }
 }
 
@@ -383,7 +383,7 @@ pub(super) fn execute(
         let info = parse_returning_descriptor(
             &descriptor,
             &ret.column,
-            plan.kind == DataSourceKind::Mysql,
+            matches!(plan.kind, DataSourceKind::Mysql | DataSourceKind::Mariadb),
         )?;
         Some(info)
     } else {

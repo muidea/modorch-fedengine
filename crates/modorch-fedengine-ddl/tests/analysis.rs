@@ -404,6 +404,28 @@ fn guarded_mutation_and_insert_returning_contracts() {
     assert!(!my_plan.native_sql.contains("RETURNING"));
     assert!(my_plan.native_sql.contains("VALUES (?, ?)"));
     assert_eq!(my_plan.returning.unwrap().column, "id");
+
+    let my_cast = a
+        .analyze("INSERT INTO mysql_erp.erp.items (id, name) VALUES ($1::INTEGER, $2::VARCHAR)")
+        .unwrap();
+    let my_cast_plan = modorch_fedengine_ddl::build_guarded_mutation_plan(
+        &my_cast.sql,
+        my_source,
+        my_cast.primary.as_ref().unwrap(),
+        None,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        my_cast_plan.native_sql.contains("VALUES (?, ?)"),
+        "{}",
+        my_cast_plan.native_sql
+    );
+    assert!(
+        !my_cast_plan.native_sql.contains("::"),
+        "{}",
+        my_cast_plan.native_sql
+    );
 }
 
 #[test]
@@ -506,6 +528,82 @@ fn guarded_ddl_v2_through_v5_intents_and_dialect_bounds() {
             .ddl_intent
             .unwrap()
             .into_guarded_plan(&a.sources[1], "erp".into(), "erp".into(), String::new())
+            .is_err()
+    );
+}
+
+#[test]
+fn pg_catalog_json_cast_unqualifies_to_json() {
+    let a = analyzer();
+    let res = a.analyze("SELECT '{\"a\":1}'::pg_catalog.json").unwrap();
+    assert!(res.sql.contains("JSON"), "{}", res.sql);
+    assert!(!res.sql.contains("pg_catalog.json"), "{}", res.sql);
+}
+
+#[test]
+fn mariadb_guarded_mutation_and_ddl_reuse_mysql_contract() {
+    let source = DataSourceDefinition {
+        id: DataSourceId("mdb".into()),
+        kind: DataSourceKind::Mariadb,
+        catalog_alias: "mdb_erp".into(),
+        secret_ref: "unused".into(),
+        organization: None,
+        default_schema: "erp".into(),
+        read_only: false,
+        ddl_enabled: true,
+        allowed_schemas: vec!["erp".into()],
+        enabled: true,
+    };
+    let a = Analyzer {
+        namespace: None,
+        sources: vec![source.clone()],
+        indexes: vec![],
+    };
+    let ins = a
+        .analyze("INSERT INTO mdb_erp.erp.items (id, name) VALUES ($1, $2) RETURNING id")
+        .unwrap();
+    let mut_plan = modorch_fedengine_ddl::build_guarded_mutation_plan(
+        &ins.sql,
+        &source,
+        ins.primary.as_ref().unwrap(),
+        ins.returning.as_ref(),
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        mut_plan.native_sql.contains("`erp`.`items`"),
+        "{}",
+        mut_plan.native_sql
+    );
+    assert!(
+        !mut_plan
+            .native_sql
+            .to_ascii_uppercase()
+            .contains("RETURNING"),
+        "{}",
+        mut_plan.native_sql
+    );
+    assert_eq!(mut_plan.returning.unwrap().column, "id");
+
+    let ddl = a
+        .analyze("CREATE TABLE mdb_erp.erp.notes (id INTEGER, body TEXT)")
+        .unwrap();
+    let ddl_plan = ddl
+        .ddl_intent
+        .unwrap()
+        .into_guarded_plan(&source, "erp".into(), "erp".into(), String::new())
+        .unwrap()
+        .unwrap();
+    assert_eq!(ddl_plan.contract_version, 5);
+
+    let mdb_not_null = a
+        .analyze("ALTER TABLE mdb_erp.erp.items ALTER COLUMN name SET NOT NULL")
+        .unwrap();
+    assert!(
+        mdb_not_null
+            .ddl_intent
+            .unwrap()
+            .into_guarded_plan(&source, "erp".into(), "erp".into(), String::new())
             .is_err()
     );
 }

@@ -464,10 +464,11 @@ impl VisitorMut for Binder<'_> {
         ControlFlow::Continue(())
     }
     fn pre_visit_expr(&mut self, e: &mut Expr) -> ControlFlow<EngineError> {
-        if let Expr::Cast { data_type, .. } = e
-            && let Err(err) = validate_cast_type(data_type)
-        {
-            return ControlFlow::Break(err);
+        if let Expr::Cast { data_type, .. } = e {
+            if let Err(err) = validate_cast_type(data_type) {
+                return ControlFlow::Break(err);
+            }
+            unqualify_pg_catalog_json(data_type);
         }
         if self.analyzer.namespace.is_some()
             && let Expr::CompoundIdentifier(parts) = e
@@ -655,6 +656,23 @@ fn validate_decimal_info(info: &ExactNumberInfo) -> Result<()> {
                 Ok(())
             }
         }
+    }
+}
+fn unqualify_pg_catalog_json(ty: &mut DataType) {
+    match ty {
+        DataType::Custom(name, modifiers)
+            if modifiers.is_empty()
+                && Analyzer::parts(name).is_ok_and(|parts| {
+                    parts.len() == 2 && parts[0] == "pg_catalog" && parts[1] == "json"
+                }) =>
+        {
+            *ty = DataType::JSON;
+        }
+        DataType::Array(ArrayElemTypeDef::AngleBracket(inner))
+        | DataType::Array(ArrayElemTypeDef::SquareBracket(inner, _)) => {
+            unqualify_pg_catalog_json(inner);
+        }
+        _ => {}
     }
 }
 pub(super) fn validate_cast_type(ty: &DataType) -> Result<()> {

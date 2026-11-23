@@ -29,7 +29,7 @@ pub(super) fn build_guarded_ddl_sql(
     diagnostics: bool,
 ) -> (String, Vec<duckdb::types::Value>) {
     let product = match plan.kind {
-        DataSourceKind::Mysql => "mysql",
+        DataSourceKind::Mysql | DataSourceKind::Mariadb => "mysql",
         _ => "postgres",
     };
     let mut args: Vec<duckdb::types::Value> = vec![
@@ -194,7 +194,7 @@ fn has_source_diagnostics(conn: &Connection, fn_name: &str) -> bool {
 
 fn check_ddl_capabilities(conn: &Connection, plan: &GuardedDdlPlan) -> Result<()> {
     let product = match plan.kind {
-        DataSourceKind::Mysql => "mysql",
+        DataSourceKind::Mysql | DataSourceKind::Mariadb => "mysql",
         _ => "postgres",
     };
     let cap_fn = format!("{product}_ddl_capabilities");
@@ -254,7 +254,7 @@ pub(super) fn execute(
     check_ddl_capabilities(conn, &effective)?;
 
     let product = match effective.kind {
-        DataSourceKind::Mysql => "mysql",
+        DataSourceKind::Mysql | DataSourceKind::Mariadb => "mysql",
         _ => "postgres",
     };
     let fn_name = format!("{product}_guarded_ddl");

@@ -59,17 +59,17 @@ pub fn build_guarded_mutation_plan(
     primary: &ObjectRef,
     returning: Option<&ReturningPlan>,
 ) -> Result<Option<GuardedMutationPlan>> {
-    // Guarded CRUD native functions exist for postgres/greenplum/kingbase/mysql/oracle/sqlserver/dameng/db2.
+    // Guarded CRUD native functions exist for postgres/greenplum/kingbase/mysql/mariadb/oracle/sqlserver/dameng/db2.
     if matches!(
         source.kind,
-        DataSourceKind::Mariadb | DataSourceKind::Starrocks | DataSourceKind::Hana
+        DataSourceKind::Starrocks | DataSourceKind::Hana
     ) {
         return Ok(None);
     }
     if returning.is_some()
         && !matches!(
             source.kind,
-            DataSourceKind::Postgres | DataSourceKind::Mysql
+            DataSourceKind::Postgres | DataSourceKind::Mysql | DataSourceKind::Mariadb
         )
     {
         return Err(EngineError::unsupported(
@@ -87,7 +87,7 @@ pub fn build_guarded_mutation_plan(
             if let TableObject::TableName(name) = &mut i.table {
                 rewrite_relation(name, source.kind, &source.catalog_alias)?;
             }
-            if source.kind == DataSourceKind::Mysql {
+            if matches!(source.kind, DataSourceKind::Mysql | DataSourceKind::Mariadb) {
                 // mysql_guarded_insert_returning fetches returning keys via LAST_INSERT_ID()/PK query
                 // and requires mysql_stmt_field_count == 0 on the prepared INSERT.
                 i.returning = None;
@@ -112,6 +112,14 @@ pub fn build_guarded_mutation_plan(
     }
 
     let res = visit_expressions_mut(&mut parsed[0], |expr| {
+        if question_marks
+            && let Expr::Cast { expr: inner, .. } = expr
+            && matches!(inner.as_ref(), Expr::Value(v) if matches!(v.value, Value::Placeholder(_)))
+        {
+            // Non-PG guarded engines bind typed parameters out-of-band via struct_pack/ODBC and
+            // reject PostgreSQL `::TYPE` placeholder cast syntax.
+            *expr = (**inner).clone();
+        }
         if let Expr::Value(v) = expr
             && let Value::Placeholder(p) = &mut v.value
         {

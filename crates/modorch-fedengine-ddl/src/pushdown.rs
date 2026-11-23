@@ -251,6 +251,16 @@ fn try_single_source_pushdown(
                 return Ok(None);
             }
         } else {
+            let has_json_cast = has_expr(
+                query,
+                |e| matches!(e, Expr::Cast { data_type, .. } if is_json_cast_type(data_type)),
+            );
+            if has_json_cast {
+                // Keep JSON casts on DuckDB while still validating non-JSON casts against
+                // StarRocks pushdown compatibility.
+                validate_starrocks_casts_excluding_json(query)?;
+                return Ok(None);
+            }
             rewrite_starrocks_query(query)?;
         }
     }
@@ -414,6 +424,39 @@ fn rewrite_starrocks_query(query: &mut Query) -> Result<()> {
                 Err(e) => return ControlFlow::Break(e),
             };
             *data_type = mapped;
+        }
+        ControlFlow::Continue(())
+    });
+    if let ControlFlow::Break(e) = flow {
+        return Err(e);
+    }
+    Ok(())
+}
+
+fn is_json_cast_type(ty: &DataType) -> bool {
+    match ty {
+        DataType::JSON => true,
+        DataType::Custom(name, modifiers) if modifiers.is_empty() => Analyzer::parts(name)
+            .is_ok_and(|parts| {
+                matches!(
+                    parts.as_slice(),
+                    [t] if t == "json"
+                ) || matches!(
+                    parts.as_slice(),
+                    [s, t] if s == "pg_catalog" && t == "json"
+                )
+            }),
+        _ => false,
+    }
+}
+
+fn validate_starrocks_casts_excluding_json(query: &mut Query) -> Result<()> {
+    let flow = visit_expressions_mut(query, |expr| {
+        if let Expr::Cast { data_type, .. } = expr
+            && !is_json_cast_type(data_type)
+            && let Err(e) = starrocks_cast_type(data_type)
+        {
+            return ControlFlow::Break(e);
         }
         ControlFlow::Continue(())
     });
@@ -876,5 +919,27 @@ mod tests {
 
         let param_sql = "SELECT sr_src.sales.t.id FROM sr_src.sales.t WHERE sr_src.sales.t.id = $1";
         assert_eq!(rewrite(param_sql, &sr, &defs).unwrap(), param_sql);
+    }
+
+    #[test]
+    fn starrocks_keeps_json_cast_local_and_still_rejects_interval_cast() {
+        let defs = vec![source("s1", DataSourceKind::Starrocks, "sr_src")];
+        let mut sr = BTreeSet::new();
+        sr.insert(DataSourceId("s1".into()));
+
+        for json_sql in [
+            "SELECT CAST(sr_src.sales.t.v AS JSON) FROM sr_src.sales.t",
+            "SELECT CAST(sr_src.sales.t.v AS pg_catalog.json) FROM sr_src.sales.t",
+        ] {
+            assert_eq!(rewrite(json_sql, &sr, &defs).unwrap(), json_sql);
+        }
+
+        let err = rewrite(
+            "SELECT CAST(sr_src.sales.t.v AS JSON), CAST('1 day' AS INTERVAL) FROM sr_src.sales.t",
+            &sr,
+            &defs,
+        )
+        .unwrap_err();
+        assert_eq!(err.sqlstate, "0A000");
     }
 }

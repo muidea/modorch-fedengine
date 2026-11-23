@@ -1403,6 +1403,7 @@ impl Rewrite<'_> {
                 "name" | "\"char\"" | "pg_node_tree" => Some("VARCHAR"),
                 "int2vector" => Some("SMALLINT[]"),
                 "oidvector" => Some("UINTEGER[]"),
+                "pg_catalog.json" | "pg_catalog.\"json\"" => Some("JSON"),
                 _ => None,
             };
             if let Some(duck) = duck {
@@ -1539,9 +1540,30 @@ impl Rewrite<'_> {
             ("format_type", 2) => {
                 let oid = p(0)?;
                 let modifier = p(1)?;
+                let pg_type_sql = scoped_catalog("pg_type", self.scope)?;
+                let typemod = format!("COALESCE(CAST({modifier} AS BIGINT),-1)");
                 format!(
-                    "(SELECT CASE WHEN t.oid=1700 AND ({modifier})>=4 THEN 'numeric('||CAST((CAST({modifier} AS INTEGER)-4)>>16 AS VARCHAR)||','||CAST((CAST({modifier} AS INTEGER)-4)&65535 AS VARCHAR)||')' WHEN t.oid=1043 AND ({modifier})>=4 THEN 'character varying('||CAST(CAST({modifier} AS INTEGER)-4 AS VARCHAR)||')' ELSE CASE t.typname WHEN 'int2' THEN 'smallint' WHEN 'int4' THEN 'integer' WHEN 'int8' THEN 'bigint' WHEN 'bool' THEN 'boolean' WHEN 'varchar' THEN 'character varying' ELSE t.typname END END FROM ({}) t WHERE t.oid={oid} LIMIT 1)",
-                    scoped_catalog("pg_type", self.scope)?
+                    "(SELECT CASE COALESCE(elem.oid,pt.oid) \
+                    WHEN 16 THEN 'boolean' \
+                    WHEN 20 THEN 'bigint' \
+                    WHEN 21 THEN 'smallint' \
+                    WHEN 23 THEN 'integer' \
+                    WHEN 700 THEN 'real' \
+                    WHEN 701 THEN 'double precision' \
+                    WHEN 1042 THEN CASE WHEN {typemod}>=4 THEN 'character('||CAST({typemod}-4 AS VARCHAR)||')' ELSE 'character' END \
+                    WHEN 1043 THEN CASE WHEN {typemod}>=4 THEN 'character varying('||CAST({typemod}-4 AS VARCHAR)||')' ELSE 'character varying' END \
+                    WHEN 1700 THEN CASE WHEN {typemod}>=4 THEN 'numeric('||CAST(((({typemod}-4)>>16)&65535) AS VARCHAR)||','||CAST((({typemod}-4)&65535) AS VARCHAR)||')' ELSE 'numeric' END \
+                    WHEN 1083 THEN CASE WHEN {typemod}>=0 THEN 'time('||CAST({typemod} AS VARCHAR)||') without time zone' ELSE 'time without time zone' END \
+                    WHEN 1114 THEN CASE WHEN {typemod}>=0 THEN 'timestamp('||CAST({typemod} AS VARCHAR)||') without time zone' ELSE 'timestamp without time zone' END \
+                    WHEN 1184 THEN CASE WHEN {typemod}>=0 THEN 'timestamp('||CAST({typemod} AS VARCHAR)||') with time zone' ELSE 'timestamp with time zone' END \
+                    WHEN 1266 THEN CASE WHEN {typemod}>=0 THEN 'time('||CAST({typemod} AS VARCHAR)||') with time zone' ELSE 'time with time zone' END \
+                    WHEN 1560 THEN CASE WHEN {typemod}>=0 THEN 'bit('||CAST({typemod} AS VARCHAR)||')' ELSE 'bit' END \
+                    WHEN 1562 THEN CASE WHEN {typemod}>=0 THEN 'bit varying('||CAST({typemod} AS VARCHAR)||')' ELSE 'bit varying' END \
+                    ELSE COALESCE(elem.typname,pt.typname) END \
+                    ||CASE WHEN elem.oid IS NOT NULL THEN '[]' ELSE '' END \
+                    FROM ({pg_type_sql}) pt \
+                    LEFT JOIN ({pg_type_sql}) elem ON pt.typelem<>0 AND pt.typlen=-1 AND elem.oid=pt.typelem \
+                    WHERE pt.oid=CAST({oid} AS BIGINT) LIMIT 1)"
                 )
             }
             ("obj_description", 1 | 2) | ("col_description", 2) => {
@@ -2065,5 +2087,30 @@ mod tests {
             };
             assert_eq!(plan.parameter_types.get(&1), Some(&expected));
         }
+    }
+    #[test]
+    fn format_type_uses_local_pg_type_with_array_and_precision_support() {
+        let (session, scope) = context();
+        let CompatibilityPlan::Metadata(plan) = plan_compatibility(
+            "SELECT pg_catalog.format_type(1007, -1), pg_catalog.format_type(1184, 3), CAST('{\"a\":1}' AS pg_catalog.json)",
+            &session,
+            &scope,
+            1,
+        )
+        .unwrap()
+        else {
+            panic!("not metadata");
+        };
+        assert!(!plan.sql.contains("format_type("), "{}", plan.sql);
+        assert!(plan.sql.contains("LEFT JOIN"), "{}", plan.sql);
+        assert!(
+            plan.sql.contains("pt.typelem <> 0 AND pt.typlen = -1"),
+            "{}",
+            plan.sql
+        );
+        assert!(plan.sql.contains("timestamp("), "{}", plan.sql);
+        assert!(plan.sql.contains("double precision"), "{}", plan.sql);
+        assert!(!plan.sql.contains("pg_catalog.json"), "{}", plan.sql);
+        assert!(plan.sql.contains("AS JSON"), "{}", plan.sql);
     }
 }

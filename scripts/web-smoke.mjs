@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { mkdtemp, readFile, writeFile, rm, readdir } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, writeFile, rm, readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, resolve, join } from 'node:path';
 import { parseArgs } from 'node:util';
@@ -16,14 +16,15 @@ const { values } = parseArgs({ options: {
 const temporary = await mkdtemp(join(tmpdir(), 'fedengine-web-'));
 const processes = [];
 const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
-async function until(fn, message, timeout = 15000) {
+async function until(fn, message, timeout = 15000, diagnose = null) {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
     const value = await fn();
     if (value) return value;
     await sleep(80);
   }
-  throw new Error(`Timed out: ${message}`);
+  const detail = diagnose ? await Promise.resolve(diagnose()).catch(error => `diagnose failed: ${error.message}`) : '';
+  throw new Error(detail ? `Timed out: ${message}\n${detail}` : `Timed out: ${message}`);
 }
 function launch(command, args, options) {
   const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'], ...options });
@@ -34,7 +35,22 @@ function launch(command, args, options) {
 }
 function running(child) {
   if (child.failure) throw child.failure;
-  if (child.exitCode !== null) throw new Error(`Process exited: ${child.output}`);
+  if (child.exitCode !== null || child.signalCode !== null) {
+    throw new Error(`Process exited (code=${child.exitCode}, signal=${child.signalCode}): ${child.output}`);
+  }
+}
+/** Format child process status and recent output for timeout diagnostics. */
+function childSummary(child) {
+  return `pid=${child.pid} exitCode=${child.exitCode} signalCode=${child.signalCode}\n${child.output.slice(-4000)}`;
+}
+/** Read DevTools WebSocket endpoint from Chrome's DevToolsActivePort file if ready. */
+async function readDevToolsPort(profileDir) {
+  try {
+    const [port, wsPath] = (await readFile(join(profileDir, 'DevToolsActivePort'), 'utf8')).trim().split(/\r?\n/u);
+    return /^\d+$/u.test(port ?? '') && wsPath?.startsWith('/devtools/') ? `ws://127.0.0.1:${port}${wsPath}` : null;
+  } catch {
+    return null;
+  }
 }
 class DevTools {
   constructor(socket) {
@@ -84,9 +100,15 @@ try {
     break;
   }
   const engine = launch(binary, ['--config', join(temporary, 'application.toml')], { env });
-  const address = await until(() => {
-    running(engine); return /management_address=Some\((127\.0\.0\.1:\d+)\)/u.exec(engine.output)?.[1];
-  }, 'FedEngine ready');
+  const address = await until(
+    () => {
+      running(engine);
+      return /management_address=Some\((127\.0\.0\.1:\d+)\)/u.exec(engine.output)?.[1];
+    },
+    'FedEngine ready',
+    30000,
+    () => `binary=${binary} ${childSummary(engine)}`,
+  );
   const origin = `http://${address}`;
   async function api(path, method = 'GET', body = null) {
     const response = await fetch(`${origin}/api/v1/${path}`, {
@@ -101,12 +123,64 @@ try {
       return ['Succeeded', 'Failed', 'Interrupted'].includes(current.status) && current;
     }, 'operation completion');
   }
-  const browser = launch(values.chrome, ['--headless=new', '--no-sandbox', '--disable-gpu', '--no-first-run', '--no-default-browser-check',
-    '--remote-debugging-address=127.0.0.1', '--remote-debugging-port=0', `--user-data-dir=${temporary}/chrome`, 'about:blank']);
-  const endpoint = await until(() => { running(browser); return /DevTools listening on (ws:\/\/[^\s]+)/u.exec(browser.output)?.[1]; }, 'Chromium ready');
-  const browserOrigin = new URL(endpoint).origin.replace('ws:', 'http:');
-  const targets = await (await fetch(`${browserOrigin}/json/list`)).json();
-  const socket = new WebSocket(targets.find(target => target.type === 'page').webSocketDebuggerUrl);
+  const chromeProfile = join(temporary, 'chrome');
+  await mkdir(chromeProfile, { recursive: true });
+  const browserEnv = { ...process.env, DBUS_SESSION_BUS_ADDRESS: '/dev/null', NO_AT_BRIDGE: '1' };
+  delete browserEnv.DISPLAY;
+  delete browserEnv.WAYLAND_DISPLAY;
+  const browser = launch(values.chrome, [
+    '--headless=new',
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-dev-shm-usage',
+    '--disable-gpu',
+    '--no-first-run',
+    '--no-default-browser-check',
+    '--password-store=basic',
+    '--use-mock-keychain',
+    '--disable-background-networking',
+    '--disable-component-update',
+    '--disable-default-apps',
+    '--disable-extensions',
+    '--disable-sync',
+    '--metrics-recording-only',
+    '--mute-audio',
+    '--no-pings',
+    '--disable-crash-reporter',
+    '--remote-debugging-address=127.0.0.1',
+    '--remote-debugging-port=0',
+    `--user-data-dir=${chromeProfile}`,
+    'about:blank',
+  ], { env: browserEnv });
+  const endpoint = await until(
+    async () => {
+      running(browser);
+      return /DevTools listening on (ws:\/\/[^\s]+)/u.exec(browser.output)?.[1] ?? await readDevToolsPort(chromeProfile);
+    },
+    'Chromium ready',
+    60000,
+    () => readFile(join(chromeProfile, 'DevToolsActivePort'), 'utf8').catch(() => '<missing>').then(
+      portFile => `chrome=${values.chrome} portFile=${JSON.stringify(portFile)} ${childSummary(browser)}`,
+    ),
+  );
+  const browserOrigin = new URL(endpoint).origin.replace(/^ws:/u, 'http:');
+  const pageTarget = await until(
+    async () => {
+      running(browser);
+      try {
+        const response = await fetch(`${browserOrigin}/json/list`);
+        if (!response.ok) return null;
+        const targets = await response.json();
+        return targets.find(target => target.type === 'page' && target.webSocketDebuggerUrl) ?? null;
+      } catch {
+        return null;
+      }
+    },
+    'Chromium page target',
+    30000,
+    () => `endpoint=${endpoint} ${childSummary(browser)}`,
+  );
+  const socket = new WebSocket(pageTarget.webSocketDebuggerUrl);
   await once(socket, 'open'); cdp = new DevTools(socket);
   const exceptions = [], writes = [], blocked = [];
   cdp.on('Runtime.exceptionThrown', event => exceptions.push(event.exceptionDetails.exception?.description ?? event.exceptionDetails.text));

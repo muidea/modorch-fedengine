@@ -220,6 +220,11 @@ pub fn authorize(config: &Config, request: &Authorize) -> Result<()> {
         if a.kind != Kind::Query && source.read_only {
             return Err(EngineError::denied("data source is read-only"));
         }
+        if a.kind != Kind::Query && source.kind == DataSourceKind::Starrocks {
+            return Err(EngineError::unsupported(
+                "StarRocks data sources are read-only; writes and DDL are not enabled",
+            ));
+        }
         let action = if a.kind == Kind::Query
             || (a.kind == Kind::Ddl && a.primary.as_ref().is_some_and(|p| p != object))
         {

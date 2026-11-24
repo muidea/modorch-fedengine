@@ -709,7 +709,15 @@ pub fn plan_with_parameters(
     pid: i32,
     declared: &BTreeMap<usize, PgType>,
 ) -> Result<CompatibilityPlan> {
-    let mut parsed = parse_pg(sql)?;
+    let mut parsed = match parse_pg(sql) {
+        Ok(p) => p,
+        Err(_) if crate::session::is_reindex_statement(sql) => {
+            return Ok(CompatibilityPlan::Business(
+                sql.trim().trim_end_matches(';').trim().to_string(),
+            ));
+        }
+        Err(err) => return Err(err),
+    };
     if parsed.len() != 1 {
         return Err(EngineError::unsupported("one statement is required"));
     }

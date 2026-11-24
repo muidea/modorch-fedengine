@@ -506,32 +506,7 @@ pub(super) fn capture(
     budget: usize,
 ) -> Result<()> {
     if !source.kind.is_postgres_family() && !source.kind.is_mysql_family() {
-        for obj in objects.values_mut() {
-            for category in [
-                "details",
-                "column_properties",
-                "constraints",
-                "indexes",
-                "statistics",
-                "storage",
-                "column_statistics",
-                "activity",
-                "identity",
-            ] {
-                obj.metadata.status.insert(
-                    category.into(),
-                    MetadataStatus {
-                        support: MetadataSupport::Partial,
-                        unsupported_fields: vec!["extended_dialect_relational_metadata".into()],
-                        ..MetadataStatus::default()
-                    },
-                );
-            }
-            obj.metadata
-                .status
-                .insert("details".into(), MetadataStatus::success());
-        }
-        return Ok(());
+        return capture_extended_odbc(conn, source, objects, budget);
     }
     let scope = source
         .allowed_schemas
@@ -793,6 +768,816 @@ pub(super) fn capture(
     Ok(())
 }
 
+fn partial_status(reason: &str, complete: bool) -> MetadataStatus {
+    MetadataStatus {
+        support: MetadataSupport::Partial,
+        scan_state: MetadataScanState::Success,
+        complete,
+        unsupported_fields: if reason.is_empty() {
+            vec![]
+        } else {
+            vec![reason.into()]
+        },
+        ..MetadataStatus::default()
+    }
+}
+
+fn parse_bool_flag(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" | "1" | "true" | "t" => Some(true),
+        "n" | "no" | "0" | "false" | "f" => Some(false),
+        _ => None,
+    }
+}
+
+fn normalize_btree_method(raw: &str) -> Option<String> {
+    let lower = raw.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return None;
+    }
+    if matches!(
+        lower.as_str(),
+        "btree"
+            | "normal"
+            | "function-based normal"
+            | "cluster"
+            | "clustered"
+            | "nonclustered"
+            | "reg"
+            | "clus"
+            | "inverted value"
+            | "inverted hash"
+            | "inverted individual"
+    ) {
+        Some("btree".into())
+    } else {
+        Some(lower)
+    }
+}
+
+fn query_text_rows(
+    conn: &Connection,
+    sql: &str,
+    cols: usize,
+    budget: usize,
+) -> Result<Vec<Vec<String>>> {
+    let mut stmt = conn.prepare(sql).map_err(engine_error)?;
+    let mut rows = stmt.query([]).map_err(engine_error)?;
+    let mut out = Vec::new();
+    let mut bytes = 0usize;
+    while let Some(r) = rows.next().map_err(engine_error)? {
+        let mut row = Vec::with_capacity(cols);
+        for idx in 0..cols {
+            let cell = metadata_text(r, idx)?;
+            bytes = bytes.saturating_add(cell.len() + 24);
+            row.push(cell);
+        }
+        if bytes > budget {
+            return Err(EngineError::new(
+                "54000",
+                "extended metadata budget exceeded",
+            ));
+        }
+        out.push(row);
+    }
+    Ok(out)
+}
+
+fn finalize_extended_objects(source: &DataSourceDefinition, objects: &mut Objects) {
+    let targets: std::collections::BTreeSet<(String, String)> = objects.keys().cloned().collect();
+    for obj in objects.values_mut() {
+        for constraint in &mut obj.metadata.constraints {
+            if let Some(fk) = &mut constraint.foreign_key {
+                fk.reference_state = if !source.allowed_schemas.contains(&fk.schema) {
+                    MetadataReferenceState::OutsideScope
+                } else if targets.contains(&(fk.schema.clone(), fk.table.clone())) {
+                    MetadataReferenceState::Resolved
+                } else {
+                    MetadataReferenceState::Unresolved
+                };
+            }
+        }
+        obj.indexes = obj
+            .metadata
+            .indexes
+            .iter()
+            .map(|i| CatalogIndex {
+                name: i.name.clone(),
+                definition: i
+                    .definition
+                    .as_ref()
+                    .map(|e| e.source_text.clone())
+                    .unwrap_or_else(|| {
+                        format!(
+                            "{}:{}",
+                            i.method.as_deref().unwrap_or("unknown"),
+                            i.keys
+                                .iter()
+                                .filter_map(|k| k.column.as_deref())
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        )
+                    }),
+                protected: i.primary == Some(true)
+                    || obj
+                        .metadata
+                        .constraints
+                        .iter()
+                        .any(|c| c.backing_index.as_ref() == Some(&i.name)),
+                supported: i.method.as_deref() == Some("btree")
+                    && i.include.is_empty()
+                    && i.predicate.is_none()
+                    && i.keys
+                        .iter()
+                        .all(|k| k.column.is_some() && k.prefix_length.is_none()),
+            })
+            .collect();
+    }
+}
+
+fn capture_extended_odbc(
+    conn: &Connection,
+    source: &DataSourceDefinition,
+    objects: &mut Objects,
+    budget: usize,
+) -> Result<()> {
+    let native_available = source.kind != DataSourceKind::Starrocks
+        && crate::guarded_crud::is_native_scanner_catalog(conn, &source.catalog_alias, source.kind);
+
+    if !native_available {
+        for obj in objects.values_mut() {
+            for category in [
+                "column_properties",
+                "constraints",
+                "indexes",
+                "statistics",
+                "storage",
+                "column_statistics",
+                "activity",
+                "identity",
+            ] {
+                obj.metadata.status.insert(
+                    category.into(),
+                    partial_status("extended_dialect_relational_metadata", false),
+                );
+            }
+            obj.metadata
+                .status
+                .insert("details".into(), MetadataStatus::success());
+            obj.metadata
+                .status
+                .insert("core".into(), MetadataStatus::success());
+        }
+        return Ok(());
+    }
+
+    let mut by_schema: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (schema, table) in objects.keys() {
+        by_schema
+            .entry(schema.clone())
+            .or_default()
+            .push(table.clone());
+    }
+    let fn_name = match source.kind {
+        DataSourceKind::Oracle => "oracle_relational_metadata",
+        DataSourceKind::Sqlserver => "sqlserver_relational_metadata",
+        _ => "odbc_relational_metadata",
+    };
+    let present: bool = conn
+        .query_row(
+            "SELECT count(*) > 0 FROM duckdb_functions() WHERE function_name = ?",
+            [fn_name],
+            |r| r.get(0),
+        )
+        .unwrap_or(false);
+    if !present {
+        for obj in objects.values_mut() {
+            for category in [
+                "column_properties",
+                "constraints",
+                "indexes",
+                "statistics",
+                "storage",
+                "column_statistics",
+                "activity",
+                "identity",
+            ] {
+                obj.metadata.status.insert(
+                    category.into(),
+                    partial_status("extended_dialect_relational_metadata", false),
+                );
+            }
+            obj.metadata
+                .status
+                .insert("details".into(), MetadataStatus::success());
+            obj.metadata
+                .status
+                .insert("core".into(), MetadataStatus::success());
+        }
+        return Ok(());
+    }
+
+    let mut pk_indexes: std::collections::BTreeSet<(String, String, String)> =
+        std::collections::BTreeSet::new();
+    let mut mssql_index_ids: BTreeMap<(String, String, String), String> = BTreeMap::new();
+    let mut ok_cols = true;
+    let mut ok_cons = true;
+    let mut ok_idxs = true;
+
+    for (schema, tables) in &by_schema {
+        for chunk in tables.chunks(128) {
+            let list_expr = format!(
+                "CAST([{}] AS VARCHAR[])",
+                chunk
+                    .iter()
+                    .map(|t| quote_literal(t))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            let call = |cat: &str| {
+                format!(
+                    "SELECT * FROM {}({}, {}, {}, {})",
+                    fn_name,
+                    quote_literal(&source.catalog_alias),
+                    quote_literal(cat),
+                    quote_literal(schema),
+                    list_expr
+                )
+            };
+            match source.kind {
+                DataSourceKind::Oracle => {
+                    if let Ok(rows) = query_text_rows(conn, &call("columnProperties"), 9, budget) {
+                        for r in rows {
+                            let Some(obj) = objects.get_mut(&(r[0].clone(), r[1].clone())) else {
+                                continue;
+                            };
+                            if let Some(col) = obj.columns.iter_mut().find(|c| c.name == r[2]) {
+                                if let Some(n) = parse_bool_flag(&r[4]) {
+                                    col.nullable = n;
+                                }
+                                let def = if r[5] == "1" {
+                                    MetadataExpression::source("DEFAULT".into(), source.kind)
+                                } else if r[5] != "0" {
+                                    MetadataExpression::source(r[5].clone(), source.kind)
+                                } else {
+                                    None
+                                };
+                                obj.metadata.columns.insert(
+                                    r[2].clone(),
+                                    ColumnProperties {
+                                        attnum: r[3].trim().parse().unwrap_or(0),
+                                        default: def,
+                                        identity: (!r[6].is_empty()).then(|| r[6].clone()),
+                                        ..ColumnProperties::default()
+                                    },
+                                );
+                            }
+                        }
+                    } else {
+                        ok_cols = false;
+                    }
+                    if let Ok(rows) = query_text_rows(conn, &call("constraints"), 18, budget) {
+                        let mut grouped: BTreeMap<(String, String, String), MetadataConstraint> =
+                            BTreeMap::new();
+                        for r in rows {
+                            let key = (r[0].clone(), r[1].clone(), r[2].clone());
+                            let Some(table_obj) = objects.get(&(r[0].clone(), r[1].clone())) else {
+                                continue;
+                            };
+                            if !r[5].is_empty() && !table_obj.columns.iter().any(|c| c.name == r[5])
+                            {
+                                continue;
+                            }
+                            let kind_code = match r[3].trim().to_ascii_uppercase().as_str() {
+                                "P" => "p",
+                                "U" => "u",
+                                "R" => "f",
+                                "C" => "c",
+                                _ => continue,
+                            };
+                            if kind_code == "p" && !r[17].is_empty() {
+                                pk_indexes.insert((r[0].clone(), r[1].clone(), r[17].clone()));
+                            }
+                            let entry = grouped.entry(key).or_insert_with(|| MetadataConstraint {
+                                name: r[2].clone(),
+                                kind: kind_code.into(),
+                                backing_index: (!r[17].is_empty()).then(|| r[17].clone()),
+                                definition: MetadataExpression::source(r[14].clone(), source.kind),
+                                enforced: parse_bool_flag(
+                                    if r[10].eq_ignore_ascii_case("ENABLED") {
+                                        "true"
+                                    } else {
+                                        "false"
+                                    },
+                                ),
+                                validated: parse_bool_flag(
+                                    if r[11].eq_ignore_ascii_case("VALIDATED") {
+                                        "true"
+                                    } else {
+                                        "false"
+                                    },
+                                ),
+                                deferrable: Some(r[12].eq_ignore_ascii_case("DEFERRABLE")),
+                                initially_deferred: Some(r[13].eq_ignore_ascii_case("DEFERRED")),
+                                foreign_key: (kind_code == "f" && !r[7].is_empty()).then(|| {
+                                    MetadataForeignKey {
+                                        schema: r[6].clone(),
+                                        table: r[7].clone(),
+                                        columns: vec![],
+                                        on_delete: (!r[9].is_empty()).then(|| r[9].clone()),
+                                        ..MetadataForeignKey::default()
+                                    }
+                                }),
+                                ..MetadataConstraint::default()
+                            });
+                            if !r[5].is_empty() && !entry.columns.contains(&r[5]) {
+                                entry.columns.push(r[5].clone());
+                            }
+                            if let Some(fk) = &mut entry.foreign_key
+                                && !r[8].is_empty()
+                                && !fk.columns.contains(&r[8])
+                            {
+                                fk.columns.push(r[8].clone());
+                            }
+                        }
+                        for ((s, t, _), c) in grouped {
+                            if let Some(obj) = objects.get_mut(&(s, t)) {
+                                obj.metadata.constraints.push(c);
+                            }
+                        }
+                    } else {
+                        ok_cons = false;
+                    }
+                    if let Ok(rows) = query_text_rows(conn, &call("indexes"), 16, budget) {
+                        let mut grouped: BTreeMap<(String, String, String), MetadataIndex> =
+                            BTreeMap::new();
+                        for r in rows {
+                            let Some(table_obj) = objects.get(&(r[0].clone(), r[1].clone())) else {
+                                continue;
+                            };
+                            let col_name = (!r[13].is_empty()
+                                && table_obj.columns.iter().any(|c| c.name == r[13]))
+                            .then(|| r[13].clone());
+                            let expr = MetadataExpression::source(r[15].clone(), source.kind);
+                            if col_name.is_none() && expr.is_none() {
+                                continue;
+                            }
+                            let key = (r[0].clone(), r[1].clone(), r[3].clone());
+                            let is_pk = pk_indexes.contains(&key);
+                            let entry = grouped.entry(key).or_insert_with(|| MetadataIndex {
+                                source_id: (!r[2].is_empty()).then(|| r[2].clone()),
+                                name: r[3].clone(),
+                                method: normalize_btree_method(&r[4]),
+                                unique: Some(r[5].eq_ignore_ascii_case("UNIQUE")),
+                                primary: Some(is_pk),
+                                valid: Some(r[6].eq_ignore_ascii_case("VALID")),
+                                enabled: Some(r[7].eq_ignore_ascii_case("VISIBLE")),
+                                ..MetadataIndex::default()
+                            });
+                            entry.keys.push(MetadataIndexItem {
+                                column: col_name,
+                                expression: expr,
+                                descending: Some(r[14].eq_ignore_ascii_case("DESC")),
+                                ..MetadataIndexItem::default()
+                            });
+                        }
+                        for ((s, t, _), i) in grouped {
+                            if let Some(obj) = objects.get_mut(&(s, t)) {
+                                obj.metadata.indexes.push(i);
+                            }
+                        }
+                    } else {
+                        ok_idxs = false;
+                    }
+                }
+                DataSourceKind::Sqlserver => {
+                    if let Ok(rows) = query_text_rows(conn, &call("columnProperties"), 12, budget) {
+                        for r in rows {
+                            let Some(obj) = objects.get_mut(&(r[0].clone(), r[1].clone())) else {
+                                continue;
+                            };
+                            if let Some(col) = obj.columns.iter_mut().find(|c| c.name == r[2]) {
+                                if let Some(n) = parse_bool_flag(&r[4]) {
+                                    col.nullable = n;
+                                }
+                                obj.metadata.columns.insert(
+                                    r[2].clone(),
+                                    ColumnProperties {
+                                        attnum: r[3].trim().parse().unwrap_or(0),
+                                        default: MetadataExpression::source(
+                                            r[5].clone(),
+                                            source.kind,
+                                        ),
+                                        identity: (r[6] == "1").then(|| "IDENTITY".into()),
+                                        generated: if r[9] == "1" {
+                                            MetadataExpression::source(r[10].clone(), source.kind)
+                                        } else {
+                                            None
+                                        },
+                                        ..ColumnProperties::default()
+                                    },
+                                );
+                            }
+                        }
+                    } else {
+                        ok_cols = false;
+                    }
+                    if let Ok(rows) = query_text_rows(conn, &call("indexes"), 17, budget) {
+                        let mut grouped: BTreeMap<(String, String, String), MetadataIndex> =
+                            BTreeMap::new();
+                        for r in rows {
+                            if r[3].is_empty() {
+                                continue;
+                            }
+                            let Some(table_obj) = objects.get(&(r[0].clone(), r[1].clone())) else {
+                                continue;
+                            };
+                            if !r[2].is_empty() {
+                                mssql_index_ids.insert(
+                                    (r[0].clone(), r[1].clone(), r[2].clone()),
+                                    r[3].clone(),
+                                );
+                            }
+                            let col_name = (!r[13].is_empty()
+                                && table_obj.columns.iter().any(|c| c.name == r[13]))
+                            .then(|| r[13].clone());
+                            if col_name.is_none() {
+                                continue;
+                            }
+                            let key = (r[0].clone(), r[1].clone(), r[3].clone());
+                            let entry = grouped.entry(key).or_insert_with(|| MetadataIndex {
+                                source_id: (!r[2].is_empty()).then(|| r[2].clone()),
+                                name: r[3].clone(),
+                                method: normalize_btree_method(&r[4]),
+                                unique: parse_bool_flag(&r[5]),
+                                primary: parse_bool_flag(&r[6]),
+                                enabled: parse_bool_flag(&r[7]).map(|d| !d),
+                                valid: parse_bool_flag(&r[8]).map(|h| !h),
+                                predicate: MetadataExpression::source(r[9].clone(), source.kind),
+                                ..MetadataIndex::default()
+                            });
+                            if parse_bool_flag(&r[12]) == Some(true) {
+                                if let Some(cn) = col_name
+                                    && !entry.include.contains(&cn)
+                                {
+                                    entry.include.push(cn);
+                                }
+                            } else {
+                                entry.keys.push(MetadataIndexItem {
+                                    column: col_name,
+                                    descending: parse_bool_flag(&r[14]),
+                                    ..MetadataIndexItem::default()
+                                });
+                            }
+                        }
+                        for ((s, t, _), i) in grouped {
+                            if let Some(obj) = objects.get_mut(&(s, t)) {
+                                obj.metadata.indexes.push(i);
+                            }
+                        }
+                    } else {
+                        ok_idxs = false;
+                    }
+                    if let Ok(rows) = query_text_rows(conn, &call("constraints"), 16, budget) {
+                        let mut grouped: BTreeMap<(String, String, String), MetadataConstraint> =
+                            BTreeMap::new();
+                        for r in rows {
+                            let Some(table_obj) = objects.get(&(r[0].clone(), r[1].clone())) else {
+                                continue;
+                            };
+                            if !r[6].is_empty() && !table_obj.columns.iter().any(|c| c.name == r[6])
+                            {
+                                continue;
+                            }
+                            let kind_code = match r[4].trim().to_ascii_uppercase().as_str() {
+                                "PK" => "p",
+                                "UQ" => "u",
+                                "F" => "f",
+                                "C" => "c",
+                                _ => continue,
+                            };
+                            let backing = mssql_index_ids
+                                .get(&(r[0].clone(), r[1].clone(), r[15].clone()))
+                                .cloned();
+                            let entry = grouped
+                                .entry((r[0].clone(), r[1].clone(), r[3].clone()))
+                                .or_insert_with(|| MetadataConstraint {
+                                    source_id: (!r[2].is_empty()).then(|| r[2].clone()),
+                                    name: r[3].clone(),
+                                    kind: kind_code.into(),
+                                    backing_index: backing,
+                                    definition: MetadataExpression::source(
+                                        r[12].clone(),
+                                        source.kind,
+                                    ),
+                                    enforced: parse_bool_flag(&r[13]).map(|d| !d),
+                                    validated: parse_bool_flag(&r[14]).map(|nt| !nt),
+                                    foreign_key: (kind_code == "f" && !r[8].is_empty()).then(
+                                        || MetadataForeignKey {
+                                            schema: r[7].clone(),
+                                            table: r[8].clone(),
+                                            columns: vec![],
+                                            on_update: (!r[10].is_empty()).then(|| r[10].clone()),
+                                            on_delete: (!r[11].is_empty()).then(|| r[11].clone()),
+                                            ..MetadataForeignKey::default()
+                                        },
+                                    ),
+                                    ..MetadataConstraint::default()
+                                });
+                            if !r[6].is_empty() && !entry.columns.contains(&r[6]) {
+                                entry.columns.push(r[6].clone());
+                            }
+                            if let Some(fk) = &mut entry.foreign_key
+                                && !r[9].is_empty()
+                                && !fk.columns.contains(&r[9])
+                            {
+                                fk.columns.push(r[9].clone());
+                            }
+                        }
+                        for ((s, t, _), c) in grouped {
+                            if let Some(obj) = objects.get_mut(&(s, t)) {
+                                obj.metadata.constraints.push(c);
+                            }
+                        }
+                    } else {
+                        ok_cons = false;
+                    }
+                }
+                _ => {
+                    if let Ok(rows) = query_text_rows(conn, &call("columnProperties"), 8, budget) {
+                        for r in rows {
+                            let Some(obj) = objects.get_mut(&(r[0].clone(), r[1].clone())) else {
+                                continue;
+                            };
+                            if let Some(col) = obj.columns.iter_mut().find(|c| c.name == r[2]) {
+                                if let Some(n) = parse_bool_flag(&r[5]) {
+                                    col.nullable = n;
+                                }
+                                obj.metadata.columns.insert(
+                                    r[2].clone(),
+                                    ColumnProperties {
+                                        attnum: r[4].trim().parse().unwrap_or(0),
+                                        default: MetadataExpression::source(
+                                            r[6].clone(),
+                                            source.kind,
+                                        ),
+                                        ..ColumnProperties::default()
+                                    },
+                                );
+                            }
+                        }
+                    } else {
+                        ok_cols = false;
+                    }
+                    if matches!(source.kind, DataSourceKind::Db2 | DataSourceKind::Hana)
+                        && let Ok(rows) = query_text_rows(conn, &call("columnDetails"), 7, budget)
+                    {
+                        for r in rows {
+                            let Some(obj) = objects.get_mut(&(r[0].clone(), r[1].clone())) else {
+                                continue;
+                            };
+                            if let Some(props) = obj.metadata.columns.get_mut(&r[2]) {
+                                if !r[3].is_empty() && r[3] != "N" {
+                                    props.identity = Some(r[3].clone());
+                                }
+                                if !r[5].is_empty() {
+                                    props.generated =
+                                        MetadataExpression::source(r[5].clone(), source.kind);
+                                }
+                                if props.default.is_none() && !r[6].is_empty() {
+                                    props.default =
+                                        MetadataExpression::source(r[6].clone(), source.kind);
+                                }
+                            }
+                        }
+                    }
+                    let mut grouped_cons: BTreeMap<(String, String, String), MetadataConstraint> =
+                        BTreeMap::new();
+                    if let Ok(rows) = query_text_rows(conn, &call("constraintDetails"), 14, budget)
+                    {
+                        for r in rows {
+                            let Some(table_obj) = objects.get(&(r[0].clone(), r[1].clone())) else {
+                                continue;
+                            };
+                            if !r[5].is_empty() && !table_obj.columns.iter().any(|c| c.name == r[5])
+                            {
+                                continue;
+                            }
+                            let kind_code = match r[3].trim().to_ascii_uppercase().as_str() {
+                                "P" => "p",
+                                "U" => "u",
+                                "F" => "f",
+                                "C" | "K" => "c",
+                                _ => continue,
+                            };
+                            let entry = grouped_cons
+                                .entry((r[0].clone(), r[1].clone(), r[2].clone()))
+                                .or_insert_with(|| MetadataConstraint {
+                                    name: r[2].clone(),
+                                    kind: kind_code.into(),
+                                    backing_index: (!r[9].is_empty()).then(|| r[9].clone()),
+                                    definition: MetadataExpression::source(
+                                        r[6].clone(),
+                                        source.kind,
+                                    ),
+                                    enforced: parse_bool_flag(
+                                        if r[7].eq_ignore_ascii_case("ENABLED")
+                                            || r[7].eq_ignore_ascii_case("TRUE")
+                                            || r[7] == "Y"
+                                        {
+                                            "true"
+                                        } else if r[7].is_empty() {
+                                            ""
+                                        } else {
+                                            "false"
+                                        },
+                                    ),
+                                    validated: parse_bool_flag(
+                                        if r[8].eq_ignore_ascii_case("VALIDATED")
+                                            || r[8].eq_ignore_ascii_case("TRUE")
+                                            || r[8] == "Y"
+                                            || r[8] == "I"
+                                        {
+                                            "true"
+                                        } else if r[8].is_empty() {
+                                            ""
+                                        } else {
+                                            "false"
+                                        },
+                                    ),
+                                    deferrable: (!r[10].is_empty())
+                                        .then(|| r[10].eq_ignore_ascii_case("DEFERRABLE")),
+                                    initially_deferred: (!r[11].is_empty())
+                                        .then(|| r[11].eq_ignore_ascii_case("DEFERRED")),
+                                    ..MetadataConstraint::default()
+                                });
+                            if !r[5].is_empty() && !entry.columns.contains(&r[5]) {
+                                entry.columns.push(r[5].clone());
+                            }
+                        }
+                    } else {
+                        ok_cons = false;
+                    }
+                    if let Ok(rows) = query_text_rows(conn, &call("constraints"), 13, budget) {
+                        for r in rows {
+                            let Some(table_obj) = objects.get(&(r[0].clone(), r[1].clone())) else {
+                                continue;
+                            };
+                            if !r[6].is_empty() && !table_obj.columns.iter().any(|c| c.name == r[6])
+                            {
+                                continue;
+                            }
+                            let kind_code = match r[4].trim().to_ascii_uppercase().as_str() {
+                                "PRIMARY KEY" | "P" => "p",
+                                "UNIQUE" | "U" => "u",
+                                "FOREIGN KEY" | "R" | "F" => "f",
+                                "CHECK" | "C" => "c",
+                                _ => continue,
+                            };
+                            let entry = grouped_cons
+                                .entry((r[0].clone(), r[1].clone(), r[3].clone()))
+                                .or_insert_with(|| MetadataConstraint {
+                                    source_id: (!r[2].is_empty()).then(|| r[2].clone()),
+                                    name: r[3].clone(),
+                                    kind: kind_code.into(),
+                                    ..MetadataConstraint::default()
+                                });
+                            if !r[6].is_empty() && !entry.columns.contains(&r[6]) {
+                                entry.columns.push(r[6].clone());
+                            }
+                            if kind_code == "f" && !r[8].is_empty() {
+                                let fk =
+                                    entry.foreign_key.get_or_insert_with(|| MetadataForeignKey {
+                                        schema: r[7].clone(),
+                                        table: r[8].clone(),
+                                        columns: vec![],
+                                        on_update: (!r[10].is_empty()).then(|| r[10].clone()),
+                                        on_delete: (!r[11].is_empty()).then(|| r[11].clone()),
+                                        ..MetadataForeignKey::default()
+                                    });
+                                if !r[9].is_empty() && !fk.columns.contains(&r[9]) {
+                                    fk.columns.push(r[9].clone());
+                                }
+                            }
+                        }
+                    }
+                    for ((s, t, _), c) in grouped_cons {
+                        if let Some(obj) = objects.get_mut(&(s, t)) {
+                            obj.metadata.constraints.push(c);
+                        }
+                    }
+                    if let Ok(rows) = query_text_rows(conn, &call("indexDetails"), 16, budget) {
+                        let mut grouped_idx: BTreeMap<(String, String, String), MetadataIndex> =
+                            BTreeMap::new();
+                        for r in rows {
+                            let Some(table_obj) = objects.get(&(r[0].clone(), r[1].clone())) else {
+                                continue;
+                            };
+                            let col_name = (!r[4].is_empty()
+                                && table_obj.columns.iter().any(|c| c.name == r[4]))
+                            .then(|| r[4].clone());
+                            let expr = MetadataExpression::source(r[5].clone(), source.kind);
+                            if col_name.is_none() && expr.is_none() {
+                                continue;
+                            }
+                            let entry = grouped_idx
+                                .entry((r[0].clone(), r[1].clone(), r[2].clone()))
+                                .or_insert_with(|| MetadataIndex {
+                                    name: r[2].clone(),
+                                    method: normalize_btree_method(&r[11]),
+                                    unique: parse_bool_flag(&r[12]),
+                                    primary: parse_bool_flag(&r[13]),
+                                    valid: parse_bool_flag(&r[9]),
+                                    enabled: parse_bool_flag(&r[10]),
+                                    definition: MetadataExpression::source(
+                                        r[14].clone(),
+                                        source.kind,
+                                    ),
+                                    ..MetadataIndex::default()
+                                });
+                            if parse_bool_flag(&r[6]) == Some(true) {
+                                if let Some(cn) = col_name
+                                    && !entry.include.contains(&cn)
+                                {
+                                    entry.include.push(cn);
+                                }
+                            } else {
+                                let desc = match r[7].trim().to_ascii_uppercase().as_str() {
+                                    "DESC" | "D" | "FALSE" => Some(true),
+                                    "ASC" | "A" | "TRUE" => Some(false),
+                                    _ => None,
+                                };
+                                entry.keys.push(MetadataIndexItem {
+                                    column: col_name,
+                                    expression: expr,
+                                    descending: desc,
+                                    ..MetadataIndexItem::default()
+                                });
+                            }
+                        }
+                        for ((s, t, _), i) in grouped_idx {
+                            if let Some(obj) = objects.get_mut(&(s, t)) {
+                                obj.metadata.indexes.push(i);
+                            }
+                        }
+                    } else {
+                        ok_idxs = false;
+                    }
+                }
+            }
+        }
+    }
+
+    finalize_extended_objects(source, objects);
+    for obj in objects.values_mut() {
+        obj.metadata
+            .status
+            .insert("core".into(), MetadataStatus::success());
+        obj.metadata
+            .status
+            .insert("details".into(), MetadataStatus::success());
+        obj.metadata.status.insert(
+            "column_properties".into(),
+            if ok_cols {
+                partial_status("odbc_relational_metadata", true)
+            } else {
+                partial_status("column_properties_unavailable", false)
+            },
+        );
+        obj.metadata.status.insert(
+            "constraints".into(),
+            if ok_cons {
+                partial_status("odbc_relational_metadata", true)
+            } else {
+                partial_status("constraints_unavailable", false)
+            },
+        );
+        obj.metadata.status.insert(
+            "indexes".into(),
+            if ok_idxs {
+                partial_status("odbc_relational_metadata", true)
+            } else {
+                partial_status("indexes_unavailable", false)
+            },
+        );
+        for cat in ["statistics", "column_statistics", "storage", "activity"] {
+            obj.metadata.status.insert(
+                cat.into(),
+                MetadataStatus {
+                    support: MetadataSupport::Unsupported,
+                    unsupported_fields: vec!["dialect_metadata_unsupported".into()],
+                    ..MetadataStatus::default()
+                },
+            );
+        }
+        obj.metadata.status.insert(
+            "identity".into(),
+            partial_status("offline_identity_continuity_unproven", false),
+        );
+    }
+    Ok(())
+}
+
 /// Explicit metadata category support matrix per data source dialect.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct MetadataSupportMatrix {
@@ -835,6 +1620,26 @@ impl MetadataSupportMatrix {
                 statistics: MetadataSupport::Supported,
                 column_statistics: MetadataSupport::Unsupported,
                 storage: MetadataSupport::Supported,
+                activity: MetadataSupport::Unsupported,
+            }
+        } else if matches!(
+            kind,
+            DataSourceKind::Oracle
+                | DataSourceKind::Sqlserver
+                | DataSourceKind::Dameng
+                | DataSourceKind::Db2
+                | DataSourceKind::Hana
+        ) {
+            Self {
+                dialect,
+                core: MetadataSupport::Supported,
+                details: MetadataSupport::Partial,
+                column_properties: MetadataSupport::Partial,
+                constraints: MetadataSupport::Partial,
+                indexes: MetadataSupport::Partial,
+                statistics: MetadataSupport::Unsupported,
+                column_statistics: MetadataSupport::Unsupported,
+                storage: MetadataSupport::Unsupported,
                 activity: MetadataSupport::Unsupported,
             }
         } else {
@@ -1021,7 +1826,9 @@ mod tests {
             let m = MetadataSupportMatrix::for_kind(kind);
             assert_eq!(m.core, MetadataSupport::Supported);
             assert_eq!(m.storage, MetadataSupport::Unsupported);
-            assert_eq!(m.constraints, MetadataSupport::Unsupported);
+            assert_eq!(m.column_properties, MetadataSupport::Partial);
+            assert_eq!(m.constraints, MetadataSupport::Partial);
+            assert_eq!(m.indexes, MetadataSupport::Partial);
         }
     }
 }

@@ -217,6 +217,9 @@ mod tests {
                 Err(err) => panic!("unexpected load failure for {module}: {err}"),
             }
         }
+        if std::env::var_os("FEDENGINE_REQUIRE_ODBC").is_some() {
+            assert_eq!(odbc_loaded, vec!["oracle", "sqlserver", "odbc_catalog"]);
+        }
         let versioned: i64 = conn
             .query_row(
                 "SELECT count(*) FROM duckdb_functions() WHERE regexp_matches(function_name, '_v[0-9]+$')",
@@ -229,20 +232,59 @@ mod tests {
             "pg_clear_cache",
             "mysql_clear_cache",
             "postgres_crud_metadata",
+            "greenplum_crud_metadata",
+            "kingbasees_crud_metadata",
+            "postgres_guarded_insert_returning",
+            "greenplum_guarded_insert_returning",
+            "kingbasees_guarded_insert_returning",
+            "postgres_ddl_capabilities",
+            "greenplum_ddl_capabilities",
+            "kingbasees_ddl_capabilities",
             "postgres_guarded_ddl",
+            "greenplum_guarded_ddl",
+            "kingbasees_guarded_ddl",
             "mysql_crud_metadata",
+            "mysql_guarded_insert_returning",
+            "mysql_ddl_capabilities",
             "mysql_guarded_ddl",
         ];
         if odbc_loaded.contains(&"oracle") {
-            expected.extend(["oracle_crud_metadata", "oracle_relational_metadata"]);
+            expected.extend([
+                "oracle_crud_metadata",
+                "oracle_guarded_mutation",
+                "oracle_guarded_insert_returning",
+                "oracle_ddl_capabilities",
+                "oracle_guarded_ddl",
+                "oracle_relational_metadata",
+            ]);
         }
         if odbc_loaded.contains(&"sqlserver") {
-            expected.extend(["sqlserver_crud_metadata", "sqlserver_relational_metadata"]);
+            expected.extend([
+                "sqlserver_crud_metadata",
+                "sqlserver_guarded_mutation",
+                "sqlserver_guarded_insert_returning",
+                "sqlserver_ddl_capabilities",
+                "sqlserver_guarded_ddl",
+                "sqlserver_relational_metadata",
+            ]);
         }
         if odbc_loaded.contains(&"odbc_catalog") {
             expected.extend([
                 "dameng_crud_metadata",
+                "dameng_guarded_mutation",
+                "dameng_guarded_insert_returning",
                 "db2_crud_metadata",
+                "db2_guarded_mutation",
+                "db2_guarded_insert_returning",
+                "hana_crud_metadata",
+                "hana_guarded_mutation",
+                "hana_guarded_insert_returning",
+                "dameng_ddl_capabilities",
+                "dameng_guarded_ddl",
+                "db2_ddl_capabilities",
+                "db2_guarded_ddl",
+                "hana_ddl_capabilities",
+                "hana_guarded_ddl",
                 "odbc_relational_metadata",
             ]);
         }

@@ -27,11 +27,24 @@ pub fn is_bare_numeric_data_type(ty: &DataType) -> bool {
     }
 }
 
+fn reindex_bypass(sql: &str) -> Result<Option<String>> {
+    Ok(crate::analysis::parse_reindex_index(sql)?
+        .map(|_| sql.trim().trim_end_matches(';').trim().to_string()))
+}
+
 /// Lower the parameters actually referenced by an execution plan to dense slots.
 /// The returned zero-based indices address the original client parameter vector.
 /// Client parameter discovery and validation must happen before this lowering.
 pub fn compact_parameters(sql: &str) -> Result<(String, Vec<usize>)> {
-    let mut statements = parse_parameter_sql(sql)?;
+    let mut statements = match parse_parameter_sql(sql) {
+        Ok(s) => s,
+        Err(err) => {
+            if let Some(trimmed) = reindex_bypass(sql)? {
+                return Ok((trimmed, vec![]));
+            }
+            return Err(err);
+        }
+    };
     if statements.len() != 1 {
         return Err(EngineError::unsupported("one SQL statement is required"));
     }
@@ -97,7 +110,16 @@ pub fn parameter_hints(sql: &str) -> Result<Vec<Option<String>>> {
         }
     }
     let mut hints = Hints { types: Vec::new() };
-    for s in parse_parameter_sql(sql)? {
+    let statements = match parse_parameter_sql(sql) {
+        Ok(s) => s,
+        Err(err) => {
+            if reindex_bypass(sql)?.is_some() {
+                return Ok(vec![]);
+            }
+            return Err(err);
+        }
+    };
+    for s in statements {
         if let ControlFlow::Break(e) = Visit::visit(&s, &mut hints) {
             return Err(e);
         }
@@ -174,7 +196,15 @@ pub fn cast_parameters(sql: &str, types: &[String]) -> Result<String> {
             ControlFlow::Continue(())
         }
     }
-    let mut parsed = parse_parameter_sql(sql)?;
+    let mut parsed = match parse_parameter_sql(sql) {
+        Ok(s) => s,
+        Err(err) => {
+            if let Some(trimmed) = reindex_bypass(sql)? {
+                return Ok(trimmed);
+            }
+            return Err(err);
+        }
+    };
     let mut casts = Casts {
         types: Vec::new(),
         skip_depth: 0,

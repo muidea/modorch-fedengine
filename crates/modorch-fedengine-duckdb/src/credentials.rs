@@ -147,8 +147,10 @@ fn default_driver(
 
 fn format_attach_options(kind: DataSourceKind, read_only: bool, extra: &[String]) -> String {
     let mut opts = vec![format!("TYPE {}", kind.attach_type())];
-    if read_only || kind.is_read_only_scanner() {
+    if read_only || kind == DataSourceKind::Starrocks {
         opts.push("READ_ONLY".into());
+    } else if kind.is_read_only_scanner() {
+        opts.push("GUARDED_CRUD_ADMIN true".into());
     }
     match kind {
         DataSourceKind::Greenplum => {
@@ -190,10 +192,7 @@ pub(super) fn attach_plan(
         } else {
             resolve(reference, directory)?
         };
-        let mut extra = Vec::new();
-        if kind.is_postgres_family() && !default_schema.is_empty() {
-            extra.push(format!("SCHEMA {}", quote_literal(default_schema)));
-        }
+        let extra: Vec<String> = Vec::new();
         return Ok(AttachPlan {
             secret_sql: None,
             attach_sql: format!(
@@ -531,6 +530,7 @@ mod structured_tests {
         )
         .unwrap();
         assert!(gp.secret_sql.is_none());
+        assert!(!gp.attach_sql.contains("SCHEMA 'public'"));
         assert!(gp.attach_sql.contains("ISOLATION_LEVEL 'READ COMMITTED'"));
         assert!(gp.attach_sql.contains("USE_TEXT_PROTOCOL true"));
 
@@ -544,7 +544,21 @@ mod structured_tests {
             Some(&org),
         )
         .unwrap();
+        assert!(!kb.attach_sql.contains("SCHEMA 'public'"));
         assert!(kb.attach_sql.contains("USE_TEXT_PROTOCOL true"));
+
+        let ora_rw = attach_plan(
+            "file:creds.json",
+            root.to_str().unwrap(),
+            DataSourceKind::Oracle,
+            "ora_rw_alias",
+            false,
+            "APP",
+            Some(&org),
+        )
+        .unwrap();
+        assert!(ora_rw.attach_sql.contains("GUARDED_CRUD_ADMIN true"));
+        assert!(!ora_rw.attach_sql.contains("READ_ONLY"));
 
         let ora = attach_plan(
             "file:creds.json",
@@ -564,6 +578,20 @@ mod structured_tests {
                 .contains("//db.local:1521/ORCL")
         );
         assert!(ora.attach_sql.contains("TYPE oracle_scanner"));
+        assert!(ora.attach_sql.contains("READ_ONLY"));
+
+        let sqlsrv_rw = attach_plan(
+            "file:creds.json",
+            root.to_str().unwrap(),
+            DataSourceKind::Sqlserver,
+            "ss_rw_alias",
+            false,
+            "dbo",
+            Some(&org),
+        )
+        .unwrap();
+        assert!(sqlsrv_rw.attach_sql.contains("GUARDED_CRUD_ADMIN true"));
+        assert!(!sqlsrv_rw.attach_sql.contains("READ_ONLY"));
 
         let sqlsrv = attach_plan(
             "file:creds.json",
@@ -583,12 +611,47 @@ mod structured_tests {
                 .contains("TYPE sqlserver")
         );
         assert!(sqlsrv.attach_sql.contains("TYPE sqlserver_scanner"));
+        assert!(sqlsrv.attach_sql.contains("READ_ONLY"));
+
+        let starrocks = attach_plan(
+            "file:creds.json",
+            root.to_str().unwrap(),
+            DataSourceKind::Starrocks,
+            "sr_alias",
+            false,
+            "analytics",
+            Some(&org),
+        )
+        .unwrap();
+        assert!(starrocks.attach_sql.contains("READ_ONLY"));
+        assert!(!starrocks.attach_sql.contains("GUARDED_CRUD_ADMIN"));
 
         for kind in [
             DataSourceKind::Dameng,
             DataSourceKind::Db2,
             DataSourceKind::Hana,
         ] {
+            let plan_rw = attach_plan(
+                "file:creds.json",
+                root.to_str().unwrap(),
+                kind,
+                "odbc_rw_alias",
+                false,
+                "APP",
+                Some(&org),
+            )
+            .unwrap();
+            assert!(
+                plan_rw.attach_sql.contains("GUARDED_CRUD_ADMIN true"),
+                "{}",
+                plan_rw.attach_sql
+            );
+            assert!(
+                !plan_rw.attach_sql.contains("READ_ONLY"),
+                "{}",
+                plan_rw.attach_sql
+            );
+
             let plan = attach_plan(
                 "file:creds.json",
                 root.to_str().unwrap(),
@@ -612,6 +675,7 @@ mod structured_tests {
                 "{}",
                 plan.attach_sql
             );
+            assert!(plan.attach_sql.contains("READ_ONLY"), "{}", plan.attach_sql);
         }
     }
 }

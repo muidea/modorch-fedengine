@@ -1,3 +1,4 @@
+use modorch_fedengine_contract::PgType;
 use modorch_fedengine_core::*;
 use modorch_fedengine_ddl::*;
 fn configuration() -> Config {
@@ -378,6 +379,7 @@ fn guarded_mutation_and_insert_returning_contracts() {
         pg_source,
         ok.primary.as_ref().unwrap(),
         ok.returning.as_ref(),
+        &[PgType::Int4, PgType::Text],
     )
     .unwrap()
     .unwrap();
@@ -397,6 +399,7 @@ fn guarded_mutation_and_insert_returning_contracts() {
         my_source,
         my_ok.primary.as_ref().unwrap(),
         my_ok.returning.as_ref(),
+        &[PgType::Int4, PgType::Text],
     )
     .unwrap()
     .unwrap();
@@ -413,6 +416,7 @@ fn guarded_mutation_and_insert_returning_contracts() {
         my_source,
         my_cast.primary.as_ref().unwrap(),
         None,
+        &[PgType::Int4, PgType::Text],
     )
     .unwrap()
     .unwrap();
@@ -523,13 +527,14 @@ fn guarded_ddl_v2_through_v5_intents_and_dialect_bounds() {
     let my_not_null = a
         .analyze("ALTER TABLE mysql_erp.erp.items ALTER COLUMN name SET NOT NULL")
         .unwrap();
-    assert!(
-        my_not_null
-            .ddl_intent
-            .unwrap()
-            .into_guarded_plan(&a.sources[1], "erp".into(), "erp".into(), String::new())
-            .is_err()
-    );
+    let my_nn_plan = my_not_null
+        .ddl_intent
+        .unwrap()
+        .into_guarded_plan(&a.sources[1], "erp".into(), "erp".into(), String::new())
+        .unwrap()
+        .unwrap();
+    assert_eq!(my_nn_plan.contract_version, 4);
+    assert_eq!(my_nn_plan.action, "set_not_null");
 }
 
 #[test]
@@ -567,6 +572,7 @@ fn mariadb_guarded_mutation_and_ddl_reuse_mysql_contract() {
         &source,
         ins.primary.as_ref().unwrap(),
         ins.returning.as_ref(),
+        &[PgType::Int4, PgType::Text],
     )
     .unwrap()
     .unwrap();
@@ -599,11 +605,726 @@ fn mariadb_guarded_mutation_and_ddl_reuse_mysql_contract() {
     let mdb_not_null = a
         .analyze("ALTER TABLE mdb_erp.erp.items ALTER COLUMN name SET NOT NULL")
         .unwrap();
+    let mdb_nn_plan = mdb_not_null
+        .ddl_intent
+        .unwrap()
+        .into_guarded_plan(&source, "erp".into(), "erp".into(), String::new())
+        .unwrap()
+        .unwrap();
+    assert_eq!(mdb_nn_plan.contract_version, 4);
+    assert_eq!(mdb_nn_plan.action, "set_not_null");
+}
+
+#[test]
+fn reindex_v5_ddl_starrocks_gate_and_oracle_mutation_rewrites() {
+    let mut a = analyzer();
+    let table = ObjectRef {
+        source: DataSourceId("crm".into()),
+        catalog: "pg_crm".into(),
+        schema: "public".into(),
+        name: "items".into(),
+    };
+    let idx = ObjectRef {
+        name: "items_idx".into(),
+        ..table.clone()
+    };
+    a.indexes.push(IndexOwner {
+        index: idx,
+        table,
+        protected: false,
+    });
+
+    let reindex = a.analyze("REINDEX INDEX pg_crm.public.items_idx").unwrap();
+    assert_eq!(reindex.action, "REINDEX");
+    assert_eq!(reindex.capability, "REINDEX");
+    let reindex_plan = reindex
+        .ddl_intent
+        .unwrap()
+        .into_guarded_plan(
+            &a.sources[0],
+            "crmdb".into(),
+            "public".into(),
+            "items".into(),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(reindex_plan.contract_version, 4);
+    assert_eq!(reindex_plan.action, "reindex");
+    assert_eq!(reindex_plan.owner, "items");
+    assert!(a.analyze("REINDEX TABLE pg_crm.public.items").is_err());
+
+    let drop_col = a
+        .analyze("ALTER TABLE pg_crm.public.items DROP COLUMN note")
+        .unwrap()
+        .ddl_intent
+        .unwrap()
+        .into_guarded_plan(
+            &a.sources[0],
+            "crmdb".into(),
+            "public".into(),
+            String::new(),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(drop_col.contract_version, 5);
+    assert_eq!(drop_col.action, "drop_column");
+    assert_eq!(drop_col.column_name, "note");
+
+    let alter_col = a
+        .analyze("ALTER TABLE mysql_erp.erp.items ALTER COLUMN amount TYPE DECIMAL(18, 4)")
+        .unwrap()
+        .ddl_intent
+        .unwrap()
+        .into_guarded_plan(&a.sources[1], "erp".into(), "erp".into(), String::new())
+        .unwrap()
+        .unwrap();
+    assert_eq!(alter_col.contract_version, 5);
+    assert_eq!(alter_col.action, "alter_column_type");
+    assert_eq!(alter_col.column_name, "amount");
+    assert_eq!(alter_col.columns[0].precision, 18);
+
+    let create_schema = a
+        .analyze("CREATE SCHEMA pg_crm.sales")
+        .unwrap()
+        .ddl_intent
+        .unwrap()
+        .into_guarded_plan(&a.sources[0], "crmdb".into(), "sales".into(), String::new())
+        .unwrap()
+        .unwrap();
+    assert_eq!(create_schema.contract_version, 5);
+    assert_eq!(create_schema.action, "create_schema");
+    assert_eq!(create_schema.table_name, "sales");
+
+    let oracle_source = DataSourceDefinition {
+        id: DataSourceId("ora".into()),
+        kind: DataSourceKind::Oracle,
+        catalog_alias: "ora_db".into(),
+        secret_ref: "unused".into(),
+        organization: None,
+        default_schema: "HR".into(),
+        read_only: false,
+        ddl_enabled: true,
+        allowed_schemas: vec!["HR".into()],
+        enabled: true,
+    };
+    let hana_source = DataSourceDefinition {
+        id: DataSourceId("hana".into()),
+        kind: DataSourceKind::Hana,
+        catalog_alias: "hana_db".into(),
+        secret_ref: "unused".into(),
+        organization: None,
+        default_schema: "APP".into(),
+        read_only: false,
+        ddl_enabled: true,
+        allowed_schemas: vec!["APP".into()],
+        enabled: true,
+    };
+    let sr_source = DataSourceDefinition {
+        id: DataSourceId("sr".into()),
+        kind: DataSourceKind::Starrocks,
+        catalog_alias: "sr_db".into(),
+        secret_ref: "unused".into(),
+        organization: None,
+        default_schema: "analytics".into(),
+        read_only: false,
+        ddl_enabled: true,
+        allowed_schemas: vec!["analytics".into()],
+        enabled: true,
+    };
+    let ext_analyzer = Analyzer {
+        namespace: None,
+        sources: vec![
+            oracle_source.clone(),
+            hana_source.clone(),
+            sr_source.clone(),
+        ],
+        indexes: vec![],
+    };
+
+    let ora_ins = ext_analyzer
+        .analyze("INSERT INTO ora_db.\"HR\".events (id, created_at) VALUES ($1, $2), ($3, $4)")
+        .unwrap();
+    let ora_plan = modorch_fedengine_ddl::build_guarded_mutation_plan(
+        &modorch_fedengine_ddl::compact_parameters(&ora_ins.sql)
+            .unwrap()
+            .0,
+        &oracle_source,
+        ora_ins.primary.as_ref().unwrap(),
+        None,
+        &[
+            PgType::Int8,
+            PgType::Timestamp,
+            PgType::Int8,
+            PgType::Timestamp,
+        ],
+    )
+    .unwrap()
+    .unwrap();
     assert!(
-        mdb_not_null
+        ora_plan.native_sql.starts_with("INSERT ALL "),
+        "{}",
+        ora_plan.native_sql
+    );
+    assert!(
+        ora_plan
+            .native_sql
+            .contains("TO_TIMESTAMP(?, 'YYYY-MM-DD HH24:MI:SS.FF6')"),
+        "{}",
+        ora_plan.native_sql
+    );
+    assert!(
+        ora_plan.native_sql.ends_with("SELECT 1 FROM DUAL"),
+        "{}",
+        ora_plan.native_sql
+    );
+
+    let hana_ins = ext_analyzer
+        .analyze("INSERT INTO hana_db.\"APP\".items (id) VALUES ($1)")
+        .unwrap();
+    let hana_plan = modorch_fedengine_ddl::build_guarded_mutation_plan(
+        &modorch_fedengine_ddl::compact_parameters(&hana_ins.sql)
+            .unwrap()
+            .0,
+        &hana_source,
+        hana_ins.primary.as_ref().unwrap(),
+        None,
+        &[PgType::Int8],
+    )
+    .unwrap()
+    .unwrap();
+    assert!(hana_plan.native_sql.contains("\"APP\".\"items\""));
+
+    let sr_ins = ext_analyzer
+        .analyze("INSERT INTO sr_db.analytics.items (id) VALUES ($1)")
+        .unwrap();
+    assert!(
+        modorch_fedengine_ddl::build_guarded_mutation_plan(
+            &modorch_fedengine_ddl::compact_parameters(&sr_ins.sql)
+                .unwrap()
+                .0,
+            &sr_source,
+            sr_ins.primary.as_ref().unwrap(),
+            None,
+            &[PgType::Int8],
+        )
+        .is_err()
+    );
+}
+
+fn test_source(id: &str, kind: DataSourceKind, alias: &str, schema: &str) -> DataSourceDefinition {
+    DataSourceDefinition {
+        id: DataSourceId(id.into()),
+        kind,
+        catalog_alias: alias.into(),
+        secret_ref: "unused".into(),
+        organization: None,
+        default_schema: schema.into(),
+        read_only: false,
+        ddl_enabled: true,
+        allowed_schemas: vec![schema.into()],
+        enabled: true,
+    }
+}
+
+#[test]
+fn ddl_v6_constraints_conditional_and_ctas_across_dialects() {
+    let pg = test_source("pg", DataSourceKind::Postgres, "pg_s", "public");
+    let my = test_source("my", DataSourceKind::Mysql, "my_s", "app");
+    let mdb = test_source("mdb", DataSourceKind::Mariadb, "mdb_s", "app");
+    let ora = test_source("ora", DataSourceKind::Oracle, "ora_s", "HR");
+    let mssql = test_source("ms", DataSourceKind::Sqlserver, "ms_s", "dbo");
+    let dm = test_source("dm", DataSourceKind::Dameng, "dm_s", "DM");
+    let db2 = test_source("db2", DataSourceKind::Db2, "db2_s", "DB2INST1");
+    let hana = test_source("hana", DataSourceKind::Hana, "hana_s", "APP");
+
+    let sources = vec![
+        pg.clone(),
+        my.clone(),
+        mdb.clone(),
+        ora.clone(),
+        mssql.clone(),
+        dm.clone(),
+        db2.clone(),
+        hana.clone(),
+    ];
+    let mut a = Analyzer {
+        namespace: None,
+        sources,
+        indexes: vec![],
+    };
+
+    // v6 CREATE TABLE with inline column options + table constraints
+    let ct = a
+        .analyze(
+            "CREATE TABLE IF NOT EXISTS pg_s.public.orders (\
+             id BIGINT PRIMARY KEY, \
+             code VARCHAR(32) NOT NULL UNIQUE DEFAULT 'new', \
+             parent_id BIGINT, \
+             qty INTEGER NOT NULL DEFAULT 1, \
+             FOREIGN KEY (parent_id) REFERENCES pg_s.public.parents(id), \
+             CHECK (qty > 0))",
+        )
+        .unwrap();
+    let ct_plan = ct
+        .ddl_intent
+        .unwrap()
+        .into_guarded_plan(&pg, "db".into(), "public".into(), String::new())
+        .unwrap()
+        .unwrap();
+    assert_eq!(ct_plan.contract_version, 6);
+    assert!(ct_plan.conditional);
+    assert_eq!(ct_plan.columns.len(), 4);
+    assert!(ct_plan.columns[0].primary_key);
+    assert!(ct_plan.columns[1].not_null);
+    assert!(ct_plan.columns[1].unique);
+    assert_eq!(ct_plan.columns[1].default_kind.as_deref(), Some("string"));
+    assert_eq!(ct_plan.columns[1].default_value.as_deref(), Some("new"));
+    assert!(ct_plan.columns[3].not_null);
+    assert_eq!(ct_plan.columns[3].default_kind.as_deref(), Some("integer"));
+    assert_eq!(ct_plan.columns[3].default_value.as_deref(), Some("1"));
+    assert_eq!(ct_plan.constraints.len(), 2);
+    assert_eq!(ct_plan.constraints[0].kind, "foreign_key");
+    assert_eq!(ct_plan.constraints[1].kind, "check");
+
+    // v6 ADD COLUMN with inline modifiers
+    let add_col = a
+        .analyze(
+            "ALTER TABLE my_s.app.orders ADD COLUMN IF NOT EXISTS note VARCHAR(64) NOT NULL DEFAULT 'ok'",
+        )
+        .unwrap();
+    let add_plan = add_col
+        .ddl_intent
+        .unwrap()
+        .into_guarded_plan(&my, "app".into(), "app".into(), String::new())
+        .unwrap()
+        .unwrap();
+    assert_eq!(add_plan.contract_version, 6);
+    assert!(add_plan.conditional);
+    assert_eq!(add_plan.columns.len(), 1);
+    assert!(add_plan.columns[0].not_null);
+    assert_eq!(add_plan.columns[0].default_kind.as_deref(), Some("string"));
+
+    // Conditional DDL actions + DROP NOT NULL + DROP INDEX IF EXISTS
+    for (src, db, schema, sql) in [
+        (&my, "app", "app", "DROP TABLE IF EXISTS my_s.app.orders"),
+        (&my, "app", "app", "CREATE SCHEMA IF NOT EXISTS my_s.app"),
+        (&my, "app", "app", "DROP SCHEMA IF EXISTS my_s.app"),
+        (
+            &my,
+            "app",
+            "app",
+            "ALTER TABLE my_s.app.orders DROP COLUMN IF EXISTS note",
+        ),
+        (
+            &my,
+            "app",
+            "app",
+            "CREATE INDEX IF NOT EXISTS idx_o ON my_s.app.orders (code)",
+        ),
+        (
+            &my,
+            "app",
+            "app",
+            "ALTER TABLE my_s.app.orders ALTER COLUMN qty DROP NOT NULL",
+        ),
+    ] {
+        let p = a
+            .analyze(sql)
+            .unwrap()
             .ddl_intent
             .unwrap()
-            .into_guarded_plan(&source, "erp".into(), "erp".into(), String::new())
+            .into_guarded_plan(src, db.into(), schema.into(), String::new())
+            .unwrap()
+            .unwrap();
+        if sql.contains("IF ") {
+            assert!(p.conditional, "{sql}");
+        } else {
+            assert_eq!(p.action, "drop_not_null");
+        }
+    }
+    let drop_missing_ok = a
+        .analyze("DROP INDEX IF EXISTS pg_s.public.missing_idx")
+        .unwrap();
+    let drop_missing_plan = drop_missing_ok
+        .ddl_intent
+        .unwrap()
+        .into_guarded_plan(&pg, "db".into(), "public".into(), String::new())
+        .unwrap()
+        .unwrap();
+    assert!(drop_missing_plan.conditional);
+    assert_eq!(
+        a.analyze("DROP INDEX pg_s.public.missing_idx")
+            .unwrap_err()
+            .sqlstate,
+        "42704"
+    );
+    a.indexes.push(IndexOwner {
+        index: ObjectRef {
+            source: pg.id.clone(),
+            catalog: "pg_s".into(),
+            schema: "public".into(),
+            name: "existing_idx".into(),
+        },
+        table: ObjectRef {
+            source: pg.id.clone(),
+            catalog: "pg_s".into(),
+            schema: "public".into(),
+            name: "orders".into(),
+        },
+        protected: false,
+    });
+    assert!(
+        a.analyze("DROP INDEX IF EXISTS pg_s.public.existing_idx")
+            .is_ok()
+    );
+
+    // Expanded column types per dialect & rejections
+    for (src, db, schema, col_def) in [
+        (
+            &my,
+            "app",
+            "app",
+            "flag BOOLEAN, at_t TIME, raw_b BYTEA, uid UUID",
+        ),
+        (
+            &mdb,
+            "app",
+            "app",
+            "flag BOOLEAN, at_t TIME, raw_b BYTEA, uid UUID",
+        ),
+        (&ora, "ORCL", "HR", "raw_b BYTEA, ts TIMESTAMPTZ, uid UUID"),
+        (&mssql, "master", "dbo", "ts TIMESTAMPTZ, uid UUID"),
+        (&dm, "DAMENG", "DM", "ts TIMESTAMPTZ, uid UUID"),
+        (&db2, "TESTDB", "DB2INST1", "uid UUID, raw_b BYTEA"),
+        (&hana, "HDB", "APP", "uid UUID, raw_b BYTEA"),
+    ] {
+        let stmt = format!(
+            "CREATE TABLE {}.\"{schema}\".t ({col_def})",
+            src.catalog_alias
+        );
+        let plan = a
+            .analyze(&stmt)
+            .unwrap()
+            .ddl_intent
+            .unwrap()
+            .into_guarded_plan(src, db.into(), schema.into(), String::new())
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.contract_version, 5, "{stmt}");
+    }
+    for (src, db, schema, col_def) in [
+        (&ora, "ORCL", "HR", "at_t TIME"),
+        (&my, "app", "app", "ts TIMESTAMPTZ"),
+        (&db2, "TESTDB", "DB2INST1", "ts TIMESTAMPTZ"),
+        (&hana, "HDB", "APP", "ts TIMESTAMPTZ"),
+    ] {
+        let stmt = format!(
+            "CREATE TABLE {}.\"{schema}\".t ({col_def})",
+            src.catalog_alias
+        );
+        let parsed = a.analyze(&stmt).unwrap();
+        assert!(
+            parsed
+                .ddl_intent
+                .unwrap()
+                .into_guarded_plan(src, db.into(), schema.into(), String::new())
+                .is_err(),
+            "expected error for {stmt}"
+        );
+    }
+
+    // ODBC 5-source CTAS -> v6 create_table_as with rewritten query_sql; PG/MySQL -> Ok(None)
+    for (src, db, schema) in [
+        (&ora, "ORCL", "HR"),
+        (&mssql, "master", "dbo"),
+        (&dm, "DAMENG", "DM"),
+        (&db2, "TESTDB", "DB2INST1"),
+        (&hana, "HDB", "APP"),
+    ] {
+        let sql = format!(
+            "CREATE TABLE {0}.\"{1}\".copy_t AS SELECT id, name FROM {0}.\"{1}\".src_t WHERE id > 0",
+            src.catalog_alias, schema
+        );
+        let analyzed = a.analyze(&sql).unwrap();
+        let plan = analyzed
+            .ddl_intent
+            .unwrap()
+            .into_guarded_plan(src, db.into(), schema.into(), String::new())
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.contract_version, 6);
+        assert_eq!(plan.action, "create_table_as");
+        let q = plan.query_sql.unwrap();
+        assert!(!q.contains(&src.catalog_alias), "{q}");
+        assert!(q.contains("src_t"), "{q}");
+    }
+    let pg_ctas = a
+        .analyze("CREATE TABLE pg_s.public.copy_t AS SELECT id FROM pg_s.public.src_t")
+        .unwrap();
+    assert!(
+        pg_ctas
+            .ddl_intent
+            .unwrap()
+            .into_guarded_plan(&pg, "db".into(), "public".into(), String::new())
+            .unwrap()
+            .is_none()
+    );
+    let ms_cte = a
+        .analyze(
+            "CREATE TABLE ms_s.dbo.copy_t AS WITH c AS (SELECT id FROM ms_s.dbo.src_t) SELECT id FROM c",
+        )
+        .unwrap();
+    assert!(
+        ms_cte
+            .ddl_intent
+            .unwrap()
+            .into_guarded_plan(&mssql, "master".into(), "dbo".into(), String::new())
             .is_err()
     );
+    let ora_param_ctas = a.analyze(
+        "CREATE TABLE ora_s.\"HR\".copy_t AS SELECT id FROM ora_s.\"HR\".src_t WHERE id = $1",
+    );
+    if let Ok(parsed) = ora_param_ctas {
+        assert!(
+            parsed
+                .ddl_intent
+                .unwrap()
+                .into_guarded_plan(&ora, "ORCL".into(), "HR".into(), String::new())
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn guarded_mutation_param_reuse_reorder_and_all_dialect_returning() {
+    let pg = test_source("pg", DataSourceKind::Postgres, "pg_s", "public");
+    let gp = test_source("gp", DataSourceKind::Greenplum, "gp_s", "public");
+    let kb = test_source("kb", DataSourceKind::Kingbasees, "kb_s", "public");
+    let my = test_source("my", DataSourceKind::Mysql, "my_s", "app");
+    let mdb = test_source("mdb", DataSourceKind::Mariadb, "mdb_s", "app");
+    let ora = test_source("ora", DataSourceKind::Oracle, "ora_s", "HR");
+    let mssql = test_source("ms", DataSourceKind::Sqlserver, "ms_s", "dbo");
+    let dm = test_source("dm", DataSourceKind::Dameng, "dm_s", "DM");
+    let db2 = test_source("db2", DataSourceKind::Db2, "db2_s", "DB2INST1");
+    let hana = test_source("hana", DataSourceKind::Hana, "hana_s", "APP");
+
+    let a = Analyzer {
+        namespace: None,
+        sources: vec![
+            pg.clone(),
+            gp.clone(),
+            kb.clone(),
+            my.clone(),
+            mdb.clone(),
+            ora.clone(),
+            mssql.clone(),
+            dm.clone(),
+            db2.clone(),
+            hana.clone(),
+        ],
+        indexes: vec![],
+    };
+
+    // Out-of-order ($2 ... $1) and reuse ($1 ... $1) on ?-placeholder dialect
+    let upd_reorder = a
+        .analyze("UPDATE my_s.app.items SET name = $2, note = $1 WHERE id = $1")
+        .unwrap();
+    let (sql, _) = modorch_fedengine_ddl::compact_parameters(&upd_reorder.sql).unwrap();
+    let plan = modorch_fedengine_ddl::build_guarded_mutation_plan(
+        &sql,
+        &my,
+        upd_reorder.primary.as_ref().unwrap(),
+        None,
+        &[PgType::Int8, PgType::Text],
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(plan.param_map, vec![1, 0, 0]);
+    assert!(
+        plan.native_sql.contains("name = ?, note = ? WHERE id = ?"),
+        "{}",
+        plan.native_sql
+    );
+
+    // INSERT ... RETURNING allowed across all 10 guarded dialects
+    for src in [&pg, &gp, &kb, &my, &mdb, &ora, &mssql, &dm, &db2, &hana] {
+        let sql = format!(
+            "INSERT INTO {}.\"{}\".items (id, name) VALUES ($1, $2) RETURNING id",
+            src.catalog_alias, src.default_schema
+        );
+        let ins = a.analyze(&sql).unwrap();
+        let (compact, _) = modorch_fedengine_ddl::compact_parameters(&ins.sql).unwrap();
+        let mp = modorch_fedengine_ddl::build_guarded_mutation_plan(
+            &compact,
+            src,
+            ins.primary.as_ref().unwrap(),
+            ins.returning.as_ref(),
+            &[PgType::Int8, PgType::Text],
+        )
+        .unwrap()
+        .unwrap();
+        match src.kind {
+            DataSourceKind::Sqlserver => {
+                assert!(
+                    mp.native_sql.contains("OUTPUT INSERTED.[id]"),
+                    "{}",
+                    mp.native_sql
+                )
+            }
+            DataSourceKind::Db2 => assert!(
+                mp.native_sql
+                    .starts_with("SELECT \"id\" FROM FINAL TABLE ("),
+                "{}",
+                mp.native_sql
+            ),
+            DataSourceKind::Oracle | DataSourceKind::Dameng => {
+                assert!(
+                    mp.native_sql.ends_with(" RETURNING \"id\" INTO ?"),
+                    "{}",
+                    mp.native_sql
+                );
+            }
+            DataSourceKind::Mysql | DataSourceKind::Mariadb | DataSourceKind::Hana => {
+                assert!(
+                    !mp.native_sql.to_ascii_uppercase().contains("RETURNING"),
+                    "{}",
+                    mp.native_sql
+                );
+            }
+            _ => assert!(mp.native_sql.contains("RETURNING id"), "{}", mp.native_sql),
+        }
+    }
+
+    // Oracle/Dameng multi-row INSERT RETURNING -> 0A000
+    for src in [&ora, &dm] {
+        let sql = format!(
+            "INSERT INTO {}.\"{}\".items (id, name) VALUES ($1, $2), ($3, $4) RETURNING id",
+            src.catalog_alias, src.default_schema
+        );
+        let ins = a.analyze(&sql).unwrap();
+        let (compact, _) = modorch_fedengine_ddl::compact_parameters(&ins.sql).unwrap();
+        let err = modorch_fedengine_ddl::build_guarded_mutation_plan(
+            &compact,
+            src,
+            ins.primary.as_ref().unwrap(),
+            ins.returning.as_ref(),
+            &[PgType::Int8, PgType::Text, PgType::Int8, PgType::Text],
+        )
+        .unwrap_err();
+        assert_eq!(err.sqlstate, "0A000");
+    }
+
+    // UPDATE ... RETURNING
+    for src in [&pg, &gp, &kb, &ora, &mssql, &dm, &db2] {
+        let sql = format!(
+            "UPDATE {}.\"{}\".items SET name = $1 WHERE id = $2 RETURNING id",
+            src.catalog_alias, src.default_schema
+        );
+        let upd = a.analyze(&sql).unwrap();
+        let (compact, _) = modorch_fedengine_ddl::compact_parameters(&upd.sql).unwrap();
+        let mp = modorch_fedengine_ddl::build_guarded_mutation_plan(
+            &compact,
+            src,
+            upd.primary.as_ref().unwrap(),
+            upd.returning.as_ref(),
+            &[PgType::Text, PgType::Int8],
+        )
+        .unwrap()
+        .unwrap();
+        match src.kind {
+            DataSourceKind::Sqlserver => {
+                assert!(
+                    mp.native_sql.contains("OUTPUT INSERTED.[id]"),
+                    "{}",
+                    mp.native_sql
+                )
+            }
+            DataSourceKind::Db2 => assert!(
+                mp.native_sql
+                    .starts_with("SELECT \"id\" FROM FINAL TABLE ("),
+                "{}",
+                mp.native_sql
+            ),
+            DataSourceKind::Oracle | DataSourceKind::Dameng => {
+                assert!(
+                    mp.native_sql.ends_with(" RETURNING \"id\" INTO ?"),
+                    "{}",
+                    mp.native_sql
+                );
+            }
+            _ => assert!(mp.native_sql.contains("RETURNING id"), "{}", mp.native_sql),
+        }
+    }
+    for src in [&my, &mdb, &hana] {
+        let sql = format!(
+            "UPDATE {}.\"{}\".items SET name = $1 WHERE id = $2 RETURNING id",
+            src.catalog_alias, src.default_schema
+        );
+        let upd = a.analyze(&sql).unwrap();
+        let err = modorch_fedengine_ddl::build_guarded_mutation_plan(
+            &upd.sql,
+            src,
+            upd.primary.as_ref().unwrap(),
+            upd.returning.as_ref(),
+            &[PgType::Text, PgType::Int8],
+        )
+        .unwrap_err();
+        assert_eq!(err.sqlstate, "0A000");
+    }
+
+    // DELETE ... RETURNING
+    for src in [&pg, &gp, &kb, &mdb, &ora, &mssql, &dm, &db2] {
+        let sql = format!(
+            "DELETE FROM {}.\"{}\".items WHERE id = $1 RETURNING id",
+            src.catalog_alias, src.default_schema
+        );
+        let del = a.analyze(&sql).unwrap();
+        let mp = modorch_fedengine_ddl::build_guarded_mutation_plan(
+            &del.sql,
+            src,
+            del.primary.as_ref().unwrap(),
+            del.returning.as_ref(),
+            &[PgType::Int8],
+        )
+        .unwrap()
+        .unwrap();
+        match src.kind {
+            DataSourceKind::Sqlserver => {
+                assert!(
+                    mp.native_sql.contains("OUTPUT DELETED.[id]"),
+                    "{}",
+                    mp.native_sql
+                )
+            }
+            DataSourceKind::Db2 => assert!(
+                mp.native_sql.starts_with("SELECT \"id\" FROM OLD TABLE ("),
+                "{}",
+                mp.native_sql
+            ),
+            DataSourceKind::Oracle | DataSourceKind::Dameng => {
+                assert!(
+                    mp.native_sql.ends_with(" RETURNING \"id\" INTO ?"),
+                    "{}",
+                    mp.native_sql
+                );
+            }
+            _ => assert!(mp.native_sql.contains("RETURNING id"), "{}", mp.native_sql),
+        }
+    }
+    for src in [&my, &hana] {
+        let sql = format!(
+            "DELETE FROM {}.\"{}\".items WHERE id = $1 RETURNING id",
+            src.catalog_alias, src.default_schema
+        );
+        let del = a.analyze(&sql).unwrap();
+        let err = modorch_fedengine_ddl::build_guarded_mutation_plan(
+            &del.sql,
+            src,
+            del.primary.as_ref().unwrap(),
+            del.returning.as_ref(),
+            &[PgType::Int8],
+        )
+        .unwrap_err();
+        assert_eq!(err.sqlstate, "0A000");
+    }
 }

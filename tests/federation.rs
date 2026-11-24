@@ -39,7 +39,12 @@ async fn remote_crud_federation_ddl_index_generation_and_zero_cross_source_effec
         .actions
         .extend(["CREATE_SCHEMA".into(), "DROP_SCHEMA".into()]);
     // Discover the exact tuple in a separate in-memory admin instance, then enable tested operations.
-    let admin = duckdb::Connection::open_in_memory().unwrap();
+    let admin = duckdb::Connection::open_in_memory_with_flags(
+        duckdb::Config::default()
+            .with("allow_unsigned_extensions", "true")
+            .unwrap(),
+    )
+    .unwrap();
     admin
         .execute_batch(&format!(
             "SET extension_directory={}; LOAD postgres; LOAD mysql",
@@ -106,6 +111,13 @@ async fn remote_crud_federation_ddl_index_generation_and_zero_cross_source_effec
                     "ALTER_TABLE",
                     "ALTER_TABLE_ADD_COLUMN",
                     "ALTER_TABLE_DROP_COLUMN",
+                    "ALTER_TABLE_RENAME_TABLE",
+                    "ALTER_TABLE_RENAME_COLUMN",
+                    "ALTER_TABLE_COLUMN_TYPE",
+                    "ALTER_TABLE_COLUMN_DEFAULT",
+                    "ALTER_TABLE_COLUMN_NULLABILITY",
+                    "ALTER_TABLE_ADD_CONSTRAINT",
+                    "ALTER_TABLE_DROP_CONSTRAINT",
                     "CREATE_INDEX_BTREE",
                     "CREATE_INDEX_UNIQUE_BTREE",
                     "DROP_TABLE",
@@ -550,6 +562,349 @@ async fn remote_crud_federation_ddl_index_generation_and_zero_cross_source_effec
         .simple_query("DROP TABLE pg_crm.public.fedengine_copy")
         .await
         .unwrap();
+
+    // Verify v6 constraints, conditional DDL, SET/DROP NOT NULL, param reuse/reorder,
+    // expanded types (boolean/time/bytea/uuid), and UPDATE/DELETE RETURNING live on PG 17.7 & MySQL 5.7.
+    let v6_time = chrono::NaiveTime::from_hms_opt(12, 34, 56).unwrap();
+    let v6_bytes = b"\x01\x02\xab\xff".to_vec();
+    let v6_uuid = uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+    let v6_param_types = [
+        tokio_postgres::types::Type::TEXT,
+        tokio_postgres::types::Type::INT4,
+        tokio_postgres::types::Type::INT4,
+        tokio_postgres::types::Type::BOOL,
+        tokio_postgres::types::Type::TIME,
+        tokio_postgres::types::Type::BYTEA,
+        tokio_postgres::types::Type::UUID,
+    ];
+
+    client
+        .simple_query("CREATE TABLE pg_crm.public.fedengine_v6_parent(id INTEGER PRIMARY KEY)")
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        client
+            .simple_query(
+                "CREATE TABLE IF NOT EXISTS pg_crm.public.fedengine_v6_child(\
+                 id INTEGER PRIMARY KEY, \
+                 code VARCHAR(32) NOT NULL UNIQUE DEFAULT 'dflt', \
+                 parent_id INTEGER, \
+                 qty INTEGER NOT NULL DEFAULT 1, \
+                 flag BOOLEAN, \
+                 at_t TIME, \
+                 raw_b BYTEA, \
+                 uid UUID, \
+                 FOREIGN KEY(parent_id) REFERENCES pg_crm.public.fedengine_v6_parent(id), \
+                 CHECK(qty > 0))",
+            )
+            .await
+            .unwrap();
+        client
+            .simple_query(
+                "ALTER TABLE pg_crm.public.fedengine_v6_child ADD COLUMN IF NOT EXISTS note VARCHAR(64) NOT NULL DEFAULT 'n1'",
+            )
+            .await
+            .unwrap();
+    }
+    for _ in 0..2 {
+        client
+            .simple_query("ALTER TABLE pg_crm.public.fedengine_v6_child DROP COLUMN IF EXISTS note")
+            .await
+            .unwrap();
+    }
+    client
+        .execute(
+            "INSERT INTO pg_crm.public.fedengine_v6_parent VALUES(10)",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(
+        client
+            .execute(
+                "INSERT INTO pg_crm.public.fedengine_v6_child(id, code, parent_id, qty) VALUES(1, 'bad_chk', 10, 0)",
+                &[]
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        client
+            .execute(
+                "INSERT INTO pg_crm.public.fedengine_v6_child(id, code, parent_id, qty) VALUES(2, 'bad_fk', 999, 1)",
+                &[]
+            )
+            .await
+            .is_err()
+    );
+    let pg_ins = client
+        .prepare_typed(
+            "INSERT INTO pg_crm.public.fedengine_v6_child(id, code, parent_id, qty, flag, at_t, raw_b, uid) \
+             VALUES($2, $1, $2, $3, $4, $5, $6, $7)",
+            &v6_param_types,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .execute(
+                &pg_ins,
+                &[
+                    &"reused", &10i32, &5i32, &true, &v6_time, &v6_bytes, &v6_uuid
+                ],
+            )
+            .await
+            .unwrap(),
+        1
+    );
+    let pg_upd_ret = client
+        .prepare_typed(
+            "UPDATE pg_crm.public.fedengine_v6_child SET qty=$1 WHERE id=$2 RETURNING id",
+            &[
+                tokio_postgres::types::Type::INT4,
+                tokio_postgres::types::Type::INT4,
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .query_one(&pg_upd_ret, &[&9i32, &10i32])
+            .await
+            .unwrap()
+            .get::<_, i32>(0),
+        10
+    );
+    let pg_del_ret = client
+        .prepare_typed(
+            "DELETE FROM pg_crm.public.fedengine_v6_child WHERE id=$1 RETURNING id",
+            &[tokio_postgres::types::Type::INT4],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .query_one(&pg_del_ret, &[&10i32])
+            .await
+            .unwrap()
+            .get::<_, i32>(0),
+        10
+    );
+    for _ in 0..2 {
+        client
+            .simple_query(
+                "CREATE INDEX IF NOT EXISTS fedengine_v6_idx ON pg_crm.public.fedengine_v6_child(qty)",
+            )
+            .await
+            .unwrap();
+    }
+    for _ in 0..2 {
+        client
+            .simple_query("DROP INDEX IF EXISTS pg_crm.public.fedengine_v6_idx")
+            .await
+            .unwrap();
+    }
+    for _ in 0..2 {
+        client
+            .simple_query("DROP TABLE IF EXISTS pg_crm.public.fedengine_v6_child")
+            .await
+            .unwrap();
+        client
+            .simple_query("DROP TABLE IF EXISTS pg_crm.public.fedengine_v6_parent")
+            .await
+            .unwrap();
+    }
+
+    assert!(
+        client
+            .simple_query(
+                "CREATE TABLE mysql_erp.erp.fedengine_v6_chk(qty INTEGER, CHECK(qty > 0))"
+            )
+            .await
+            .is_err()
+    );
+    client
+        .simple_query("CREATE TABLE mysql_erp.erp.fedengine_v6_parent(id INTEGER PRIMARY KEY)")
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        client
+            .simple_query(
+                "CREATE TABLE IF NOT EXISTS mysql_erp.erp.fedengine_v6_child(\
+                 id INTEGER PRIMARY KEY, \
+                 code VARCHAR(32) NOT NULL UNIQUE DEFAULT 'dflt', \
+                 parent_id INTEGER, \
+                 qty INTEGER NOT NULL DEFAULT 1, \
+                 flag BOOLEAN, \
+                 at_t TIME, \
+                 raw_b BYTEA, \
+                 uid UUID, \
+                 FOREIGN KEY(parent_id) REFERENCES mysql_erp.erp.fedengine_v6_parent(id))",
+            )
+            .await
+            .unwrap();
+        client
+            .simple_query(
+                "ALTER TABLE mysql_erp.erp.fedengine_v6_child ADD COLUMN IF NOT EXISTS note VARCHAR(64) NOT NULL DEFAULT 'm1'",
+            )
+            .await
+            .unwrap();
+    }
+    for _ in 0..2 {
+        client
+            .simple_query("ALTER TABLE mysql_erp.erp.fedengine_v6_child DROP COLUMN IF EXISTS note")
+            .await
+            .unwrap();
+    }
+    client
+        .execute(
+            "INSERT INTO mysql_erp.erp.fedengine_v6_parent VALUES(10)",
+            &[],
+        )
+        .await
+        .unwrap();
+    let my_ins = client
+        .prepare_typed(
+            "INSERT INTO mysql_erp.erp.fedengine_v6_child(id, code, parent_id, qty, flag, at_t, raw_b, uid) \
+             VALUES($2, $1, $2, $3, $4, $5, $6, $7)",
+            &v6_param_types,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .execute(
+                &my_ins,
+                &[
+                    &"reused", &10i32, &5i32, &true, &v6_time, &v6_bytes, &v6_uuid
+                ],
+            )
+            .await
+            .unwrap(),
+        1
+    );
+    let my_row = client
+        .query_one(
+            "SELECT code, parent_id::INTEGER, qty::INTEGER, flag, at_t::VARCHAR, raw_b, uid::VARCHAR \
+             FROM mysql_erp.erp.fedengine_v6_child WHERE id=10",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(my_row.get::<_, String>(0), "reused");
+    assert_eq!(my_row.get::<_, i32>(1), 10);
+    assert_eq!(my_row.get::<_, i32>(2), 5);
+    assert!(my_row.get::<_, bool>(3));
+    assert!(my_row.get::<_, String>(4).starts_with("12:34:56"));
+    assert_eq!(my_row.get::<_, Vec<u8>>(5), v6_bytes);
+    assert_eq!(
+        my_row.get::<_, String>(6).to_ascii_lowercase(),
+        v6_uuid.to_string()
+    );
+    let my_upd = client
+        .prepare_typed(
+            "UPDATE mysql_erp.erp.fedengine_v6_child SET code=$2 WHERE id=$1 AND parent_id=$1",
+            &[
+                tokio_postgres::types::Type::INT4,
+                tokio_postgres::types::Type::TEXT,
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(client.execute(&my_upd, &[&10i32, &"upd"]).await.unwrap(), 1);
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT code FROM mysql_erp.erp.fedengine_v6_child WHERE id=10",
+                &[]
+            )
+            .await
+            .unwrap()
+            .get::<_, String>(0),
+        "upd"
+    );
+    client
+        .simple_query(
+            "ALTER TABLE mysql_erp.erp.fedengine_v6_child ALTER COLUMN code DROP NOT NULL",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .execute(
+                "INSERT INTO mysql_erp.erp.fedengine_v6_child(id, code, parent_id, qty) VALUES(11, NULL, 10, 1)",
+                &[]
+            )
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        client
+            .execute(
+                "UPDATE mysql_erp.erp.fedengine_v6_child SET code='k11' WHERE id=11",
+                &[]
+            )
+            .await
+            .unwrap(),
+        1
+    );
+    client
+        .simple_query("ALTER TABLE mysql_erp.erp.fedengine_v6_child ALTER COLUMN code SET NOT NULL")
+        .await
+        .unwrap();
+    assert!(
+        client
+            .execute(
+                "INSERT INTO mysql_erp.erp.fedengine_v6_child(id, code, parent_id, qty) VALUES(12, NULL, 10, 1)",
+                &[]
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        client
+            .execute(
+                "INSERT INTO mysql_erp.erp.fedengine_v6_child(id, parent_id) VALUES(12, 10)",
+                &[]
+            )
+            .await
+            .unwrap(),
+        1
+    );
+    let dflt_row = client
+        .query_one(
+            "SELECT code, qty::INTEGER FROM mysql_erp.erp.fedengine_v6_child WHERE id=12",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(dflt_row.get::<_, String>(0), "dflt");
+    assert_eq!(dflt_row.get::<_, i32>(1), 1);
+    for _ in 0..2 {
+        client
+            .simple_query(
+                "CREATE INDEX IF NOT EXISTS fedengine_v6_idx ON mysql_erp.erp.fedengine_v6_child(qty)",
+            )
+            .await
+            .unwrap();
+    }
+    for _ in 0..2 {
+        client
+            .simple_query("DROP INDEX IF EXISTS mysql_erp.erp.fedengine_v6_idx")
+            .await
+            .unwrap();
+    }
+    for _ in 0..2 {
+        client
+            .simple_query("DROP TABLE IF EXISTS mysql_erp.erp.fedengine_v6_child")
+            .await
+            .unwrap();
+        client
+            .simple_query("DROP TABLE IF EXISTS mysql_erp.erp.fedengine_v6_parent")
+            .await
+            .unwrap();
+    }
     client
         .simple_query("CREATE SCHEMA mysql_erp.fedengine_test_ns")
         .await
@@ -594,6 +949,8 @@ async fn remote_crud_federation_ddl_index_generation_and_zero_cross_source_effec
     assert_eq!(metrics.active_sessions, 0);
     assert_eq!(metrics.metadata_stale, 0);
     assert!(metrics.ddl_confirmed >= 20);
-    assert!(metrics.unknown_writes >= 2);
+    // Guarded CRUD proves rollback on the PG/MySQL unique-constraint violations above;
+    // indeterminate unknown-write drain is verified in tests/clients.rs.
+    assert_eq!(metrics.unknown_writes, 0);
     assert_eq!(metrics.admitted, metrics.completed + metrics.failed);
 }

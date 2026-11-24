@@ -20,7 +20,7 @@ impl QueryParser for Backend {
     where
         C: ClientInfo + Unpin + Send + std::marker::Sync,
     {
-        if Analyzer::parse(sql).map_err(pg_error)?.is_empty() {
+        if Analyzer::split(sql).map_err(pg_error)?.is_empty() {
             return Ok(None);
         }
         let types = types

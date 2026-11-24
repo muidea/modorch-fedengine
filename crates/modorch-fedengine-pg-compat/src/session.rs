@@ -1,9 +1,33 @@
 //! One session setting registry for PostgreSQL probes and state-changing commands.
 use modorch_fedengine_contract::*;
 use modorch_fedengine_core::*;
-use sqlparser::{ast::*, dialect::PostgreSqlDialect, parser::Parser};
+use sqlparser::{
+    ast::*,
+    dialect::PostgreSqlDialect,
+    parser::Parser,
+    tokenizer::{Token, Tokenizer},
+};
 
 pub const SERVER_VERSION: &str = "16.0 (FedEngine 0.1; PostgreSQL protocol subset)";
+pub(crate) fn is_reindex_statement(sql: &str) -> bool {
+    let Ok(tokens) = Tokenizer::new(&PostgreSqlDialect {}, sql).tokenize() else {
+        return false;
+    };
+    let mut non_ws = tokens
+        .into_iter()
+        .filter(|t| !matches!(t, Token::Whitespace(_)))
+        .collect::<Vec<_>>();
+    if matches!(non_ws.last(), Some(Token::SemiColon)) {
+        non_ws.pop();
+    }
+    if non_ws.iter().any(|t| matches!(t, Token::SemiColon)) {
+        return false;
+    }
+    matches!(
+        non_ws.first(),
+        Some(Token::Word(w)) if w.quote_style.is_none() && w.value.eq_ignore_ascii_case("REINDEX")
+    )
+}
 pub fn parse_pg(sql: &str) -> Result<Vec<Statement>> {
     if sql.len() > 1024 * 1024 {
         return Err(EngineError::new("54000", "SQL exceeds 1 MiB limit"));
@@ -243,7 +267,11 @@ pub fn session_command(
     sql: &str,
     session: &SessionContext,
 ) -> Result<Option<(SessionContext, String)>> {
-    let mut statements = parse_pg(sql)?;
+    let mut statements = match parse_pg(sql) {
+        Ok(s) => s,
+        Err(_) if is_reindex_statement(sql) => return Ok(None),
+        Err(err) => return Err(err),
+    };
     if statements.len() != 1 {
         return Err(EngineError::unsupported("one statement is required"));
     }
@@ -311,4 +339,24 @@ fn reset(session: &mut SessionContext, name: &str) -> Result<()> {
         session.settings.remove(&name);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reindex_passes_session_command_unless_multi_statement() {
+        assert_eq!(
+            session_command(
+                "REINDEX INDEX pg_crm.public.idx_a",
+                &SessionContext::default()
+            )
+            .unwrap(),
+            None
+        );
+        assert!(
+            session_command("REINDEX INDEX idx_a; SELECT 1", &SessionContext::default()).is_err()
+        );
+    }
 }

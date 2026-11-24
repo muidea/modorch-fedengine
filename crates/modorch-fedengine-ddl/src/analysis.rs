@@ -3,7 +3,12 @@ use crate::{
     model::*,
 };
 use modorch_fedengine_core::*;
-use sqlparser::{ast::*, dialect::DuckDbDialect, parser::Parser};
+use sqlparser::{
+    ast::*,
+    dialect::DuckDbDialect,
+    parser::Parser,
+    tokenizer::{Token, Tokenizer},
+};
 use std::{collections::BTreeSet, ops::ControlFlow};
 /// Shared immutable relation indexes from the current catalog snapshots.
 #[derive(Debug, Clone, Default)]
@@ -46,7 +51,18 @@ impl Analyzer {
             .map_err(|_| EngineError::new("42601", "SQL syntax is outside the supported grammar"))
     }
     pub fn split(sql: &str) -> Result<Vec<String>> {
-        let statements = Self::parse(sql)?;
+        if sql.len() > 1024 * 1024 {
+            return Err(EngineError::new("54000", "SQL exceeds 1 MiB limit"));
+        }
+        let statements = match Self::parse(sql) {
+            Ok(s) => s,
+            Err(err) => {
+                if parse_reindex_index(sql)?.is_some() {
+                    return Ok(vec![sql.trim().trim_end_matches(';').trim().to_string()]);
+                }
+                return Err(err);
+            }
+        };
         if statements.len() > 64 {
             return Err(EngineError::new("54000", "too many statements"));
         }
@@ -65,7 +81,15 @@ impl Analyzer {
         Ok(statements.iter().map(ToString::to_string).collect())
     }
     pub fn analyze(&self, sql: &str) -> Result<Analysis> {
-        let mut parsed = Self::parse(sql)?;
+        let mut parsed = match Self::parse(sql) {
+            Ok(p) => p,
+            Err(err) => {
+                if let Some(name) = parse_reindex_index(sql)? {
+                    return self.analyze_reindex(&name);
+                }
+                return Err(err);
+            }
+        };
         if parsed.len() != 1 {
             return Err(EngineError::unsupported(
                 "exactly one statement is required",
@@ -105,6 +129,7 @@ impl Analyzer {
             }
             Statement::Drop {
                 object_type,
+                if_exists,
                 names,
                 cascade,
                 purge,
@@ -121,33 +146,61 @@ impl Analyzer {
                 if *object_type == ObjectType::Index {
                     let candidates: Vec<_> =
                         self.indexes.iter().filter(|i| i.index == object).collect();
-                    if candidates.len() != 1 {
+                    if candidates.len() > 1 || (candidates.is_empty() && !*if_exists) {
                         return Err(EngineError::new(
                             "42704",
                             "index table ownership is unknown or ambiguous",
                         ));
                     }
-                    let owner = candidates[0];
-                    if owner.protected {
-                        return Err(EngineError::denied(
-                            "constraint/protected indexes cannot be dropped",
-                        ));
+                    if candidates.is_empty() {
+                        let owner_table = if let Some(t) = table {
+                            let bound = self.bind(t, false)?;
+                            binder.objects.insert(bound.clone());
+                            bound
+                        } else {
+                            ObjectRef {
+                                source: object.source.clone(),
+                                catalog: object.catalog.clone(),
+                                schema: object.schema.clone(),
+                                name: String::new(),
+                            }
+                        };
+                        index = Some(IndexIntent {
+                            table: owner_table.clone(),
+                            name: object.name.clone(),
+                            columns: vec![],
+                            unique: false,
+                            create: false,
+                            if_exists: true,
+                        });
+                        primary = Some(if table.is_some() {
+                            owner_table
+                        } else {
+                            object.clone()
+                        });
+                    } else {
+                        let owner = candidates[0];
+                        if owner.protected {
+                            return Err(EngineError::denied(
+                                "constraint/protected indexes cannot be dropped",
+                            ));
+                        }
+                        if let Some(t) = table
+                            && self.bind(t, false)? != owner.table
+                        {
+                            return Err(EngineError::denied("index and supplied table disagree"));
+                        }
+                        binder.objects.insert(owner.table.clone());
+                        index = Some(IndexIntent {
+                            table: owner.table.clone(),
+                            name: object.name.clone(),
+                            columns: vec![],
+                            unique: false,
+                            create: false,
+                            if_exists: *if_exists,
+                        });
+                        primary = Some(owner.table.clone());
                     }
-                    if let Some(t) = table
-                        && self.bind(t, false)? != owner.table
-                    {
-                        return Err(EngineError::denied("index and supplied table disagree"));
-                    }
-                    binder.objects.insert(owner.table.clone());
-                    index = Some(IndexIntent {
-                        table: owner.table.clone(),
-                        name: object.name.clone(),
-                        columns: vec![],
-                        unique: false,
-                        create: false,
-                        if_exists: false,
-                    });
-                    primary = Some(owner.table.clone());
                 } else {
                     primary = Some(object.clone());
                 }
@@ -368,41 +421,25 @@ impl Analyzer {
                 {
                     return Err(EngineError::unsupported("INSERT variant is not enabled"));
                 }
-                if let Some(items) = &i.returning {
-                    if items.len() != 1 {
-                        return Err(EngineError::unsupported(
-                            "INSERT RETURNING only supports a single identifier column",
-                        ));
-                    }
-                    let SelectItem::UnnamedExpr(Expr::Identifier(col)) = &items[0] else {
-                        return Err(EngineError::unsupported(
-                            "INSERT RETURNING only supports a single identifier column",
-                        ));
-                    };
-                    returning = Some(modorch_fedengine_contract::ReturningPlan {
-                        column: col.value.clone(),
-                    });
-                }
+                returning = extract_returning(&i.returning)?;
                 if let TableObject::TableName(name) = &i.table {
                     primary = Some(self.bind(name, false)?);
                 }
             }
             Statement::Update(u) => {
-                if u.returning.is_some()
-                    || !u.table.joins.is_empty()
-                    || u.output.is_some()
-                    || u.or.is_some()
-                {
+                if !u.table.joins.is_empty() || u.output.is_some() || u.or.is_some() {
                     return Err(EngineError::unsupported("UPDATE variant is not enabled"));
                 }
+                returning = extract_returning(&u.returning)?;
                 if let TableFactor::Table { name, .. } = &u.table.relation {
                     primary = Some(self.bind(name, false)?);
                 }
             }
             Statement::Delete(d) => {
-                if d.returning.is_some() || !d.tables.is_empty() || d.output.is_some() {
+                if !d.tables.is_empty() || d.output.is_some() {
                     return Err(EngineError::unsupported("DELETE variant is not enabled"));
                 }
+                returning = extract_returning(&d.returning)?;
                 let from = match &d.from {
                     FromTable::WithFromKeyword(v) | FromTable::WithoutKeyword(v) => v,
                 };
@@ -465,6 +502,145 @@ impl Analyzer {
             ddl_intent,
         })
     }
+
+    fn analyze_reindex(&self, name: &ObjectName) -> Result<Analysis> {
+        let object = self.bind(name, false)?;
+        let candidates: Vec<_> = self.indexes.iter().filter(|i| i.index == object).collect();
+        if candidates.len() != 1 {
+            return Err(EngineError::new(
+                "42704",
+                "index table ownership is unknown or ambiguous",
+            ));
+        }
+        let owner = candidates[0];
+        if owner.protected {
+            return Err(EngineError::denied(
+                "constraint/protected indexes cannot be reindexed",
+            ));
+        }
+        let mut objects = BTreeSet::new();
+        objects.insert(owner.table.clone());
+        objects.insert(object.clone());
+        let sources: BTreeSet<_> = objects.iter().map(|o| o.source.clone()).collect();
+        let rewritten_name = object_name(&[&object.catalog, &object.schema, &object.name]);
+        Ok(Analysis {
+            capability: "REINDEX".into(),
+            sql: format!("REINDEX INDEX {rewritten_name}"),
+            kind: Kind::Ddl,
+            action: "REINDEX".into(),
+            command: "REINDEX".into(),
+            objects,
+            sources,
+            primary: Some(owner.table.clone()),
+            index: None,
+            returning: None,
+            ddl_intent: Some(DdlIntent {
+                action: "reindex".into(),
+                table_name: object.name.clone(),
+                index_name: String::new(),
+                owner: owner.table.name.clone(),
+                new_name: String::new(),
+                column_name: String::new(),
+                default_kind: String::new(),
+                default_value: String::new(),
+                constraint_name: String::new(),
+                constraint: None,
+                constraints: Vec::new(),
+                identity_mode: String::new(),
+                columns: Vec::new(),
+                keys: Vec::new(),
+                conditional: false,
+                only: false,
+                query_sql: None,
+            }),
+        })
+    }
+}
+
+pub(crate) fn extract_returning(
+    returning: &Option<Vec<SelectItem>>,
+) -> Result<Option<modorch_fedengine_contract::ReturningPlan>> {
+    let Some(items) = returning else {
+        return Ok(None);
+    };
+    if items.len() != 1 {
+        return Err(EngineError::unsupported(
+            "RETURNING only supports a single identifier column",
+        ));
+    }
+    let SelectItem::UnnamedExpr(Expr::Identifier(col)) = &items[0] else {
+        return Err(EngineError::unsupported(
+            "RETURNING only supports a single identifier column",
+        ));
+    };
+    Ok(Some(modorch_fedengine_contract::ReturningPlan {
+        column: col.value.clone(),
+    }))
+}
+
+pub(crate) fn parse_reindex_index(sql: &str) -> Result<Option<ObjectName>> {
+    let tokens: Vec<Token> = Tokenizer::new(&DuckDbDialect {}, sql)
+        .tokenize()
+        .map_err(|_| EngineError::new("42601", "SQL syntax is outside the supported grammar"))?
+        .into_iter()
+        .filter(|t| !matches!(t, Token::Whitespace(_)))
+        .collect();
+    let Some(Token::Word(first)) = tokens.first() else {
+        return Ok(None);
+    };
+    if first.quote_style.is_some() || !first.value.eq_ignore_ascii_case("REINDEX") {
+        return Ok(None);
+    }
+    let Some(Token::Word(kind)) = tokens.get(1) else {
+        return Err(EngineError::unsupported(
+            "only ordinary REINDEX INDEX <name> is enabled",
+        ));
+    };
+    if kind.quote_style.is_some() || !kind.value.eq_ignore_ascii_case("INDEX") {
+        return Err(EngineError::unsupported(
+            "only ordinary REINDEX INDEX <name> is enabled",
+        ));
+    }
+    let mut idx = 2usize;
+    let mut parts = Vec::new();
+    loop {
+        let Some(Token::Word(w)) = tokens.get(idx) else {
+            return Err(EngineError::unsupported(
+                "REINDEX target must be a 1..3-part index identifier",
+            ));
+        };
+        if parts.is_empty()
+            && w.quote_style.is_none()
+            && w.value.eq_ignore_ascii_case("CONCURRENTLY")
+        {
+            return Err(EngineError::unsupported("REINDEX CONCURRENTLY is disabled"));
+        }
+        let ident = match w.quote_style {
+            Some(q) => Ident::with_quote(q, &w.value),
+            None => Ident::new(&w.value),
+        };
+        parts.push(ObjectNamePart::Identifier(ident));
+        idx += 1;
+        if matches!(tokens.get(idx), Some(Token::Period)) {
+            idx += 1;
+            continue;
+        }
+        break;
+    }
+    if parts.is_empty() || parts.len() > 3 {
+        return Err(EngineError::unsupported(
+            "REINDEX target must be a 1..3-part index identifier",
+        ));
+    }
+    if matches!(tokens.get(idx), Some(Token::SemiColon)) {
+        idx += 1;
+    }
+    if idx != tokens.len() {
+        return Err(EngineError::unsupported(
+            "REINDEX options or trailing tokens are disabled",
+        ));
+    }
+    Ok(Some(ObjectName(parts)))
 }
 pub(super) fn classify(s: &Statement) -> Result<(Kind, String, String)> {
     let (k, a, c) = match s {

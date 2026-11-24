@@ -18,11 +18,6 @@ impl IndexIntent {
         };
         let table = format!("{}.{}", q(&self.table.schema), q(&self.table.name));
         let remote = if self.create {
-            if self.if_exists && kind.is_mysql_family() {
-                return Err(EngineError::unsupported(
-                    "MySQL index IF NOT EXISTS is not verified",
-                ));
-            }
             format!(
                 "CREATE {}INDEX {}{} ON {} ({})",
                 if self.unique { "UNIQUE " } else { "" },
@@ -54,7 +49,16 @@ pub fn drop_index_name(sql: &str) -> Result<Option<ObjectName>> {
 }
 
 pub fn index_ownership_target(sql: &str) -> Result<Option<(ObjectName, &'static str)>> {
-    Ok(match Analyzer::parse(sql)?.first() {
+    let parsed = match Analyzer::parse(sql) {
+        Ok(p) => p,
+        Err(err) => {
+            if let Some(name) = crate::analysis::parse_reindex_index(sql)? {
+                return Ok(Some((name, "REINDEX")));
+            }
+            return Err(err);
+        }
+    };
+    Ok(match parsed.first() {
         Some(Statement::Drop {
             object_type: ObjectType::Index,
             names,

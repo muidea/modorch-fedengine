@@ -39,11 +39,13 @@ pub struct DdlIntent {
     pub default_value: String,
     pub constraint_name: String,
     pub constraint: Option<DdlConstraintSpec>,
+    pub constraints: Vec<DdlConstraintSpec>,
     pub identity_mode: String,
     pub columns: Vec<DdlColumnSpec>,
     pub keys: Vec<String>,
     pub conditional: bool,
     pub only: bool,
+    pub query_sql: Option<String>,
 }
 impl DdlIntent {
     /// Convert an analyzed DDL intent into a typed native guarded-DDL plan for `source`.

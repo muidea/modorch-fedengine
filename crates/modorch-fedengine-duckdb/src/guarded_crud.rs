@@ -11,13 +11,14 @@ pub(super) fn crud_product(kind: DataSourceKind) -> Option<&'static str> {
     match kind {
         DataSourceKind::Postgres => Some("postgres"),
         DataSourceKind::Greenplum => Some("greenplum"),
-        DataSourceKind::Kingbasees => Some("kingbase"),
+        DataSourceKind::Kingbasees => Some("kingbasees"),
         DataSourceKind::Mysql | DataSourceKind::Mariadb => Some("mysql"),
         DataSourceKind::Oracle => Some("oracle"),
         DataSourceKind::Sqlserver => Some("sqlserver"),
         DataSourceKind::Dameng => Some("dameng"),
         DataSourceKind::Db2 => Some("db2"),
-        DataSourceKind::Starrocks | DataSourceKind::Hana => None,
+        DataSourceKind::Hana => Some("hana"),
+        DataSourceKind::Starrocks => None,
     }
 }
 
@@ -143,15 +144,28 @@ pub(super) fn parse_returning_descriptor(
     let col = cols
         .iter()
         .find(|c| {
-            c.get("name")
-                .and_then(|n| n.as_str())
-                .is_some_and(|n| n == col_name)
+            !c.get("dropped").and_then(|v| v.as_bool()).unwrap_or(false)
+                && c.get("name")
+                    .and_then(|n| n.as_str())
+                    .is_some_and(|n| n == col_name)
         })
         .ok_or_else(|| EngineError::new("42703", format!("column {col_name} does not exist")))?;
     let oid = col
         .get("pg_type")
         .and_then(|t| t.get("oid"))
         .and_then(|v| v.as_i64())
+        .or_else(|| col.get("type_oid").and_then(|v| v.as_i64()))
+        .or_else(|| {
+            col.get("data_type")
+                .and_then(|v| v.as_str())
+                .and_then(|dt| match dt.to_ascii_lowercase().as_str() {
+                    "smallint" | "int2" => Some(21),
+                    "int" | "integer" | "int4" => Some(23),
+                    "bigint" | "int8" => Some(20),
+                    "uniqueidentifier" | "uuid" => Some(2950),
+                    _ => None,
+                })
+        })
         .ok_or_else(|| EngineError::unsupported("returned column OID is unavailable"))?;
     let pg = returning_oid_to_pg_type(oid, mysql)?;
     Ok((col_name.to_string(), oid, pg))
@@ -262,11 +276,20 @@ pub(super) fn build_guarded_mutation_sql(
     };
     let mut query = format!("SELECT * FROM system.main.{fn_name}(?, ?, ?, ?, ?, ?");
     if !param_types.is_empty() {
+        let oracle = product == "oracle";
+        let pg_family = matches!(product, "postgres" | "greenplum" | "kingbasees");
         let parts = param_types
             .iter()
             .enumerate()
             .map(|(i, ty)| {
-                let cast = duckdb_cast_type(*ty)?;
+                let cast = if *ty == PgType::Bytea && !pg_family {
+                    "BLOB"
+                } else if oracle {
+                    let _ = duckdb_cast_type(*ty)?;
+                    "VARCHAR"
+                } else {
+                    duckdb_cast_type(*ty)?
+                };
                 Ok(format!("p{} := CAST(? AS {cast})", i + 1))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -294,7 +317,44 @@ fn has_source_diagnostics(conn: &Connection, fn_name: &str) -> bool {
     .unwrap_or(false)
 }
 
-fn cell_as_guarded_param(value: &Cell, ty: PgType) -> Result<duckdb::types::Value> {
+fn cell_as_guarded_param(
+    value: &Cell,
+    ty: PgType,
+    kind: DataSourceKind,
+) -> Result<duckdb::types::Value> {
+    if let (Cell::Bytes(b), PgType::Bytea) = (value, ty)
+        && !kind.is_postgres_family()
+    {
+        return Ok(duckdb::types::Value::Blob(b.clone()));
+    }
+    if let (Cell::Timestamp(v), PgType::Timestamptz) = (value, ty)
+        && matches!(
+            kind,
+            DataSourceKind::Oracle | DataSourceKind::Sqlserver | DataSourceKind::Dameng
+        )
+    {
+        let dt = chrono::DateTime::from_timestamp_micros(*v)
+            .ok_or_else(|| EngineError::new("22007", "invalid timestamptz value"))?;
+        return Ok(duckdb::types::Value::Text(
+            dt.format("%Y-%m-%d %H:%M:%S%.6f+00:00").to_string(),
+        ));
+    }
+    if kind == DataSourceKind::Oracle {
+        return Ok(match value {
+            Cell::Null => duckdb::types::Value::Null,
+            Cell::Bool(v) => duckdb::types::Value::Text(if *v { "1" } else { "0" }.into()),
+            Cell::I16(v) => duckdb::types::Value::Text(v.to_string()),
+            Cell::I32(v) => duckdb::types::Value::Text(v.to_string()),
+            Cell::I64(v) => duckdb::types::Value::Text(v.to_string()),
+            Cell::F32(v) => duckdb::types::Value::Text(v.to_string()),
+            Cell::F64(v) => duckdb::types::Value::Text(v.to_string()),
+            Cell::Numeric(s) | Cell::Text(s) => duckdb::types::Value::Text(s.clone()),
+            _ => match modorch_fedengine_pg_compat::text_value(value, ty)? {
+                Some(text) => duckdb::types::Value::Text(text),
+                None => duckdb::types::Value::Null,
+            },
+        });
+    }
     Ok(match value {
         Cell::Null => duckdb::types::Value::Null,
         Cell::Bool(v) => duckdb::types::Value::Boolean(*v),
@@ -398,6 +458,9 @@ pub(super) fn execute(
         columns,
         parameters: param_types.to_vec(),
     }));
+    if r.prepare_only {
+        return Ok(());
+    }
     if r.cancel.is_cancelled() {
         return Err(EngineError::new("57014", "write canceled before execute"));
     }
@@ -411,17 +474,45 @@ pub(super) fn execute(
     let ret_tuple = returning_info
         .as_ref()
         .map(|(n, oid, _)| (n.as_str(), *oid));
-    let mut_sql = build_guarded_mutation_sql(product, ret_tuple, param_types, mut_diag)?;
+    let expanded_param_types: Vec<PgType>;
+    let effective_param_types: &[PgType] = if plan.param_map.is_empty() {
+        param_types
+    } else {
+        expanded_param_types = plan
+            .param_map
+            .iter()
+            .map(|&idx| {
+                param_types.get(idx).copied().ok_or_else(|| {
+                    EngineError::new("XX000", "guarded mutation parameter index out of bounds")
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        &expanded_param_types
+    };
+    let mut_sql = build_guarded_mutation_sql(product, ret_tuple, effective_param_types, mut_diag)?;
 
-    let mut args: Vec<duckdb::types::Value> = Vec::with_capacity(6 + r.parameters.len() + 1);
+    let mut args: Vec<duckdb::types::Value> =
+        Vec::with_capacity(6 + effective_param_types.len() + 1);
     args.push(duckdb::types::Value::Text(plan.catalog.clone()));
     args.push(duckdb::types::Value::Text(plan.schema.clone()));
     args.push(duckdb::types::Value::Text(plan.table.clone()));
     args.push(duckdb::types::Value::Text(descriptor));
     args.push(duckdb::types::Value::Text(version));
     args.push(duckdb::types::Value::Text(plan.native_sql.clone()));
-    for (p, ty) in r.parameters.iter().zip(param_types.iter()) {
-        args.push(cell_as_guarded_param(p, *ty)?);
+    if plan.param_map.is_empty() {
+        for (p, ty) in r.parameters.iter().zip(param_types.iter()) {
+            args.push(cell_as_guarded_param(p, *ty, plan.kind)?);
+        }
+    } else {
+        for &idx in &plan.param_map {
+            let p = r.parameters.get(idx).ok_or_else(|| {
+                EngineError::new("XX000", "guarded mutation parameter value out of bounds")
+            })?;
+            let ty = param_types.get(idx).ok_or_else(|| {
+                EngineError::new("XX000", "guarded mutation parameter type out of bounds")
+            })?;
+            args.push(cell_as_guarded_param(p, *ty, plan.kind)?);
+        }
     }
     if let Some((_, oid, _)) = &returning_info {
         args.push(duckdb::types::Value::BigInt(*oid));
@@ -619,6 +710,12 @@ mod tests {
         assert_eq!((name.as_str(), oid, pg), ("id", 20, PgType::Int8));
         assert!(parse_returning_descriptor(desc, "u", true).is_err());
 
+        let pg_desc = r#"{"columns":[{"name":"id","type_oid":23,"dropped":true},{"name":"id","type_oid":20,"dropped":false}]}"#;
+        let (name, oid, pg) = parse_returning_descriptor(pg_desc, "id", false).unwrap();
+        assert_eq!((name.as_str(), oid, pg), ("id", 20, PgType::Int8));
+        let dropped_only = r#"{"columns":[{"name":"id","type_oid":23,"dropped":true}]}"#;
+        assert!(parse_returning_descriptor(dropped_only, "id", false).is_err());
+
         let rows = decode_returning_rows(r#"[["42"],["100"]]"#, PgType::Int8, 2).unwrap();
         assert!(matches!(rows[0].as_slice(), [Cell::I64(42)]));
         assert!(matches!(rows[1].as_slice(), [Cell::I64(100)]));
@@ -677,5 +774,113 @@ mod tests {
             rx.try_recv().unwrap(),
             ResultChunk::Complete(c) if c.affected_rows == Some(1) && c.outcome == ExecutionOutcome::CommitConfirmed
         ));
+    }
+
+    #[test]
+    fn kingbasees_hana_and_oracle_varchar_param_packing() {
+        assert_eq!(crud_product(DataSourceKind::Kingbasees), Some("kingbasees"));
+        assert_eq!(crud_product(DataSourceKind::Hana), Some("hana"));
+
+        let oracle_sql =
+            build_guarded_mutation_sql("oracle", None, &[PgType::Bool, PgType::Int8], false)
+                .unwrap();
+        assert_eq!(
+            oracle_sql,
+            "SELECT * FROM system.main.oracle_guarded_mutation(?, ?, ?, ?, ?, ?, params := struct_pack(p1 := CAST(? AS VARCHAR), p2 := CAST(? AS VARCHAR)))"
+        );
+
+        assert_eq!(
+            cell_as_guarded_param(&Cell::Bool(true), PgType::Bool, DataSourceKind::Oracle).unwrap(),
+            duckdb::types::Value::Text("1".into())
+        );
+        assert_eq!(
+            cell_as_guarded_param(&Cell::Bool(false), PgType::Bool, DataSourceKind::Oracle)
+                .unwrap(),
+            duckdb::types::Value::Text("0".into())
+        );
+        assert_eq!(
+            cell_as_guarded_param(&Cell::I64(42), PgType::Int8, DataSourceKind::Oracle).unwrap(),
+            duckdb::types::Value::Text("42".into())
+        );
+        assert_eq!(
+            cell_as_guarded_param(&Cell::F64(1.5), PgType::Float8, DataSourceKind::Oracle).unwrap(),
+            duckdb::types::Value::Text("1.5".into())
+        );
+
+        // Non-PG Bytea casts to BLOB (including Oracle), whereas PG uses VARCHAR
+        for prod in ["mysql", "oracle", "sqlserver", "dameng", "db2", "hana"] {
+            let blob_sql = build_guarded_mutation_sql(prod, None, &[PgType::Bytea], false).unwrap();
+            assert!(
+                blob_sql.contains("p1 := CAST(? AS BLOB)"),
+                "{prod}: {blob_sql}"
+            );
+        }
+        let pg_blob_sql =
+            build_guarded_mutation_sql("postgres", None, &[PgType::Bytea], false).unwrap();
+        assert!(
+            pg_blob_sql.contains("p1 := CAST(? AS VARCHAR)"),
+            "{pg_blob_sql}"
+        );
+
+        assert_eq!(
+            cell_as_guarded_param(
+                &Cell::Bytes(vec![1, 2, 3]),
+                PgType::Bytea,
+                DataSourceKind::Oracle
+            )
+            .unwrap(),
+            duckdb::types::Value::Blob(vec![1, 2, 3])
+        );
+        assert_eq!(
+            cell_as_guarded_param(
+                &Cell::Timestamp(0),
+                PgType::Timestamptz,
+                DataSourceKind::Oracle
+            )
+            .unwrap(),
+            duckdb::types::Value::Text("1970-01-01 00:00:00.000000+00:00".into())
+        );
+        assert_eq!(
+            cell_as_guarded_param(
+                &Cell::Timestamp(0),
+                PgType::Timestamptz,
+                DataSourceKind::Sqlserver
+            )
+            .unwrap(),
+            duckdb::types::Value::Text("1970-01-01 00:00:00.000000+00:00".into())
+        );
+        assert_eq!(
+            cell_as_guarded_param(
+                &Cell::Timestamp(0),
+                PgType::Timestamptz,
+                DataSourceKind::Dameng
+            )
+            .unwrap(),
+            duckdb::types::Value::Text("1970-01-01 00:00:00.000000+00:00".into())
+        );
+
+        // parse_returning_descriptor data_type fallback
+        for (dt, expected_oid, expected_pg) in [
+            ("smallint", 21, PgType::Int2),
+            ("int4", 23, PgType::Int4),
+            ("bigint", 20, PgType::Int8),
+            ("uniqueidentifier", 2950, PgType::Uuid),
+        ] {
+            let desc = format!(r#"{{"columns":[{{"name":"id","data_type":"{dt}"}}]}}"#);
+            let (n, oid, pg) = parse_returning_descriptor(&desc, "id", false).unwrap();
+            assert_eq!((n.as_str(), oid, pg), ("id", expected_oid, expected_pg));
+        }
+
+        // param_map expansion helper check via build_guarded_mutation_sql
+        let param_map = [1usize, 0, 0];
+        let base_types = [PgType::Int8, PgType::Text];
+        let expanded: Vec<PgType> = param_map.iter().map(|&i| base_types[i]).collect();
+        let reordered_sql = build_guarded_mutation_sql("mysql", None, &expanded, false).unwrap();
+        assert!(
+            reordered_sql.contains(
+                "p1 := CAST(? AS VARCHAR), p2 := CAST(? AS BIGINT), p3 := CAST(? AS BIGINT)"
+            ),
+            "{reordered_sql}"
+        );
     }
 }

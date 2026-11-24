@@ -467,7 +467,12 @@ async fn zero_source_online_activation_catalog_refresh_rollback_portal_drain_and
             .to_string_lossy()
             .into(),
     );
-    let admin = duckdb::Connection::open_in_memory().unwrap();
+    let admin = duckdb::Connection::open_in_memory_with_flags(
+        duckdb::Config::default()
+            .with("allow_unsigned_extensions", "true")
+            .unwrap(),
+    )
+    .unwrap();
     admin
         .execute_batch(&format!(
             "SET extension_directory={}; LOAD postgres; LOAD mysql",
@@ -1704,7 +1709,12 @@ async fn mysql_strict_identity_rotates_on_resume_and_startup() {
     });
     let dsn = std::env::var("FEDENGINE_MYSQL_DSN").unwrap();
     std::fs::write(temporary.path().join("strict_mysql"), &dsn).unwrap();
-    let admin = duckdb::Connection::open_in_memory().unwrap();
+    let admin = duckdb::Connection::open_in_memory_with_flags(
+        duckdb::Config::default()
+            .with("allow_unsigned_extensions", "true")
+            .unwrap(),
+    )
+    .unwrap();
     admin.execute_batch(&format!("SET extension_directory={}; LOAD mysql; ATTACH {} AS admin_strict (TYPE mysql); DROP TABLE IF EXISTS admin_strict.erp.strict_identity_probe; CREATE TABLE admin_strict.erp.strict_identity_probe(id INTEGER)", quote_literal(config.duckdb.extension_directory.as_ref().unwrap()), quote_literal(&dsn))).unwrap();
     let engine = FedEngine::start(config.clone()).await.unwrap();
     let address = engine.management_address().unwrap();

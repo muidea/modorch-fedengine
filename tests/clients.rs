@@ -621,10 +621,36 @@ async fn public_clients_remote_policy_crud_ddl_management_and_unknown_write_drai
         .find(|s| s.id.0 == "crm")
         .unwrap()
         .allowed_schemas = vec!["public".into()];
-    config.capabilities=serde_json::from_value(serde_json::json!([
-        {"source":"crm","duckdb_version":"v2.0.0","extension_version":"c0f5a3c0c4","remote_version":"17.7","evidence":"tests/clients.rs disposable tuple","operations":["CREATE_TABLE","DROP_TABLE"],"index_adapter":false},
-        {"source":"erp","duckdb_version":"v2.0.0","extension_version":"f7fc0d4271","remote_version":"5.7.44","evidence":"tests/clients.rs disposable tuple","operations":["CREATE_TABLE","DROP_TABLE"],"index_adapter":false}
-    ])).unwrap();
+    let ext_dir = config.duckdb.extension_directory.as_deref().unwrap();
+    let probe = duckdb::Connection::open_in_memory_with_flags(
+        duckdb::Config::default()
+            .with("allow_unsigned_extensions", "true")
+            .unwrap()
+            .with("extension_directory", ext_dir)
+            .unwrap(),
+    )
+    .unwrap();
+    probe.execute_batch("LOAD postgres; LOAD mysql").unwrap();
+    let pg_ext_version: String = probe
+        .query_row(
+            "SELECT extension_version FROM duckdb_extensions() WHERE extension_name='postgres_scanner'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let mysql_ext_version: String = probe
+        .query_row(
+            "SELECT extension_version FROM duckdb_extensions() WHERE extension_name='mysql_scanner'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    drop(probe);
+    config.capabilities = serde_json::from_value(serde_json::json!([
+        {"source":"crm","duckdb_version":"v2.0.0","extension_version":pg_ext_version,"remote_version":"17.7","evidence":"tests/clients.rs disposable tuple","operations":["CREATE_TABLE","DROP_TABLE"],"index_adapter":false},
+        {"source":"erp","duckdb_version":"v2.0.0","extension_version":mysql_ext_version,"remote_version":"5.7.44","evidence":"tests/clients.rs disposable tuple","operations":["CREATE_TABLE","DROP_TABLE"],"index_adapter":false}
+    ]))
+    .unwrap();
     let (_dir, r, a) = host_with_config(config).await;
     let budget = FedEngineClientBudget {
         timeout: Duration::from_secs(10),

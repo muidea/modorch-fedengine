@@ -10,6 +10,8 @@ fn attachments_are_visible_to_old_and_new_connections_and_cache_can_be_refreshed
         .unwrap()
         .with("autoinstall_known_extensions", "false")
         .unwrap()
+        .with("allow_unsigned_extensions", "true")
+        .unwrap()
         .with("extension_directory", "./data/extensions")
         .unwrap();
     let root = Connection::open_in_memory_with_flags(options).unwrap();
@@ -49,12 +51,17 @@ fn attachments_are_visible_to_old_and_new_connections_and_cache_can_be_refreshed
             let mut stream = statement.stream_arrow([]).unwrap();
             assert!(stream.next().unwrap().is_ok());
         }
-        root.execute_batch(&format!("CALL {extension}_clear_cache()"))
+        let clear_cache = if extension == "postgres" {
+            "pg_clear_cache"
+        } else {
+            "mysql_clear_cache"
+        };
+        root.execute_batch(&format!("CALL {clear_cache}()"))
             .unwrap();
         before
             .execute_batch(&format!("ALTER TABLE {table} ADD COLUMN note VARCHAR(30)"))
             .unwrap();
-        root.execute_batch(&format!("CALL {extension}_clear_cache()"))
+        root.execute_batch(&format!("CALL {clear_cache}()"))
             .unwrap();
         assert_eq!(
             after

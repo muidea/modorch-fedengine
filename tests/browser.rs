@@ -401,7 +401,12 @@ async fn mapped_sources_paging_details_grants_refresh_and_definition_conflicts()
         password_secret_ref: "USER".into(),
     });
     let schema = format!("browser_{}", uuid::Uuid::new_v4().simple());
-    let admin = duckdb::Connection::open_in_memory().unwrap();
+    let admin = duckdb::Connection::open_in_memory_with_flags(
+        duckdb::Config::default()
+            .with("allow_unsigned_extensions", "true")
+            .unwrap(),
+    )
+    .unwrap();
     admin
         .execute_batch(&format!(
             "SET extension_directory={}; LOAD postgres; LOAD mysql",

@@ -94,10 +94,9 @@ pub(super) fn run(
         );
     }
     if let Some(plan) = &r.guarded_mutation
-        && !r.prepare_only
         && crate::guarded_crud::is_native_scanner_catalog(conn, &plan.catalog, plan.kind)
     {
-        if types.len() != r.parameters.len() {
+        if !r.prepare_only && types.len() != r.parameters.len() {
             return Err(EngineError::new("08P01", "parameter count mismatch"));
         }
         return crate::guarded_crud::execute(

@@ -790,7 +790,12 @@ async fn mysql_organization(strict: bool) {
         json!({"username":fields["user"],"password":fields["password"]}).to_string(),
     )
     .unwrap();
-    let native = duckdb::Connection::open_in_memory().unwrap();
+    let native = duckdb::Connection::open_in_memory_with_flags(
+        duckdb::Config::default()
+            .with("allow_unsigned_extensions", "true")
+            .unwrap(),
+    )
+    .unwrap();
     native
         .execute_batch(&format!(
             "SET extension_directory={};LOAD mysql;ATTACH {} AS native (TYPE mysql)",

@@ -357,7 +357,7 @@ impl QueryHandler {
             routes: scope.virtual_database.as_ref().map(|_| routes),
         });
         // Inspect the actual AST to discover index ownership for DROP/ALTER INDEX; never trust textual prefixes.
-        let statements = Analyzer::parse(&business_sql)?;
+        let statements = Analyzer::split(&business_sql)?;
         if statements.len() != 1 {
             return Err(EngineError::unsupported("one SQL statement is required"));
         }
@@ -470,14 +470,20 @@ impl QueryHandler {
                 .iter()
                 .filter(|i| i.schema == index.table.schema && i.index == index.name)
                 .collect();
-            if owners.len() != 1 || owners[0].table != index.table.name || owners[0].protected {
+            if index.if_exists && owners.is_empty() {
+                verified_index_owner = None;
+            } else if owners.len() != 1
+                || (!index.table.name.is_empty() && owners[0].table != index.table.name)
+                || owners[0].protected
+            {
                 return Err(EngineError::denied(
                     "index ownership changed while awaiting the DDL fence",
                 ));
+            } else {
+                verified_index_owner = Some(owners[0].table.clone());
             }
-            verified_index_owner = Some(owners[0].table.clone());
         } else if let Some(intent) = &analysis.ddl_intent
-            && intent.action == "rename_index"
+            && matches!(intent.action.as_str(), "rename_index" | "reindex")
             && let Some(primary) = &analysis.primary
         {
             let runtime = self.runtime.acquire().map_err(message_error)?;
@@ -509,7 +515,35 @@ impl QueryHandler {
             })
             .collect::<Result<Vec<_>>>()?;
         let returning = analysis.returning.clone();
-        let sql = if let Some(index) = &analysis.index {
+        let guarded_ddl = if analysis.kind == Kind::Ddl
+            && let Some(intent) = analysis.ddl_intent
+            && let Some(primary) = &analysis.primary
+            && let Some(source) = definitions.iter().find(|s| s.id == primary.source)
+        {
+            let owner = if matches!(
+                intent.action.as_str(),
+                "drop_index" | "rename_index" | "reindex"
+            ) && matches!(
+                source.kind,
+                DataSourceKind::Postgres
+                    | DataSourceKind::Greenplum
+                    | DataSourceKind::Kingbasees
+                    | DataSourceKind::Mysql
+                    | DataSourceKind::Mariadb
+                    | DataSourceKind::Sqlserver
+            ) {
+                verified_index_owner.unwrap_or_else(|| intent.owner.clone())
+            } else {
+                String::new()
+            };
+            let schema = primary.schema.clone();
+            intent.into_guarded_plan(source, schema.clone(), schema, owner)?
+        } else {
+            None
+        };
+        let sql = if guarded_ddl.is_none()
+            && let Some(index) = &analysis.index
+        {
             let source = definitions
                 .iter()
                 .find(|s| s.id == index.table.source)
@@ -521,9 +555,12 @@ impl QueryHandler {
             analysis.sql
         };
         let (sql, slots) = modorch_fedengine_ddl::compact_parameters(&sql)?;
-        let parameter_types = slots
+        let concrete_param_types: Vec<modorch_fedengine_contract::PgType> =
+            slots.iter().map(|i| wire_types[*i]).collect();
+        let parameter_types = concrete_param_types
             .iter()
-            .map(|i| Some(wire_types[*i]))
+            .copied()
+            .map(Some)
             .collect::<Vec<_>>();
         let parameters = if prepare {
             vec![]
@@ -535,28 +572,16 @@ impl QueryHandler {
                 && let Some(primary) = &analysis.primary
                 && let Some(source) = definitions.iter().find(|s| s.id == primary.source)
             {
-                build_guarded_mutation_plan(&sql, source, primary, returning.as_ref())?
+                build_guarded_mutation_plan(
+                    &sql,
+                    source,
+                    primary,
+                    returning.as_ref(),
+                    &concrete_param_types,
+                )?
             } else {
                 None
             };
-        let guarded_ddl = if analysis.kind == Kind::Ddl
-            && let Some(intent) = analysis.ddl_intent
-            && let Some(primary) = &analysis.primary
-            && let Some(source) = definitions.iter().find(|s| s.id == primary.source)
-        {
-            let owner = if matches!(
-                intent.action.as_str(),
-                "drop_index" | "rename_index" | "reindex"
-            ) {
-                verified_index_owner.unwrap_or_else(|| intent.owner.clone())
-            } else {
-                String::new()
-            };
-            let schema = primary.schema.clone();
-            intent.into_guarded_plan(source, schema.clone(), schema, owner)?
-        } else {
-            None
-        };
         let sql = typed_sql(
             &sql,
             &parameter_types,

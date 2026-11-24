@@ -138,7 +138,10 @@ impl ExecutionPort for DuckdbRuntime {
                 // wait_finished, rather than wait, guarantees lease/fence release.
                 job.wait_finished().await?;
                 let confirmed = completion_rx.await.ok();
-                let needs_refresh = static_mode || registry.get(&source).is_ok_and(|s| s.stale.load(Ordering::SeqCst));
+                let needs_refresh = (confirmed.is_some() && static_mode)
+                    || registry
+                        .get(&source)
+                        .is_ok_and(|s| s.stale.load(Ordering::SeqCst));
                 let fresh = !needs_refresh || crate::ddl_refresh::refresh(&hub, &storage, &registry, &source, timeout.min(deadline.saturating_duration_since(Instant::now()))).await;
                 if let Some(mut completion) = confirmed {
                     if !fresh {

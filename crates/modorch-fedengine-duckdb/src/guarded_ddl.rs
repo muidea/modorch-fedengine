@@ -9,17 +9,48 @@ use modorch_fedengine_core::*;
 use modorch_fedengine_datasource::DataSourceRegistry;
 use std::sync::atomic::Ordering;
 
+pub(super) fn ddl_product(kind: DataSourceKind) -> Option<&'static str> {
+    match kind {
+        DataSourceKind::Postgres => Some("postgres"),
+        DataSourceKind::Greenplum => Some("greenplum"),
+        DataSourceKind::Kingbasees => Some("kingbasees"),
+        DataSourceKind::Mysql | DataSourceKind::Mariadb => Some("mysql"),
+        DataSourceKind::Oracle => Some("oracle"),
+        DataSourceKind::Sqlserver => Some("sqlserver"),
+        DataSourceKind::Dameng => Some("dameng"),
+        DataSourceKind::Db2 => Some("db2"),
+        DataSourceKind::Hana => Some("hana"),
+        DataSourceKind::Starrocks => None,
+    }
+}
+
 pub(super) fn resolve_remote_database(conn: &Connection, plan: &GuardedDdlPlan) -> String {
-    if plan.kind == DataSourceKind::Postgres {
-        let q = format!(
-            "SELECT current_database FROM postgres_query({}, 'SELECT current_database() AS current_database')",
-            quote_literal(&plan.catalog)
-        );
-        if let Ok(db) = conn.query_row(&q, [], |row| row.get::<_, String>(0))
-            && !db.is_empty()
-        {
-            return db;
+    let query = match plan.kind {
+        DataSourceKind::Postgres | DataSourceKind::Greenplum | DataSourceKind::Kingbasees => {
+            Some(format!(
+                "SELECT current_database FROM postgres_query({}, 'SELECT current_database() AS current_database')",
+                quote_literal(&plan.catalog)
+            ))
         }
+        DataSourceKind::Mysql | DataSourceKind::Mariadb => Some(format!(
+            "SELECT db FROM mysql_query({}, 'SELECT DATABASE() AS db')",
+            quote_literal(&plan.catalog)
+        )),
+        DataSourceKind::Sqlserver => Some(format!(
+            "SELECT db FROM sqlserver_query({}, 'SELECT DB_NAME() AS db')",
+            quote_literal(&plan.catalog)
+        )),
+        DataSourceKind::Oracle => Some(format!(
+            "SELECT db FROM oracle_query({}, 'SELECT SYS_CONTEXT(''USERENV'',''DB_NAME'') AS db FROM DUAL')",
+            quote_literal(&plan.catalog)
+        )),
+        _ => None,
+    };
+    if let Some(q) = query
+        && let Ok(db) = conn.query_row(&q, [], |row| row.get::<_, String>(0))
+        && !db.is_empty()
+    {
+        return db;
     }
     plan.database.clone()
 }
@@ -28,10 +59,7 @@ pub(super) fn build_guarded_ddl_sql(
     plan: &GuardedDdlPlan,
     diagnostics: bool,
 ) -> (String, Vec<duckdb::types::Value>) {
-    let product = match plan.kind {
-        DataSourceKind::Mysql | DataSourceKind::Mariadb => "mysql",
-        _ => "postgres",
-    };
+    let product = ddl_product(plan.kind).unwrap_or("postgres");
     let mut args: Vec<duckdb::types::Value> = vec![
         duckdb::types::Value::Text(plan.catalog.clone()),
         duckdb::types::Value::Text(plan.database.clone()),
@@ -104,6 +132,60 @@ pub(super) fn build_guarded_ddl_sql(
             extra.push_str(&format!("{name} := CAST([{items}] AS VARCHAR[]), "));
         }
     }
+    if v == 6 {
+        let q = push_param(
+            duckdb::types::Value::Text(plan.query_sql.clone().unwrap_or_default()),
+            "VARCHAR",
+        );
+        extra.push_str(&format!("query_sql := {q}, "));
+        let constraints = plan
+            .constraints
+            .iter()
+            .map(|c| {
+                let name = push_param(duckdb::types::Value::Text(c.name.clone()), "VARCHAR");
+                let kind = push_param(duckdb::types::Value::Text(c.kind.clone()), "VARCHAR");
+                let cols = c
+                    .columns
+                    .iter()
+                    .map(|col| push_param(duckdb::types::Value::Text(col.clone()), "VARCHAR"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let rs = push_param(
+                    duckdb::types::Value::Text(c.reference_schema.clone()),
+                    "VARCHAR",
+                );
+                let rt = push_param(
+                    duckdb::types::Value::Text(c.reference_table.clone()),
+                    "VARCHAR",
+                );
+                let rcols = c
+                    .reference_columns
+                    .iter()
+                    .map(|col| push_param(duckdb::types::Value::Text(col.clone()), "VARCHAR"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let cc = push_param(
+                    duckdb::types::Value::Text(c.check_column.clone()),
+                    "VARCHAR",
+                );
+                let co = push_param(
+                    duckdb::types::Value::Text(c.check_operator.clone()),
+                    "VARCHAR",
+                );
+                let cv = push_param(
+                    duckdb::types::Value::Text(c.check_value.clone()),
+                    "VARCHAR",
+                );
+                format!(
+                    "struct_pack(name := {name}, kind := {kind}, columns := CAST([{cols}] AS VARCHAR[]), reference_schema := {rs}, reference_table := {rt}, reference_columns := CAST([{rcols}] AS VARCHAR[]), check_column := {cc}, check_operator := {co}, check_value := {cv})"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        extra.push_str(&format!(
+            "constraints := CAST([{constraints}] AS STRUCT(name VARCHAR, kind VARCHAR, columns VARCHAR[], reference_schema VARCHAR, reference_table VARCHAR, reference_columns VARCHAR[], check_column VARCHAR, check_operator VARCHAR, check_value VARCHAR)[]), "
+        ));
+    }
     let columns = plan
         .columns
         .iter()
@@ -111,7 +193,24 @@ pub(super) fn build_guarded_ddl_sql(
             let n = push_param(duckdb::types::Value::Text(col.name.clone()), "VARCHAR");
             let t = push_param(duckdb::types::Value::Text(col.type_name.clone()), "VARCHAR");
             let l = push_param(duckdb::types::Value::Int(col.length), "INTEGER");
-            if v == 5 {
+            if v == 6 {
+                let p = push_param(duckdb::types::Value::Int(col.precision), "INTEGER");
+                let s = push_param(duckdb::types::Value::Int(col.scale), "INTEGER");
+                let nn = push_param(duckdb::types::Value::Boolean(col.not_null), "BOOLEAN");
+                let dk = push_param(
+                    duckdb::types::Value::Text(col.default_kind.clone().unwrap_or_default()),
+                    "VARCHAR",
+                );
+                let dv = push_param(
+                    duckdb::types::Value::Text(col.default_value.clone().unwrap_or_default()),
+                    "VARCHAR",
+                );
+                let pk = push_param(duckdb::types::Value::Boolean(col.primary_key), "BOOLEAN");
+                let uq = push_param(duckdb::types::Value::Boolean(col.unique), "BOOLEAN");
+                format!(
+                    "struct_pack(name := {n}, type := {t}, length := {l}, \"precision\" := {p}, scale := {s}, not_null := {nn}, default_kind := {dk}, default_value := {dv}, primary_key := {pk}, \"unique\" := {uq})"
+                )
+            } else if v == 5 {
                 let p = push_param(duckdb::types::Value::Int(col.precision), "INTEGER");
                 let s = push_param(duckdb::types::Value::Int(col.scale), "INTEGER");
                 format!(
@@ -129,7 +228,9 @@ pub(super) fn build_guarded_ddl_sql(
         .map(|k| push_param(duckdb::types::Value::Text(k.clone()), "VARCHAR"))
         .collect::<Vec<_>>()
         .join(", ");
-    let col_ty = if v == 5 {
+    let col_ty = if v == 6 {
+        "STRUCT(name VARCHAR, type VARCHAR, length INTEGER, \"precision\" INTEGER, scale INTEGER, not_null BOOLEAN, default_kind VARCHAR, default_value VARCHAR, primary_key BOOLEAN, \"unique\" BOOLEAN)[]"
+    } else if v == 5 {
         "STRUCT(name VARCHAR, type VARCHAR, length INTEGER, \"precision\" INTEGER, scale INTEGER)[]"
     } else {
         "STRUCT(name VARCHAR, type VARCHAR, length INTEGER)[]"
@@ -139,11 +240,16 @@ pub(super) fn build_guarded_ddl_sql(
     } else {
         ""
     };
+    let cond_arg = if plan.conditional {
+        ", conditional := true"
+    } else {
+        ""
+    };
     let sql = format!(
         "SELECT * FROM system.main.{product}_guarded_ddl(CAST(? AS VARCHAR), CAST(? AS VARCHAR), CAST(? AS VARCHAR), CAST(? AS VARCHAR), struct_pack(\
          contract_version := CAST({v} AS INTEGER), target_contract := 'EXECUTION_NAME', \
          action := CAST(? AS VARCHAR), name := CAST(? AS VARCHAR), index_name := CAST(? AS VARCHAR), owner := CAST(? AS VARCHAR), \
-         {extra}columns := CAST([{columns}] AS {col_ty}), keys := CAST([{keys}] AS VARCHAR[])){diag_arg})"
+         {extra}columns := CAST([{columns}] AS {col_ty}), keys := CAST([{keys}] AS VARCHAR[])){diag_arg}{cond_arg})"
     );
     (sql, args)
 }
@@ -192,11 +298,37 @@ fn has_source_diagnostics(conn: &Connection, fn_name: &str) -> bool {
     .unwrap_or(false)
 }
 
+fn validate_capabilities_document(
+    kind: DataSourceKind,
+    state: &str,
+    stage: &str,
+    document: &str,
+) -> Result<()> {
+    if !state.is_empty() || document.is_empty() {
+        let code = crate::error::map_sqlstate(if state.is_empty() { "0A000" } else { state });
+        return Err(EngineError::new(
+            code,
+            format!("DDL capabilities check failed at stage {stage}"),
+        ));
+    }
+    if !kind.is_postgres_family()
+        && !kind.is_mysql_family()
+        && serde_json::from_str::<serde_json::Value>(document)
+            .ok()
+            .and_then(|v| v.get("executor_available").and_then(|b| b.as_bool()))
+            == Some(false)
+    {
+        return Err(EngineError::unsupported(
+            "DDL executor is not available for this database version",
+        ));
+    }
+    Ok(())
+}
+
 fn check_ddl_capabilities(conn: &Connection, plan: &GuardedDdlPlan) -> Result<()> {
-    let product = match plan.kind {
-        DataSourceKind::Mysql | DataSourceKind::Mariadb => "mysql",
-        _ => "postgres",
-    };
+    let product = ddl_product(plan.kind).ok_or_else(|| {
+        EngineError::unsupported("guarded DDL is not enabled for this data source kind")
+    })?;
     let cap_fn = format!("{product}_ddl_capabilities");
     let present: bool = conn
         .query_row(
@@ -208,20 +340,21 @@ fn check_ddl_capabilities(conn: &Connection, plan: &GuardedDdlPlan) -> Result<()
     if !present {
         return Ok(());
     }
+    let cap_schema = if plan.kind.is_mysql_family()
+        && matches!(plan.action.as_str(), "create_schema" | "drop_schema")
+        && !plan.database.is_empty()
+    {
+        plan.database.as_str()
+    } else {
+        plan.schema.as_str()
+    };
     let cap_sql = format!("SELECT sqlstate, stage, document FROM system.main.{cap_fn}(?, ?)");
     let (state, stage, document): (String, String, String) = conn
-        .query_row(&cap_sql, [&plan.catalog, &plan.schema], |row| {
+        .query_row(&cap_sql, [plan.catalog.as_str(), cap_schema], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })
         .map_err(engine_error)?;
-    if !state.is_empty() || document.is_empty() {
-        let code = crate::error::map_sqlstate(if state.is_empty() { "0A000" } else { &state });
-        return Err(EngineError::new(
-            code,
-            format!("DDL capabilities check failed at stage {stage}"),
-        ));
-    }
-    Ok(())
+    validate_capabilities_document(plan.kind, &state, &stage, &document)
 }
 
 pub(super) struct DdlExecEnv<'a> {
@@ -253,10 +386,9 @@ pub(super) fn execute(
     effective.database = resolve_remote_database(conn, &effective);
     check_ddl_capabilities(conn, &effective)?;
 
-    let product = match effective.kind {
-        DataSourceKind::Mysql | DataSourceKind::Mariadb => "mysql",
-        _ => "postgres",
-    };
+    let product = ddl_product(effective.kind).ok_or_else(|| {
+        EngineError::unsupported("guarded DDL is not enabled for this data source kind")
+    })?;
     let fn_name = format!("{product}_guarded_ddl");
     let diag = has_source_diagnostics(conn, &fn_name);
     let (sql, mut args) = build_guarded_ddl_sql(&effective, diag);
@@ -394,18 +526,26 @@ mod tests {
             constraint_name: String::new(),
             constraint: None,
             identity_mode: String::new(),
-            columns: if version == 5 {
+            columns: if version >= 5 {
                 vec![DdlColumnSpec {
                     name: "amount".into(),
                     type_name: "numeric".into(),
                     length: 0,
                     precision: 18,
                     scale: 4,
+                    not_null: false,
+                    default_kind: None,
+                    default_value: None,
+                    primary_key: false,
+                    unique: false,
                 }]
             } else {
                 vec![]
             },
+            constraints: vec![],
             keys: vec![],
+            conditional: false,
+            query_sql: None,
             contract_version: version,
         }
     }
@@ -438,6 +578,111 @@ mod tests {
         assert!(sql_v5.contains("\"precision\" := CAST(? AS INTEGER)"));
         assert!(sql_v5.contains("STRUCT(name VARCHAR, type VARCHAR, length INTEGER, \"precision\" INTEGER, scale INTEGER)[]"));
         assert_eq!(args_v5.len(), 15);
+
+        for (kind, expected_prefix) in [
+            (DataSourceKind::Postgres, "postgres_guarded_ddl("),
+            (DataSourceKind::Greenplum, "greenplum_guarded_ddl("),
+            (DataSourceKind::Kingbasees, "kingbasees_guarded_ddl("),
+            (DataSourceKind::Mysql, "mysql_guarded_ddl("),
+            (DataSourceKind::Mariadb, "mysql_guarded_ddl("),
+            (DataSourceKind::Oracle, "oracle_guarded_ddl("),
+            (DataSourceKind::Sqlserver, "sqlserver_guarded_ddl("),
+            (DataSourceKind::Dameng, "dameng_guarded_ddl("),
+            (DataSourceKind::Db2, "db2_guarded_ddl("),
+            (DataSourceKind::Hana, "hana_guarded_ddl("),
+        ] {
+            for action in [
+                "drop_column",
+                "alter_column_type",
+                "create_schema",
+                "drop_schema",
+            ] {
+                let mut p = sample_plan(5, action, kind);
+                if action != "alter_column_type" {
+                    p.columns.clear();
+                } else {
+                    p.column_name = "amount".into();
+                }
+                let (sql, _) = build_guarded_ddl_sql(&p, false);
+                assert!(sql.contains(expected_prefix), "{sql}");
+                assert!(sql.contains("contract_version := CAST(5 AS INTEGER)"));
+            }
+        }
+        assert_eq!(ddl_product(DataSourceKind::Starrocks), None);
+
+        // v6 CREATE TABLE + conditional := true
+        let mut p6 = sample_plan(6, "create_table", DataSourceKind::Postgres);
+        p6.conditional = true;
+        p6.columns = vec![DdlColumnSpec {
+            name: "id".into(),
+            type_name: "bigint".into(),
+            length: 0,
+            precision: 0,
+            scale: 0,
+            not_null: true,
+            default_kind: Some("int".into()),
+            default_value: Some("0".into()),
+            primary_key: true,
+            unique: true,
+        }];
+        p6.constraints = vec![DdlConstraintSpec {
+            name: "chk_id".into(),
+            kind: "check".into(),
+            columns: vec![],
+            reference_schema: String::new(),
+            reference_table: String::new(),
+            reference_columns: vec![],
+            check_column: "id".into(),
+            check_operator: ">=".into(),
+            check_value: "0".into(),
+        }];
+        let (sql_v6, _) = build_guarded_ddl_sql(&p6, false);
+        assert!(
+            sql_v6.contains("contract_version := CAST(6 AS INTEGER)"),
+            "{sql_v6}"
+        );
+        assert!(
+            sql_v6.contains("query_sql := CAST(? AS VARCHAR)"),
+            "{sql_v6}"
+        );
+        assert!(
+            sql_v6.contains("not_null := CAST(? AS BOOLEAN)"),
+            "{sql_v6}"
+        );
+        assert!(
+            sql_v6.contains("\"unique\" := CAST(? AS BOOLEAN)"),
+            "{sql_v6}"
+        );
+        assert!(sql_v6.contains(", conditional := true)"), "{sql_v6}");
+
+        // validate_capabilities_document rejects Sqlserver executor_available:false while allowing PG/MySQL legacy JSON
+        assert!(
+            validate_capabilities_document(
+                DataSourceKind::Sqlserver,
+                "",
+                "",
+                r#"{"contract_version":1,"executor_available":false}"#
+            )
+            .is_err()
+        );
+        assert!(
+            validate_capabilities_document(
+                DataSourceKind::Postgres,
+                "",
+                "",
+                r#"{"contract_version":1,"executor_available":false}"#
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_capabilities_document(
+                DataSourceKind::Mysql,
+                "",
+                "",
+                r#"{"contract_version":1,"executor_available":false}"#
+            )
+            .is_ok()
+        );
     }
 
     #[test]

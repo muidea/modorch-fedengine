@@ -315,6 +315,7 @@ pub struct GuardedMutationPlan {
     pub table: String,
     pub native_sql: String,
     pub returning: Option<ReturningPlan>,
+    pub param_map: Vec<usize>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DdlColumnSpec {
@@ -323,6 +324,11 @@ pub struct DdlColumnSpec {
     pub length: i32,
     pub precision: i32,
     pub scale: i32,
+    pub not_null: bool,
+    pub default_kind: Option<String>,
+    pub default_value: Option<String>,
+    pub primary_key: bool,
+    pub unique: bool,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DdlConstraintSpec {
@@ -353,9 +359,12 @@ pub struct GuardedDdlPlan {
     pub default_value: String,
     pub constraint_name: String,
     pub constraint: Option<DdlConstraintSpec>,
+    pub constraints: Vec<DdlConstraintSpec>,
     pub identity_mode: String,
     pub columns: Vec<DdlColumnSpec>,
     pub keys: Vec<String>,
+    pub conditional: bool,
+    pub query_sql: Option<String>,
     pub contract_version: i32,
 }
 pub struct ExecuteRequest {

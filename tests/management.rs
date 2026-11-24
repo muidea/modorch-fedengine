@@ -791,9 +791,23 @@ async fn zero_source_online_activation_catalog_refresh_rollback_portal_drain_and
         mapped_connection.await.unwrap();
     });
     assert_eq!(mapped.query_one("SELECT count(*)::BIGINT FROM crm.online_items a JOIN fedengine.erp.online_items b USING(id)",&[]).await.unwrap().get::<_,i64>(0),2);
-    let mapped_oid= mapped.query_one("SELECT oid FROM pg_class WHERE relname='online_items' AND relkind='f' ORDER BY oid LIMIT 1",&[]).await.unwrap().get::<_,u32>(0);
+    let mapped_oid= mapped.query_one("SELECT oid FROM pg_class WHERE relname='online_items' AND relkind='r' ORDER BY oid LIMIT 1",&[]).await.unwrap().get::<_,u32>(0);
     assert!(mapped_oid > 0);
-    let unknown = mapped.query_one("SELECT pg_relation_size('crm.online_items'), pg_table_size('crm.online_items'), pg_stat_get_numscans($1)", &[&mapped_oid]).await.unwrap();
+    let erp_oid: u32 = mapped
+        .query_one(
+            "SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='erp' AND c.relname='online_items' AND c.relkind='r'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let unknown = mapped
+        .query_one(
+            "SELECT pg_relation_size('erp.online_items'), pg_table_size('erp.online_items'), pg_stat_get_numscans($1)",
+            &[&erp_oid],
+        )
+        .await
+        .unwrap();
     for index in 0..3 {
         assert_eq!(
             unknown.columns()[index].type_(),
@@ -801,14 +815,22 @@ async fn zero_source_online_activation_catalog_refresh_rollback_portal_drain_and
         );
         assert_eq!(unknown.get::<_, Option<i64>>(index), None);
     }
-    assert_eq!(mapped.query_one("SELECT count(*)::BIGINT FROM pg_foreign_table t JOIN pg_foreign_server s ON s.oid=t.ftserver",&[]).await.unwrap().get::<_,i64>(0),2);
-    assert_eq!(
+    assert_eq!(mapped.query_one("SELECT count(*)::BIGINT FROM pg_foreign_table t JOIN pg_foreign_server s ON s.oid=t.ftserver",&[]).await.unwrap().get::<_,i64>(0),0);
+    assert!(
         mapped
-            .query_one("SELECT count(*)::BIGINT FROM pg_constraint", &[])
+            .query_one("SELECT count(*)::BIGINT FROM pg_index", &[])
             .await
             .unwrap()
-            .get::<_, i64>(0),
-        0
+            .get::<_, i64>(0)
+            >= 1
+    );
+    assert!(
+        mapped
+            .query_one("SELECT count(*)::BIGINT FROM pg_attrdef", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0)
+            >= 2
     );
     drop(mapped);
     mapped_driver.await.unwrap();
@@ -1012,7 +1034,7 @@ async fn zero_source_online_activation_catalog_refresh_rollback_portal_drain_and
     });
     assert_eq!(
         reader
-            .query_one("SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='mapped' AND c.relname='online_items' AND c.relkind='f'", &[])
+            .query_one("SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='mapped' AND c.relname='online_items' AND c.relkind='r'", &[])
             .await
             .unwrap()
             .get::<_, i64>(0),
@@ -1290,7 +1312,7 @@ async fn zero_source_online_activation_catalog_refresh_rollback_portal_drain_and
     let before_resume_catalog = get(address, "sources/crm/catalog?limit=1000").await;
     let before_resume_mapped = mapped
         .query(
-            "SELECT oid FROM pg_class WHERE relkind='f' ORDER BY oid",
+            "SELECT oid FROM pg_class WHERE relkind='r' ORDER BY oid",
             &[],
         )
         .await
@@ -1393,7 +1415,7 @@ async fn zero_source_online_activation_catalog_refresh_rollback_portal_drain_and
         before_resume_mapped,
         mapped
             .query(
-                "SELECT oid FROM pg_class WHERE relkind='f' ORDER BY oid",
+                "SELECT oid FROM pg_class WHERE relkind='r' ORDER BY oid",
                 &[]
             )
             .await
@@ -2066,7 +2088,7 @@ async fn metadata_scale_refresh_preserves_query_admission_and_memory_budget() {
         connection.await.unwrap();
     });
     let projected_columns: i64 = catalog_reader.query_one(
-        "SELECT count(*)::BIGINT FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class c ON a.attrelid=c.oid WHERE c.relkind='f' AND a.attnum>0 AND NOT a.attisdropped",
+        "SELECT count(*)::BIGINT FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class c ON a.attrelid=c.oid WHERE c.relkind='r' AND a.attnum>0 AND NOT a.attisdropped",
         &[],
     ).await.unwrap().get(0);
     assert_eq!(projected_columns, (objects * columns) as i64);

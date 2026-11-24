@@ -66,13 +66,12 @@ impl Analyzer {
                 let route = if !schema_object {
                     ns.routes
                         .as_ref()
-                        .map(|routes| routes.get(&(schema.clone(), object.clone())))
+                        .and_then(|routes| routes.get(&(schema.clone(), object.clone())))
                 } else {
                     None
                 };
-                let (id, remote_schema) = route
-                    .unwrap_or_else(|| ns.bindings.get(&schema))
-                    .ok_or_else(|| {
+                let (id, remote_schema) =
+                    route.or_else(|| ns.bindings.get(&schema)).ok_or_else(|| {
                         EngineError::new(
                             "42P01",
                             "relation is outside the available database schemas",

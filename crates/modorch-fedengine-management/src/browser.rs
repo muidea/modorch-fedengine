@@ -376,9 +376,12 @@ impl Browser {
             .as_ref()
             .and_then(|v| v.parse::<u32>().ok())
             .ok_or_else(|| EngineError::new("XX000", "invalid object OID"))?;
+        let external = ctx.scope.catalogs.iter().any(|c| {
+            c.catalog == p.database && c.mapping.is_some() && c.schemas.contains(&p.schema)
+        });
         let columns = self.sql(ctx, format!("SELECT a.attname,a.atttypid,a.attnotnull FROM pg_catalog.pg_attribute a WHERE a.attrelid={oid} AND a.attnum>0 AND NOT a.attisdropped ORDER BY a.attnum"), 1000).await?;
         Ok(
-            json!({"stamp":ctx.stamp,"oid":row[0],"schema":p.schema,"name":p.object,"kind":row[2],"external":row[2].as_deref()==Some("f"),"columns":columns}),
+            json!({"stamp":ctx.stamp,"oid":row[0],"schema":p.schema,"name":p.object,"kind":row[2],"external":external,"columns":columns}),
         )
     }
     async fn summaries(
@@ -489,7 +492,7 @@ impl Browser {
                 .collect::<Vec<_>>()
                 .join(",");
             let sql = format!(
-                "SELECT c.oid,c.relname,c.relnatts FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname={} AND c.relname IN ({names}) ORDER BY c.relname",
+                "SELECT c.oid,c.relname,c.relkind,c.relnatts FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname={} AND c.relname IN ({names}) ORDER BY c.relname",
                 quote_literal(&p.schema)
             );
             let rows = self.sql(ctx, sql, 50).await?;
@@ -499,7 +502,7 @@ impl Browser {
             rows.rows.iter().map(|r| {
                 let source_type=&summaries.iter().find(|s|Some(&s.name)==r[1].as_ref()).unwrap().object_type;
                 let summary = summaries.iter().find(|s|Some(&s.name)==r[1].as_ref()).unwrap();
-                json!({"oid":r[0],"name":r[1],"kind":"f","source_type":source_type,"columns":r[2],"metadata_conflict":summary.conflict,"contributors":summary.contributors.len()})
+                json!({"oid":r[0],"name":r[1],"kind":r[2],"source_type":source_type,"columns":r[3],"metadata_conflict":summary.conflict,"contributors":summary.contributors.len()})
             }).collect::<Vec<_>>()
         };
         Ok(json!({"stamp":ctx.stamp,"objects":objects,"offset":p.offset,"has_more":more}))

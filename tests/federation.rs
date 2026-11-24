@@ -199,6 +199,7 @@ async fn remote_crud_federation_ddl_index_generation_and_zero_cross_source_effec
         ));
         assert_eq!(error.handle.task_metrics().tasks, 0);
     }
+    let mut virtual_config = config.clone();
     let engine = FedEngine::start(config).await.unwrap();
     let mut connection_config = tokio_postgres::Config::new();
     connection_config
@@ -953,4 +954,298 @@ async fn remote_crud_federation_ddl_index_generation_and_zero_cross_source_effec
     // indeterminate unknown-write drain is verified in tests/clients.rs.
     assert_eq!(metrics.unknown_writes, 0);
     assert_eq!(metrics.admitted, metrics.completed + metrics.failed);
+
+    // Verify virtual database exposes ordinary tables (relkind='r') and allows authorized DML/DDL.
+    admin
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS pg_crm.public.fedengine_vdb_seed(id INTEGER PRIMARY KEY, name VARCHAR(32) NOT NULL);
+             CREATE TABLE IF NOT EXISTS mysql_erp.erp.fedengine_vdb_seed(id INTEGER PRIMARY KEY, name VARCHAR(32) NOT NULL);",
+        )
+        .unwrap();
+    std::fs::create_dir_all(temporary.path().join("secrets")).unwrap();
+    virtual_config.management.enabled = true;
+    virtual_config.management.listen = "127.0.0.1:0".into();
+    virtual_config.management.credentials_directory = temporary
+        .path()
+        .join("secrets")
+        .to_string_lossy()
+        .into_owned();
+    virtual_config.duckdb.database_path = temporary
+        .path()
+        .join("vdb.duckdb")
+        .to_string_lossy()
+        .into_owned();
+    virtual_config.datasources[0].allowed_schemas = vec!["public".into()];
+    virtual_config.datasources[1].allowed_schemas = vec!["erp".into()];
+    virtual_config.virtual_databases = vec![VirtualDatabaseConfig {
+        name: "fedengine".into(),
+        owner: "fedengine".into(),
+        connect: vec![],
+        allow_connections: true,
+        schemas: vec![
+            VirtualSchemaConfig {
+                name: "crm".into(),
+                source: DataSourceId("crm".into()),
+                remote_schema: "public".into(),
+            },
+            VirtualSchemaConfig {
+                name: "erp".into(),
+                source: DataSourceId("erp".into()),
+                remote_schema: "erp".into(),
+            },
+        ],
+    }];
+    let vdb_engine = FedEngine::start(virtual_config.clone()).await.unwrap();
+    let vdb_api = vdb_engine.management_address().unwrap();
+    apply_managed_source(vdb_api, "crm").await;
+    apply_managed_source(vdb_api, "erp").await;
+    let (vdb_client, vdb_conn) = tokio_postgres::Config::new()
+        .host("127.0.0.1")
+        .port(vdb_engine.address().unwrap().port())
+        .user("fedengine")
+        .dbname("fedengine")
+        .password(std::env::var("USER").unwrap())
+        .connect(NoTls)
+        .await
+        .unwrap();
+    let vdb_driver = tokio::spawn(async move { vdb_conn.await.unwrap() });
+    let relkinds: Vec<String> = vdb_client
+        .query(
+            "SELECT DISTINCT c.relkind::text FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname IN ('crm','erp') AND c.relname='fedengine_vdb_seed'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(relkinds, ["r"]);
+    assert_eq!(
+        vdb_client
+            .query_one(
+                "SELECT count(*)::BIGINT FROM pg_catalog.pg_foreign_table",
+                &[]
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        0
+    );
+    assert_eq!(
+        vdb_client
+            .query_one("SELECT count(*)::BIGINT FROM pg_catalog.pg_tables WHERE schemaname IN ('crm','erp') AND tablename='fedengine_vdb_seed'", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        2
+    );
+    assert!(
+        vdb_client
+            .query_one(
+                "SELECT has_table_privilege('crm.fedengine_vdb_seed', 'INSERT')",
+                &[]
+            )
+            .await
+            .unwrap()
+            .get::<_, bool>(0)
+    );
+    vdb_client
+        .simple_query(
+            "CREATE TABLE crm.fedengine_vdb_live(id INTEGER PRIMARY KEY, name VARCHAR(32) NOT NULL)",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        vdb_client
+            .execute(
+                "INSERT INTO crm.fedengine_vdb_live VALUES(10, 'pg-vdb')",
+                &[]
+            )
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        vdb_client
+            .execute(
+                "UPDATE crm.fedengine_vdb_live SET name='pg-vdb2' WHERE id=10",
+                &[]
+            )
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        vdb_client
+            .query_one("SELECT name FROM crm.fedengine_vdb_live WHERE id=10", &[])
+            .await
+            .unwrap()
+            .get::<_, String>(0),
+        "pg-vdb2"
+    );
+    assert_eq!(
+        vdb_client
+            .execute("DELETE FROM crm.fedengine_vdb_live WHERE id=10", &[])
+            .await
+            .unwrap(),
+        1
+    );
+    vdb_client
+        .simple_query("DROP TABLE crm.fedengine_vdb_live")
+        .await
+        .unwrap();
+    vdb_client
+        .simple_query(
+            "CREATE TABLE erp.fedengine_vdb_my(id INTEGER PRIMARY KEY, val INTEGER NOT NULL)",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        vdb_client
+            .execute("INSERT INTO erp.fedengine_vdb_my VALUES(1, 42)", &[])
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        vdb_client
+            .query_one("SELECT val FROM erp.fedengine_vdb_my WHERE id=1", &[])
+            .await
+            .unwrap()
+            .get::<_, i32>(0),
+        42
+    );
+    vdb_client
+        .simple_query("DROP TABLE erp.fedengine_vdb_my")
+        .await
+        .unwrap();
+    drop(vdb_client);
+    vdb_driver.await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), vdb_engine.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Verify read_only=true sources still deny writes & DDL through a virtual database.
+    virtual_config.duckdb.database_path = temporary
+        .path()
+        .join("ro-vdb.duckdb")
+        .to_string_lossy()
+        .into_owned();
+    virtual_config.datasources[0].read_only = true;
+    let ro_engine = FedEngine::start(virtual_config).await.unwrap();
+    let ro_api = ro_engine.management_address().unwrap();
+    apply_managed_source(ro_api, "crm").await;
+    apply_managed_source(ro_api, "erp").await;
+    let (ro_client, ro_conn) = tokio_postgres::Config::new()
+        .host("127.0.0.1")
+        .port(ro_engine.address().unwrap().port())
+        .user("fedengine")
+        .dbname("fedengine")
+        .password(std::env::var("USER").unwrap())
+        .connect(NoTls)
+        .await
+        .unwrap();
+    let ro_driver = tokio::spawn(async move { ro_conn.await.unwrap() });
+    for sql in [
+        "INSERT INTO crm.fedengine_vdb_seed VALUES(99, 'denied')",
+        "CREATE TABLE crm.fedengine_vdb_denied(id INTEGER)",
+    ] {
+        let err = ro_client.simple_query(sql).await.unwrap_err();
+        assert_eq!(err.code().unwrap().code(), "42501", "{sql}");
+    }
+    drop(ro_client);
+    ro_driver.await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), ro_engine.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+    admin
+        .execute_batch(
+            "DROP TABLE IF EXISTS pg_crm.public.fedengine_vdb_seed;
+             DROP TABLE IF EXISTS mysql_erp.erp.fedengine_vdb_seed;",
+        )
+        .unwrap();
+}
+
+async fn http_json(
+    address: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    key: Option<&str>,
+    body: serde_json::Value,
+) -> (u16, serde_json::Value) {
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpStream,
+    };
+    let mut socket = TcpStream::connect(address).await.unwrap();
+    let body = body.to_string();
+    let key = key
+        .map(|k| format!("Idempotency-Key: {k}\r\n"))
+        .unwrap_or_default();
+    let request = format!(
+        "{method} /api/v1/{path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\n{key}Content-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    socket.write_all(request.as_bytes()).await.unwrap();
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(15), socket.read_to_end(&mut response))
+        .await
+        .unwrap()
+        .unwrap();
+    let response = String::from_utf8(response).unwrap();
+    let (head, body) = response.split_once("\r\n\r\n").expect("HTTP response");
+    let status = head.split_whitespace().nth(1).unwrap().parse().unwrap();
+    let value =
+        serde_json::from_str(body).unwrap_or_else(|_| panic!("invalid JSON response: {response}"));
+    (status, value)
+}
+
+async fn apply_managed_source(address: std::net::SocketAddr, id: &str) {
+    let (status, source) = http_json(
+        address,
+        "GET",
+        &format!("sources/{id}"),
+        None,
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "{source}");
+    let body = serde_json::json!({
+        "target": {
+            "incarnation": source["incarnation"],
+            "expected_revision": source["desired_revision"],
+        }
+    });
+    let (status, operation) = http_json(
+        address,
+        "POST",
+        &format!("sources/{id}/apply"),
+        Some(&format!("apply-{id}")),
+        body,
+    )
+    .await;
+    assert_eq!(status, 202, "{operation}");
+    let op_id = operation["id"].as_str().expect("operation id");
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let (status, result) = http_json(
+                address,
+                "GET",
+                &format!("operations/{op_id}"),
+                None,
+                serde_json::Value::Null,
+            )
+            .await;
+            assert_eq!(status, 200, "{result}");
+            match result["status"].as_str().unwrap() {
+                "Succeeded" => return,
+                "Failed" | "Interrupted" => panic!("apply operation failed for {id}: {result}"),
+                _ => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for apply on {id}"));
 }

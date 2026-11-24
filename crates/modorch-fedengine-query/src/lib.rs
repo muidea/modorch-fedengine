@@ -269,7 +269,10 @@ impl QueryHandler {
             indexes: vec![],
         };
         let mut relations = modorch_fedengine_ddl::RelationNames::default();
-        let mut bindings = std::collections::BTreeMap::new();
+        let mut schema_contributors: std::collections::BTreeMap<
+            String,
+            std::collections::BTreeSet<(DataSourceId, String)>,
+        > = std::collections::BTreeMap::new();
         let mut routes = std::collections::BTreeMap::new();
         let mut authorized_routes = std::collections::BTreeSet::new();
         for catalog in scope
@@ -345,9 +348,18 @@ impl QueryHandler {
                     .as_ref()
                     .map(|m| m.remote_schema.clone())
                     .unwrap_or_else(|| schema.clone());
-                bindings.insert(schema.clone(), (catalog.id.clone(), remote));
+                schema_contributors
+                    .entry(schema.clone())
+                    .or_default()
+                    .insert((catalog.id.clone(), remote));
             }
         }
+        let bindings = schema_contributors
+            .into_iter()
+            .filter_map(|(schema, mut targets)| {
+                (targets.len() == 1).then(|| (schema, targets.pop_first().unwrap()))
+            })
+            .collect();
         analyzer.namespace = Some(modorch_fedengine_ddl::BindingNamespace {
             catalog: r.session.database.clone(),
             allow_cross_database: self.config.pgwire.allow_cross_database,
@@ -363,9 +375,14 @@ impl QueryHandler {
         }
         if let Some((name, required_action)) = index_ownership_target(&business_sql)? {
             let source = analyzer.bind(&name, false)?.source;
+            let connection_id = definitions
+                .iter()
+                .find(|d| d.id == source)
+                .and_then(|d| d.organization.as_ref())
+                .map(|o| &o.connection_id);
             if !self.config.grants.iter().any(|g| {
                 g.principal == r.principal
-                    && g.source == source
+                    && (g.source == source || connection_id.is_some_and(|cid| &g.source == cid))
                     && g.actions.contains(required_action)
             }) {
                 return Err(EngineError::denied("index operation is not granted"));
@@ -396,11 +413,6 @@ impl QueryHandler {
             }
         }
         let analysis = analyzer.analyze(&business_sql)?;
-        if scope.virtual_database.is_some() && analysis.kind != Kind::Query {
-            return Err(EngineError::unsupported(
-                "virtual database bindings support read-only queries",
-            ));
-        }
         let hub_payload = Authorize {
             principal: r.principal.clone(),
             analysis: analysis.clone(),

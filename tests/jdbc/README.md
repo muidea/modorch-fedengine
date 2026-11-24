@@ -24,7 +24,7 @@ java --class-path /path/postgresql-42.7.8.jar tests/jdbc/LoadProbe.java jdbc:pos
 
 运行产生的元数据结果、namespace 断言及环境快照放在被忽略的 `docs/validation/` 或仓库外；不提交 `*-actual.*`。PG16 直连基线与固定目录/查询夹具保留在 `tests/fixtures/metadata/`。客户端能力边界见[协议兼容说明](../../docs/protocol-compatibility.md)。临时 GUI 截图和验收报告不提交、不归档。目录 SQL 回放位于 `projection::tests::jdbc_catalog_statements_bind_and_describe`，不将业务 SQL 混入目录回放，也不以回放替代 GUI 证据。
 
-虚拟 Server 目录验证使用 `ServerCatalogProbe.java`；参数为 catalog/schema1,schema2。账号业务库需包含 public 和所有已绑定本地 schema。探针检查各库 schema、getTables/getColumns（包括 FOREIGN TABLE）、源对象读数、内部对象拒绝、账号库不伪造本地 PK/索引，以及当前库三段引用。
+虚拟 Server 目录验证使用 `ServerCatalogProbe.java`；参数为 catalog/schema1,schema2。账号业务库需包含 public 和所有已绑定本地 schema。探针检查各库 schema、getTables/getColumns（以普通 TABLE/VIEW 呈现）、源对象读数、内部对象拒绝、同 schema PK/索引映射，以及当前库三段引用。
 
 ```sh
 javac -d /tmp/fedengine-jdbc-probe tests/jdbc/ServerCatalogProbe.java tests/jdbc/VirtualDatabaseProbe.java

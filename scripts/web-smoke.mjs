@@ -260,7 +260,7 @@ try {
         const detail = url.pathname.endsWith('/object');
         const conflict = !detail && directoryConflict;
         const page = detail ? { stamp:url.searchParams.get('stamp'), object:{columns:[{name:treeColumn,remote_type:'text'}]} } : {
-          stamp:url.searchParams.get('stamp'), offset:0,has_more:true,objects:[{name:treeTable,kind:'f',source_type:'BASE TABLE',columns:1}] };
+          stamp:url.searchParams.get('stamp'), offset:0,has_more:true,objects:[{name:treeTable,kind:'r',source_type:'BASE TABLE',columns:1}] };
         await cdp.send('Fetch.fulfillRequest',{requestId:event.requestId,responseCode:conflict?409:200,
           responseHeaders:[{name:'Content-Type',value:'application/json'}],body:Buffer.from(JSON.stringify(conflict?{code:'40001',error:'directory snapshot changed'}:page)).toString('base64')});return;
       }
@@ -496,7 +496,7 @@ try {
     await api('virtual-databases', 'POST', {name:'web_live_db',owner:'fedengine',connect:[],allow_connections:true,schemas:[{name:'mapped',source:'web_live',remote_schema:schema}]});
     await evaluate('document.querySelector("[data-page=databases]").click()'); await click('↻ 刷新状态'); await click('web_live_db');
     await waitText('mapped'); await waitText(catalog.objects[0].name); await click(catalog.objects[0].name);
-    await waitText('只读外部对象'); await click('列'); await waitText(catalog.objects[0].columns[0].name);
+    await waitText('外部映射对象'); await click('列'); await waitText(catalog.objects[0].columns[0].name);
     await click('来源约束'); await click('来源索引'); await click('定义'); await click('统计'); await click('来源与状态');
     await waitText(catalog.snapshot_id); await click('查看来源对象'); await waitText('返回数据库对象'); await click('← 返回数据库对象');
     await waitText('web_live_db.mapped.');

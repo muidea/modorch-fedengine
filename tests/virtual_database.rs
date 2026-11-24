@@ -264,6 +264,15 @@ fn postgres_qualified_wildcards_columns_and_correlated_queries_execute_after_bin
         a.analyze("SELECT a.t.* FROM a.t q").unwrap_err().sqlstate,
         "42P01"
     );
+    for write_sql in [
+        "CREATE TABLE a.vdb_new(id INTEGER PRIMARY KEY)",
+        "INSERT INTO a.t VALUES(1)",
+        "UPDATE b.t SET i=2 WHERE i=1",
+        "DELETE FROM b.t WHERE i=2",
+        "DROP TABLE a.t",
+    ] {
+        assert!(a.analyze(write_sql).is_ok(), "{write_sql}");
+    }
 }
 
 #[tokio::test]

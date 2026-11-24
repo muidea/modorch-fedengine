@@ -951,47 +951,6 @@ pub(super) fn publish(conn: &Connection, snapshot: &CatalogSnapshot, alias: &str
     tracing::debug!(snapshot=%id, objects=snapshot.objects.len(), elapsed_ms=started.elapsed().as_secs_f64()*1000., "catalog local projection finished");
     Ok(())
 }
-/// Describe actual FedEngine external bindings without exposing credentials or remote indexes.
-pub(super) fn foreign_binding(
-    conn: &Connection,
-    snapshot: &CatalogSnapshot,
-    alias: &str,
-    schema: &str,
-    wrapper: u32,
-    server: u32,
-) -> Result<()> {
-    let mut rows = Rows::new();
-    push(
-        &mut rows,
-        "pg_foreign_data_wrapper",
-        &snapshot.id,
-        alias,
-        schema,
-        "",
-        json!({"oid":wrapper,"fdwname":format!("fedengine_{wrapper}"),"fdwhandler":0,"fdwvalidator":0}),
-    );
-    push(
-        &mut rows,
-        "pg_foreign_server",
-        &snapshot.id,
-        alias,
-        schema,
-        "",
-        json!({"oid":server,"srvname":schema,"srvfdw":wrapper,"srvtype":"FedEngine schema binding"}),
-    );
-    for object in &snapshot.objects {
-        push(
-            &mut rows,
-            "pg_foreign_table",
-            &snapshot.id,
-            alias,
-            schema,
-            &object.name,
-            json!({"ftrelid":object.metadata.oid,"ftserver":server}),
-        );
-    }
-    insert(conn, rows)
-}
 pub(super) fn remove(conn: &Connection, id: &str) -> Result<()> {
     conn.execute(
         "DELETE FROM _fedengine.metadata_relation_statistics WHERE snapshot_id=?",

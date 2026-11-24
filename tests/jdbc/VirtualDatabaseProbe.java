@@ -6,7 +6,7 @@ public class VirtualDatabaseProbe {
     static String qi(String s) { return "\""+s.replace("\"","\"\"")+"\""; }
     static void require(boolean ok,String msg) { if(!ok) throw new AssertionError(msg); }
     static String sample(Connection c,String schema) throws Exception {
-        try(var s=c.prepareStatement("SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=? AND c.relkind='f' ORDER BY c.relname LIMIT 1")) {
+        try(var s=c.prepareStatement("SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=? AND c.relkind='r' ORDER BY c.relname LIMIT 1")) {
             s.setString(1,schema);try(var r=s.executeQuery()) { require(r.next(),"empty business schema");return r.getString(1); }
         }
     }
@@ -26,7 +26,7 @@ public class VirtualDatabaseProbe {
             try(var s=c.createStatement()) {
                 boolean rejected=false;try(var r=s.executeQuery("SELECT * FROM \"PostgreSQL17\".public."+qi(pg)+" LIMIT 1")) {} catch(SQLException e) {require("0A000".equals(e.getSQLState()),"cross-database SQLSTATE mismatch");rejected=true;}require(rejected,"cross-database extension enabled by default");
             }
-            try(var s=c.createStatement();var r=s.executeQuery("SELECT n.nspname,c.relname,c.oid FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind='f' ORDER BY n.nspname,c.relname")) {
+            try(var s=c.createStatement();var r=s.executeQuery("SELECT n.nspname,c.relname,c.oid FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind='r' ORDER BY n.nspname,c.relname")) {
                 while(r.next()) System.out.println(r.getString(1)+"\t"+r.getString(2)+"\t"+r.getLong(3));
             }
         }

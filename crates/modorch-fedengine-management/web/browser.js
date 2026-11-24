@@ -69,7 +69,7 @@ export function createBrowser(ui) {
     const search = el('input', { type: 'search', value: w.search, placeholder: '搜索对象名称', 'aria-label': '搜索对象名称' });
     let debounce;
     search.addEventListener('input', () => { w.search = search.value; w.offset = 0; clearTimeout(debounce); debounce = setTimeout(() => { if (active(w)) loadObjects(w); }, 250); });
-    const kind = el('select', { 'aria-label': '对象类型' }, el('option', { value: '' }, '全部类型'), el('option', { value: 'table' }, '表 / 外部表'), el('option', { value: 'view' }, '视图'));
+    const kind = el('select', { 'aria-label': '对象类型' }, el('option', { value: '' }, '全部类型'), el('option', { value: 'table' }, '表'), el('option', { value: 'view' }, '视图'));
     kind.value = w.kind; kind.addEventListener('change', () => { w.kind = kind.value; w.offset = 0; loadObjects(w); });
     replace(host, el('div', { class: 'panel-heading' }, el('div', {}, el('h3', {}, w.schema || '选择 Schema')),
       el('div', { class: 'toolbar' }, search, kind)), el('div', { id: 'object-rows' }));
@@ -108,14 +108,14 @@ export function createBrowser(ui) {
     const back = () => { if (w.sourceView) { w.sourceView = false; renderDetail(w); } else { w.detail = null; renderObjectArea(w); } };
     replace(host, el('div', { class: 'panel-heading' }, el('div', {}, button(w.sourceView ? '← 返回数据库对象' : '← 返回对象列表', back, 'link'),
       el('h3', {}, w.sourceView ? `${sourceName}.${d.source.schema}.${d.name}` : `${w.db.config.name}.${d.schema}.${d.name}`)),
-      el('span', { class: 'badge' }, w.sourceView ? '来源事实' : d.external ? '只读外部对象' : '系统目录')),
+      el('span', { class: 'badge' }, w.sourceView ? '来源事实' : d.external ? '外部映射对象' : '系统目录')),
       el('details', { class: 'metadata-help' }, el('summary', {}, '元数据说明'), el('p', {}, d.external
-        ? '约束、索引和统计来自来源快照；虚拟对象不在本地强制执行来源约束。原始定义仅供查看。'
+        ? '约束、索引和统计来自来源快照；实际约束以远端来源为准。'
         : '当前数据库的 PostgreSQL 系统目录投影。')),
       d.metadata_conflict ? el('div', { class: 'notice warning' }, '多个登记的来源事实不一致；当前按有权限的来源 ID 顺序选择执行路由和目录事实。请刷新相关来源核对。') : null,
       d.source?.stale ? el('div', { class: 'notice warning' }, '来源元数据已过期；当前仍展示最后一次发布的快照。') : null,
       el('div', { class: 'browser-tabs', role: 'tablist', 'aria-label': '元数据详情' }, names.map(([id, label]) => tab(label, w.detailTab === id, () => { w.detailTab = id; renderDetail(w); }))), body);
-    const kinds = { f: '只读外部表', r: '表', p: '分区表', v: '视图', m: '物化视图' };
+    const kinds = { f: '外部表', r: '表', p: '分区表', v: '视图', m: '物化视图' };
     switch (w.detailTab) {
       case 'overview': body.append(pairList({ '数据库': w.sourceView ? sourceName : w.db.config.name, 'Schema': w.sourceView ? d.source.schema : d.schema, '名称': d.name, 'OID': w.sourceView ? m.oid : d.oid, '类型': w.sourceView ? o.object_type : (kinds[d.kind] ?? d.kind), '备注': m.comment, '列数': o?.columns.length ?? d.columns?.rows.length })); break;
       case 'columns': {

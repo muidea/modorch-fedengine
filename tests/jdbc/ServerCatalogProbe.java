@@ -47,11 +47,11 @@ public class ServerCatalogProbe {
                 }
                 for (String schema : item.getValue()) {
                 int tables = 0; String sample = null;
-                try (var r = m.getTables(catalog, schema, "%", new String[]{"TABLE", "VIEW", "FOREIGN TABLE"})) {
+                try (var r = m.getTables(catalog, schema, "%", new String[]{"TABLE", "VIEW"})) {
                     while (r.next()) { tables++; if (sample == null) sample = r.getString("TABLE_NAME"); }
                 }
                 int coreCount;
-                try (var s = c.prepareStatement("SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=? AND c.relkind IN ('r','v','m','p','f')")) {
+                try (var s = c.prepareStatement("SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=? AND c.relkind IN ('r','v','m','p')")) {
                     s.setString(1, schema);
                     try (var r=s.executeQuery()) { require(r.next(), "missing count"); coreCount=r.getInt(1); }
                 }
@@ -61,8 +61,6 @@ public class ServerCatalogProbe {
                     try (var r=m.getColumns(catalog,schema,sample,"%")) { while(r.next()) columns++; }
                     require(columns > 0,"sample columns missing");
                     if (catalog.equals("fedengine")) {
-                        try (var r=m.getPrimaryKeys(catalog,schema,sample)) { require(!r.next(), "remote key advertised as enforced local key"); }
-                        try (var r=m.getIndexInfo(catalog,schema,sample,false,false)) { require(!r.next(), "remote index advertised as local index"); }
                         try (var s=c.createStatement(); var r=s.executeQuery("SELECT "+qi(schema)+"."+qi(sample)+".* FROM "+qi(catalog)+"."+qi(schema)+"."+qi(sample)+" LIMIT 1")) { while(r.next()) {} }
                     }
                     try (var s=c.createStatement()) {

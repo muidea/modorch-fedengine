@@ -206,7 +206,7 @@ fn where_scope(name: &str, scope: &MetadataScope) -> Result<String> {
             } else {
                 format!("({})", schema_grants.join(" OR "))
             }
-        } else if name.starts_with("information_schema.") && c.mapping.is_none() {
+        } else if name.starts_with("information_schema.") {
             let checks = [
                 "SELECT",
                 "INSERT",
@@ -418,9 +418,11 @@ fn privilege_expression(
                 } else {
                     vec![]
                 };
-                for c in scope.catalogs.iter().filter(|c| {
-                    c.catalog == scope.database && (c.mapping.is_none() || *action == "SELECT")
-                }) {
+                for c in scope
+                    .catalogs
+                    .iter()
+                    .filter(|c| c.catalog == scope.database)
+                {
                     clauses.push(format!(
                         "(p._snapshot_id={} AND {})",
                         quote_literal(&c.snapshot_id),

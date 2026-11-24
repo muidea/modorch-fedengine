@@ -621,7 +621,7 @@ pub(super) fn publish(conn: &Connection, state: &ManagementState) -> Result<()> 
                 continue;
             };
             let id = format!(
-                "virtual:{}:{}:{}",
+                "virtual:v2:{}:{}:{}",
                 binding.oid, binding.object_epoch, source_snapshot.id
             );
             let exists:bool=conn.query_row("SELECT count(*)>0 FROM _fedengine.metadata_projection_state WHERE snapshot_id=?",[&id],|r|r.get(0)).map_err(engine_error)?;
@@ -742,7 +742,7 @@ mod tests {
         let (oid,namespace,kind):(u32,u32,String)=conn.query_row("SELECT oid,relnamespace,relkind FROM _fedengine.meta_pg_class WHERE _snapshot_id=?",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
         assert_ne!(oid, state.catalogs["original"].objects[0].metadata.oid);
         assert_eq!(namespace, db.schemas[0].oid);
-        assert_eq!(kind, "f");
+        assert_eq!(kind, "r");
         let constraints: i64 = conn
             .query_row(
                 "SELECT count(*) FROM _fedengine.meta_pg_constraint WHERE _snapshot_id=?",
@@ -750,7 +750,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(constraints, 0);
+        assert_eq!(constraints, 1);
         // Restart/config reconciliation and unchanged refresh retain the logical identities.
         crate::storage::initialize(&conn, &config).unwrap();
         assert_eq!(read(&conn).unwrap()[0], db);

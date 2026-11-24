@@ -95,14 +95,12 @@ jobs:
           workspaces: modorch-fedengine -> target
           key: modorch-${{ env.MODORCH_REVISION }}
           save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
-      - name: Restore DuckDB native library and extensions
+      - name: Restore DuckDB native library
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: duckdb-cache
         with:
-          path: |
-            modorch-fedengine/target/duckdb-download
-            modorch-fedengine/data/extensions
-          key: duckdb-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('modorch-fedengine/Cargo.lock', 'modorch-fedengine/scripts/fetch-extensions.py') }}
+          path: modorch-fedengine/target/duckdb-download
+          key: duckdb-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('modorch-fedengine/Cargo.lock') }}
       - name: Resolve dependencies and check framework identity
         run: |
           cargo fetch --locked
@@ -124,15 +122,13 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --workspace --no-deps --locked
-      - name: Disposable federation integration
-        run: scripts/test-federation.sh
-      - name: Save DuckDB native library and extensions
+      # Disposable PG/MySQL federation tests require locally compiled custom DuckDB 2.0.0 extensions
+      # and are executed offline/locally via scripts/test-federation.sh rather than online in CI.
+      - name: Save DuckDB native library
         if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && steps.duckdb-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: |
-            modorch-fedengine/target/duckdb-download
-            modorch-fedengine/data/extensions
+          path: modorch-fedengine/target/duckdb-download
           key: ${{ steps.duckdb-cache.outputs.cache-primary-key }}
 
   # Keep the existing required check name, including on documentation-only PRs.

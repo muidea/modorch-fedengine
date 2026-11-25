@@ -1,5 +1,5 @@
 {
-  "skill_revision": "1.1.5",
+  "skill_revision": "1.1.6",
   "library_contracts_revision": "1.1.2",
   "hash_algorithm": "sha256(sorted UTF-8 path + NUL + lowercase file sha256 + LF)",
   "library": {

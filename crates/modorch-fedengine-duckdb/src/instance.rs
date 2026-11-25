@@ -299,4 +299,92 @@ mod tests {
             assert!(count >= 1, "missing de-versioned function {required}");
         }
     }
+
+    #[test]
+    fn initialize_local_loads_split_plugin_extension_via_manifest_d() {
+        let source_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/extensions");
+        if !source_dir.join("manifest.json").is_file() {
+            return;
+        }
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(source_dir.join("manifest.json")).unwrap())
+                .unwrap();
+        let temp =
+            std::env::temp_dir().join(format!("fedengine-split-ext-{}", uuid::Uuid::new_v4()));
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(temp.clone());
+
+        let builtin = temp.join("builtin");
+        let plugin = temp.join("plugin");
+        let tmp_dir = temp.join("tmp");
+        std::fs::create_dir_all(&builtin).unwrap();
+        std::fs::create_dir_all(plugin.join("manifest.d")).unwrap();
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        let copy_entry = |key: &str, dest_root: &PathBuf| {
+            let entry = &manifest["extensions"][key];
+            let rel = entry["path"].as_str().unwrap();
+            let dst = dest_root.join(rel);
+            std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+            std::fs::copy(source_dir.join(rel), dst).unwrap();
+            entry.clone()
+        };
+
+        let pg_entry = copy_entry("postgres", &builtin);
+        std::fs::write(
+            builtin.join("manifest.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "duckdb_version": "v2.0.0",
+                "extensions": { "postgres": pg_entry }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let my_entry = copy_entry("mysql", &plugin);
+        std::fs::write(
+            plugin.join("manifest.d/mysql.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "duckdb_version": "v2.0.0",
+                "extensions": { "mysql": my_entry }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut config = Config::load(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/application.toml"),
+        )
+        .unwrap();
+        config.duckdb.database_path = ":memory:".into();
+        config.duckdb.temp_directory = tmp_dir.to_string_lossy().into();
+        config.duckdb.extension_directory = Some(builtin.to_string_lossy().into());
+        config.duckdb.plugin_extension_directory = Some(plugin.to_string_lossy().into());
+        config.duckdb.install_extensions = false;
+
+        let conn = initialize_local(&config).unwrap();
+        crate::control::load_extension(&conn, &config, DataSourceKind::Postgres).unwrap();
+        crate::control::load_extension(&conn, &config, DataSourceKind::Mysql).unwrap();
+        for ext in ["postgres_scanner", "mysql_scanner"] {
+            let loaded: bool = conn
+                .query_row(
+                    "SELECT loaded FROM duckdb_extensions() WHERE extension_name=?",
+                    [ext],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(loaded, "expected {ext} to be loaded");
+        }
+        assert!(
+            crate::control::load_extension(&conn, &config, DataSourceKind::Oracle)
+                .unwrap_err()
+                .to_string()
+                .contains("is not installed")
+        );
+    }
 }

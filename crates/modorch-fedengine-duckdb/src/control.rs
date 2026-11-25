@@ -1,7 +1,6 @@
 use crate::{
     catalog::{capture, discover},
     error::engine_error,
-    extensions::verify_extension,
     storage,
 };
 use duckdb::Connection;
@@ -21,7 +20,7 @@ pub(super) fn load_extension(
     // must not re-read its on-disk binary while holding the instance barrier.
     let loaded: bool = conn
         .query_row(
-            "SELECT loaded FROM duckdb_extensions() WHERE extension_name=?",
+            "SELECT COALESCE(BOOL_OR(loaded), false) FROM duckdb_extensions() WHERE extension_name=?",
             [&ext_name],
             |row| row.get(0),
         )
@@ -30,11 +29,8 @@ pub(super) fn load_extension(
         return Ok(());
     }
     let d = &config.duckdb;
-    let is_local_custom = d
-        .extension_directory
-        .as_deref()
-        .and_then(|dir| crate::extensions::provisioned(dir, extension).ok())
-        .unwrap_or(false);
+    let dirs = modorch_fedengine_core::plugins::extension_directories(d);
+    let is_local_custom = crate::extensions::provisioned_in_config(d, extension)?;
     // Never overwrite locally provisioned custom extensions from the upstream repo.
     if d.install_extensions && !is_local_custom {
         conn.execute_batch("SET custom_extension_repository='https://extensions.duckdb.org'")
@@ -42,11 +38,17 @@ pub(super) fn load_extension(
         conn.execute_batch(&format!("INSTALL {canonical}"))
             .map_err(engine_error)?;
     }
-    if let Some(directory) = &d.extension_directory {
-        verify_extension(directory, extension)?;
+    if !dirs.is_empty() && (is_local_custom || !d.install_extensions) {
+        let verified_path = crate::extensions::verify_extension_path(d, extension)?;
+        let path_str = verified_path
+            .to_str()
+            .ok_or_else(|| EngineError::config("extension path must be valid UTF-8"))?;
+        conn.execute_batch(&format!("LOAD {}", quote_literal(path_str)))
+            .map_err(engine_error)?;
+    } else {
+        conn.execute_batch(&format!("LOAD {ext_name}"))
+            .map_err(engine_error)?;
     }
-    conn.execute_batch(&format!("LOAD {ext_name}"))
-        .map_err(engine_error)?;
     let settings = match canonical {
         "postgres" => format!(
             "SET pg_connection_cache=true; SET pg_connection_limit={}",

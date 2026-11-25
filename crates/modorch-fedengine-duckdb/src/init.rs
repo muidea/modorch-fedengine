@@ -54,10 +54,12 @@ impl Lifecycle for DuckdbInitiator {
             .spawn_blocking_io(move |_| {
                 let _instance = instance;
                 let conn = setup_root.lock().unwrap();
-                // Explicitly provisioned extensions can be verified and initialized
+                // Explicitly provisioned extensions (built-in or plugin) can be verified and initialized
                 // before admitting PG sessions, avoiding first-use LOAD in a live barrier.
                 // Enable every provisioned database dialect family by default with no config toggle.
-                if let Some(directory) = &config.duckdb.extension_directory {
+                if !modorch_fedengine_core::plugins::extension_directories(&config.duckdb)
+                    .is_empty()
+                {
                     for kind in [
                         DataSourceKind::Postgres,
                         DataSourceKind::Mysql,
@@ -65,8 +67,11 @@ impl Lifecycle for DuckdbInitiator {
                         DataSourceKind::Sqlserver,
                         DataSourceKind::Dameng,
                     ] {
-                        if crate::extensions::provisioned(directory, kind.extension())
-                            .map_err(fw)?
+                        if crate::extensions::provisioned_in_config(
+                            &config.duckdb,
+                            kind.extension(),
+                        )
+                        .map_err(fw)?
                             && let Err(error) = crate::control::load_extension(&conn, &config, kind)
                         {
                             if kind.is_read_only_scanner()

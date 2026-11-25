@@ -129,6 +129,7 @@ impl Lifecycle for ApiInitiator {
 }
 #[derive(Clone)]
 struct ApiState {
+    config: Arc<Config>,
     hub: ExternalEventHub,
     timeout: Duration,
     browser: crate::browser::Browser,
@@ -183,6 +184,7 @@ impl Initiator for EmbeddedApiInitiator {
     }
     async fn activate_ingress(&mut self, ctx: &RuntimeContext) -> FrameworkResult<()> {
         let state = ApiState {
+            config: self.config.clone(),
             browser: crate::browser::Browser::new(
                 self.config.clone(),
                 ctx.event_hub.external(),
@@ -206,6 +208,7 @@ impl Initiator for ApiInitiator {
             FrameworkError::InvalidConfig(format!("cannot listen on management socket: {e}"))
         })?;
         let state = ApiState {
+            config: self.config.clone(),
             browser: crate::browser::Browser::new(
                 self.config.clone(),
                 ctx.event_hub.external(),
@@ -242,6 +245,15 @@ async fn dispatch(
         return (
             StatusCode::FORBIDDEN,
             axum::Json(json!({"error":"cross-origin management writes are not allowed"})),
+        )
+            .into_response();
+    }
+    if method == Method::GET && uri.path() == "/api/v1/plugins" {
+        return (
+            StatusCode::OK,
+            axum::Json(json!({
+                "plugins": modorch_fedengine_core::plugins::inspect_plugins(&state.config.duckdb)
+            })),
         )
             .into_response();
     }

@@ -6,6 +6,7 @@ mod management;
 pub use management::*;
 mod metadata;
 pub use metadata::*;
+pub mod plugins;
 use std::{collections::BTreeSet, path::Path};
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -182,6 +183,8 @@ pub struct DuckdbConfig {
     pub acquire_timeout_ms: u64,
     pub install_extensions: bool,
     pub extension_directory: Option<String>,
+    #[serde(default)]
+    pub plugin_extension_directory: Option<String>,
     pub pool_max_connections: usize,
     pub pool_wait_timeout_ms: u64,
 }

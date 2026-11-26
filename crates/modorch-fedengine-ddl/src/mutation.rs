@@ -76,6 +76,121 @@ fn oracle_temporal_wrapper(fn_name: &str, format: &str) -> Expr {
     })
 }
 
+fn oracle_custom_type(raw: &str) -> DataType {
+    DataType::Custom(
+        ObjectName(vec![ObjectNamePart::Identifier(Ident::new(raw))]),
+        vec![],
+    )
+}
+
+fn pg_catalog_date_type() -> DataType {
+    DataType::Custom(
+        ObjectName(vec![
+            ObjectNamePart::Identifier(Ident::new("pg_catalog")),
+            ObjectNamePart::Identifier(Ident::new("date")),
+        ]),
+        vec![],
+    )
+}
+
+fn is_unqualified_date(dt: &DataType) -> bool {
+    match dt {
+        DataType::Date => true,
+        DataType::Custom(name, mods) if mods.is_empty() => {
+            Analyzer::parts(name).is_ok_and(|p| p.len() == 1 && p[0].eq_ignore_ascii_case("date"))
+        }
+        _ => false,
+    }
+}
+
+fn oracle_scalar_cast_target(dt: &DataType) -> Option<DataType> {
+    match dt {
+        DataType::Int(_) | DataType::Integer(_) | DataType::Int4(_) => {
+            Some(oracle_custom_type("NUMBER(10,0)"))
+        }
+        DataType::BigInt(_) | DataType::Int8(_) => Some(oracle_custom_type("NUMBER(19,0)")),
+        DataType::Real | DataType::Float4 | DataType::Float(ExactNumberInfo::None) => {
+            Some(oracle_custom_type("BINARY_FLOAT"))
+        }
+        DataType::Double(_) | DataType::DoublePrecision | DataType::Float8 => {
+            Some(oracle_custom_type("BINARY_DOUBLE"))
+        }
+        DataType::Custom(name, mods) if mods.is_empty() => {
+            let parts = Analyzer::parts(name).ok()?;
+            let base = match parts.as_slice() {
+                [t] => t.as_str(),
+                [schema, t] if schema.eq_ignore_ascii_case("pg_catalog") => t.as_str(),
+                _ => return None,
+            };
+            match base.to_ascii_lowercase().as_str() {
+                "int" | "integer" | "int4" => Some(oracle_custom_type("NUMBER(10,0)")),
+                "bigint" | "int8" => Some(oracle_custom_type("NUMBER(19,0)")),
+                "real" | "float4" => Some(oracle_custom_type("BINARY_FLOAT")),
+                "double" | "float8" => Some(oracle_custom_type("BINARY_DOUBLE")),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn cast_placeholder(placeholder: &str, data_type: DataType) -> Expr {
+    Expr::Cast {
+        kind: CastKind::Cast,
+        expr: Box::new(Expr::Value(Value::Placeholder(placeholder.into()).into())),
+        data_type,
+        array: false,
+        format: None,
+    }
+}
+
+fn mysql_time_placeholder() -> Expr {
+    Expr::Cast {
+        kind: CastKind::Cast,
+        expr: Box::new(cast_placeholder("?", DataType::Char(None))),
+        data_type: DataType::Time(Some(6), TimezoneInfo::None),
+        array: false,
+        format: None,
+    }
+}
+
+/// Validate SQL text literals in a KingbaseES DML statement against `SQL_ASCII` and
+/// `empty_str_is_null` / Oracle-mode constraints.
+pub fn validate_kingbase_text_literals(
+    native_sql: &str,
+    ascii_only_text: bool,
+    reject_empty_text: bool,
+) -> Result<()> {
+    if !ascii_only_text && !reject_empty_text {
+        return Ok(());
+    }
+    let parsed = Analyzer::parse(native_sql)?;
+    for stmt in &parsed {
+        let res = visit_expressions(stmt, |expr| {
+            if let Expr::Value(v) = expr
+                && let Value::SingleQuotedString(s)
+                | Value::DollarQuotedString(DollarQuotedString { value: s, .. }) = &v.value
+            {
+                if reject_empty_text && s.is_empty() {
+                    return ControlFlow::Break(EngineError::unsupported(
+                        "empty string is not certified in Oracle-compatible SQL mode",
+                    ));
+                }
+                if ascii_only_text && !s.is_ascii() {
+                    return ControlFlow::Break(EngineError::unsupported(
+                        "non-ASCII text is not certified under SQL_ASCII encoding",
+                    ));
+                }
+            }
+            ControlFlow::Continue(())
+        });
+        if let ControlFlow::Break(err) = res {
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
 /// Convert an analyzed, parameter-compacted single-source DML statement into a
 /// dialect-local guarded mutation SQL statement for native scanner execution.
 pub fn build_guarded_mutation_plan(
@@ -213,15 +328,37 @@ pub fn build_guarded_mutation_plan(
     }
 
     let oracle = source.kind == DataSourceKind::Oracle;
-    let res = visit_expressions_mut(&mut parsed[0], |expr| {
+    let mysql = source.kind.is_mysql_family();
+    let kingbasees = source.kind == DataSourceKind::Kingbasees;
+    // Strip PostgreSQL placeholder casts BEFORE rewriting `$N` placeholders because
+    // `visit_expressions_mut` visits children bottom-up before parent `Expr::Cast` nodes.
+    let _ = visit_expressions_mut(&mut parsed[0], |expr| {
         if question_marks
             && let Expr::Cast { expr: inner, .. } = expr
-            && matches!(inner.as_ref(), Expr::Value(v) if matches!(v.value, Value::Placeholder(_)))
+            && matches!(inner.as_ref(), Expr::Value(v) if matches!(&v.value, Value::Placeholder(p) if p.starts_with('$')))
         {
             // Non-PG guarded engines bind typed parameters out-of-band via struct_pack/ODBC and
             // reject PostgreSQL `::TYPE` placeholder cast syntax.
             *expr = (**inner).clone();
+        } else if kingbasees
+            && let Expr::Cast {
+                expr: inner,
+                data_type,
+                ..
+            } = expr
+            && is_unqualified_date(data_type)
+            && let Expr::Value(v) = inner.as_ref()
+            && let Value::Placeholder(p) = &v.value
+            && let Some(rest) = p.strip_prefix('$')
+            && let Ok(idx) = rest.parse::<usize>()
+            && idx >= 1
+            && param_types.get(idx - 1) == Some(&PgType::Date)
+        {
+            *expr = (**inner).clone();
         }
+        ControlFlow::Continue::<()>(())
+    });
+    let res = visit_expressions_mut(&mut parsed[0], |expr| {
         let mut replacement: Option<Expr> = None;
         if let Expr::Value(v) = expr
             && let Value::Placeholder(p) = &mut v.value
@@ -258,8 +395,28 @@ pub fn build_guarded_mutation_plan(
                                 "YYYY-MM-DD HH24:MI:SS.FF6TZH:TZM",
                             ));
                         }
+                        PgType::Int4 => {
+                            replacement =
+                                Some(cast_placeholder("?", oracle_custom_type("NUMBER(10,0)")));
+                        }
+                        PgType::Int8 => {
+                            replacement =
+                                Some(cast_placeholder("?", oracle_custom_type("NUMBER(19,0)")));
+                        }
+                        PgType::Float4 => {
+                            replacement =
+                                Some(cast_placeholder("?", oracle_custom_type("BINARY_FLOAT")));
+                        }
+                        PgType::Float8 => {
+                            replacement =
+                                Some(cast_placeholder("?", oracle_custom_type("BINARY_DOUBLE")));
+                        }
                         _ => {}
                     }
+                } else if mysql && param_types.get(zero_idx) == Some(&PgType::Time) {
+                    replacement = Some(mysql_time_placeholder());
+                } else if kingbasees && param_types.get(zero_idx) == Some(&PgType::Date) {
+                    replacement = Some(cast_placeholder(p, pg_catalog_date_type()));
                 }
             } else if question_marks && p != "?" {
                 return ControlFlow::Break(EngineError::unsupported(
@@ -274,6 +431,29 @@ pub fn build_guarded_mutation_plan(
     });
     if let ControlFlow::Break(e) = res {
         return Err(e);
+    }
+    if oracle || kingbasees {
+        let cast_res = visit_expressions_mut(&mut parsed[0], |expr| {
+            if let Expr::Cast {
+                kind, data_type, ..
+            } = expr
+            {
+                if oracle {
+                    if *kind == CastKind::DoubleColon {
+                        *kind = CastKind::Cast;
+                    }
+                    if let Some(target) = oracle_scalar_cast_target(data_type) {
+                        *data_type = target;
+                    }
+                } else if kingbasees && is_unqualified_date(data_type) {
+                    *data_type = pg_catalog_date_type();
+                }
+            }
+            ControlFlow::Continue::<EngineError>(())
+        });
+        if let ControlFlow::Break(e) = cast_res {
+            return Err(e);
+        }
     }
     let _ = sqlserver_output_col;
     let _ = format_table;
@@ -326,6 +506,19 @@ pub fn build_guarded_mutation_plan(
     } else {
         inner_sql
     };
+    let mut text_literals = Vec::new();
+    if kingbasees {
+        let _ = visit_expressions(&parsed[0], |expr| {
+            if let Expr::Value(v) = expr
+                && let Value::SingleQuotedString(s)
+                | Value::DollarQuotedString(DollarQuotedString { value: s, .. })
+                | Value::EscapedStringLiteral(s) = &v.value
+            {
+                text_literals.push(s.clone());
+            }
+            ControlFlow::Continue::<()>(())
+        });
+    }
     let param_map = if question_marks {
         seen_placeholders
     } else {
@@ -340,5 +533,6 @@ pub fn build_guarded_mutation_plan(
         native_sql,
         returning: returning.cloned(),
         param_map,
+        text_literals,
     }))
 }

@@ -633,14 +633,6 @@ impl Coordinator {
                 .await?;
             return Ok(());
         }
-        while let Some(target) = self.demand_repair.pop_next() {
-            if target.source == source.id {
-                self.demand_repair.complete(&target);
-            } else {
-                let _ = self.demand_repair.enqueue(target, false, None);
-                break;
-            }
-        }
         self.demand_repair.clear_source(&source.id);
         let repair_stats = self.demand_repair.stats();
         tracing::debug!(operation=%id,elapsed_ms=barrier_started.elapsed().as_secs_f64()*1000.,repair_pending=repair_stats.pending,repair_coalesced=repair_stats.coalesced,"management publication finalization finished");

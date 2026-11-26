@@ -366,12 +366,12 @@ fn pg_queries(version: u32, condition: &str) -> Vec<(&'static str, String)> {
         "NULL::text"
     };
     let generated = if version >= 120000 {
-        "CASE WHEN a.attgenerated<>'' THEN pg_get_expr(d.adbin,d.adrelid) END"
+        "CASE WHEN COALESCE(octet_length(a.attgenerated::text),0)>0 THEN pg_get_expr(d.adbin,d.adrelid) END"
     } else {
         "NULL::text"
     };
     let default = if version >= 120000 {
-        "CASE WHEN a.attgenerated='' THEN pg_get_expr(d.adbin,d.adrelid) END"
+        "CASE WHEN COALESCE(octet_length(a.attgenerated::text),0)=0 THEN pg_get_expr(d.adbin,d.adrelid) END"
     } else {
         "pg_get_expr(d.adbin,d.adrelid)"
     };
@@ -841,6 +841,53 @@ fn query_text_rows(
         out.push(row);
     }
     Ok(out)
+}
+
+fn apply_odbc_column_details(
+    kind: DataSourceKind,
+    objects: &mut Objects,
+    rows: &[Vec<String>],
+) -> Result<()> {
+    for r in rows {
+        let Some(obj) = objects.get_mut(&(r[0].clone(), r[1].clone())) else {
+            continue;
+        };
+        if let Some(props) = obj.metadata.columns.get_mut(&r[2]) {
+            if kind == DataSourceKind::Dameng {
+                let mode = r[3].trim();
+                let gen_kind = r[4].trim();
+                if !mode.is_empty() {
+                    if mode != "by_default" && mode != "always" {
+                        return Err(EngineError::new("55000", "unknown Dameng identity kind"));
+                    }
+                    props.identity = Some(mode.to_string());
+                    props.default = None;
+                } else if !gen_kind.is_empty() {
+                    if gen_kind != "virtual" {
+                        return Err(EngineError::new("55000", "unknown Dameng generated kind"));
+                    }
+                    let expr = MetadataExpression::source(r[5].clone(), kind).ok_or_else(|| {
+                        EngineError::new("55000", "Dameng generated expression is missing")
+                    })?;
+                    props.generated = Some(expr);
+                    props.default = None;
+                } else if props.default.is_none() && !r[6].is_empty() {
+                    props.default = MetadataExpression::source(r[6].clone(), kind);
+                }
+            } else {
+                if !r[3].is_empty() && r[3] != "N" {
+                    props.identity = Some(r[3].clone());
+                }
+                if !r[5].is_empty() {
+                    props.generated = MetadataExpression::source(r[5].clone(), kind);
+                }
+                if props.default.is_none() && !r[6].is_empty() {
+                    props.default = MetadataExpression::source(r[6].clone(), kind);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn finalize_extended_objects(source: &DataSourceDefinition, objects: &mut Objects) {
@@ -1329,27 +1376,13 @@ fn capture_extended_odbc(
                     } else {
                         ok_cols = false;
                     }
-                    if matches!(source.kind, DataSourceKind::Db2 | DataSourceKind::Hana)
-                        && let Ok(rows) = query_text_rows(conn, &call("columnDetails"), 7, budget)
+                    if matches!(
+                        source.kind,
+                        DataSourceKind::Db2 | DataSourceKind::Hana | DataSourceKind::Dameng
+                    ) && let Ok(rows) = query_text_rows(conn, &call("columnDetails"), 7, budget)
+                        && apply_odbc_column_details(source.kind, objects, &rows).is_err()
                     {
-                        for r in rows {
-                            let Some(obj) = objects.get_mut(&(r[0].clone(), r[1].clone())) else {
-                                continue;
-                            };
-                            if let Some(props) = obj.metadata.columns.get_mut(&r[2]) {
-                                if !r[3].is_empty() && r[3] != "N" {
-                                    props.identity = Some(r[3].clone());
-                                }
-                                if !r[5].is_empty() {
-                                    props.generated =
-                                        MetadataExpression::source(r[5].clone(), source.kind);
-                                }
-                                if props.default.is_none() && !r[6].is_empty() {
-                                    props.default =
-                                        MetadataExpression::source(r[6].clone(), source.kind);
-                                }
-                            }
-                        }
+                        ok_cols = false;
                     }
                     let mut grouped_cons: BTreeMap<(String, String, String), MetadataConstraint> =
                         BTreeMap::new();
@@ -1830,5 +1863,111 @@ mod tests {
             assert_eq!(m.constraints, MetadataSupport::Partial);
             assert_eq!(m.indexes, MetadataSupport::Partial);
         }
+    }
+
+    #[test]
+    fn pg_attgenerated_and_dameng_column_details_follow_fqe_contract() {
+        let qs = pg_queries(160000, "TRUE");
+        let col_props = &qs
+            .iter()
+            .find(|(k, _)| *k == "column_properties")
+            .unwrap()
+            .1;
+        assert!(col_props.contains("COALESCE(octet_length(a.attgenerated::text),0)=0"));
+        assert!(col_props.contains("COALESCE(octet_length(a.attgenerated::text),0)>0"));
+        assert!(!col_props.contains("a.attgenerated=''"));
+        assert!(!col_props.contains("a.attgenerated<>''"));
+
+        let mut objects = Objects::new();
+        let mut obj = CatalogObject {
+            schema: "DM".into(),
+            name: "T".into(),
+            object_type: "BASE TABLE".into(),
+            columns: vec![],
+            indexes: vec![],
+            metadata: ObjectMetadata::default(),
+        };
+        for col in ["id", "gen_c", "def_c"] {
+            obj.metadata.columns.insert(
+                col.into(),
+                ColumnProperties {
+                    default: MetadataExpression::source("'seed'".into(), DataSourceKind::Dameng),
+                    ..ColumnProperties::default()
+                },
+            );
+        }
+        objects.insert(("DM".into(), "T".into()), obj);
+        apply_odbc_column_details(
+            DataSourceKind::Dameng,
+            &mut objects,
+            &[
+                vec![
+                    "DM".into(),
+                    "T".into(),
+                    "id".into(),
+                    "by_default".into(),
+                    "".into(),
+                    "".into(),
+                    "".into(),
+                ],
+                vec![
+                    "DM".into(),
+                    "T".into(),
+                    "gen_c".into(),
+                    "".into(),
+                    "virtual".into(),
+                    "ID + 1".into(),
+                    "".into(),
+                ],
+                vec![
+                    "DM".into(),
+                    "T".into(),
+                    "def_c".into(),
+                    "".into(),
+                    "".into(),
+                    "".into(),
+                    "42".into(),
+                ],
+            ],
+        )
+        .unwrap();
+        let meta = &objects
+            .get(&("DM".into(), "T".into()))
+            .unwrap()
+            .metadata
+            .columns;
+        assert_eq!(meta["id"].identity.as_deref(), Some("by_default"));
+        assert!(meta["id"].default.is_none());
+        assert_eq!(
+            meta["gen_c"]
+                .generated
+                .as_ref()
+                .map(|e| e.source_text.as_str()),
+            Some("ID + 1")
+        );
+        assert!(meta["gen_c"].default.is_none());
+        assert_eq!(
+            meta["def_c"]
+                .default
+                .as_ref()
+                .map(|e| e.source_text.as_str()),
+            Some("'seed'")
+        );
+
+        let err = apply_odbc_column_details(
+            DataSourceKind::Dameng,
+            &mut objects,
+            &[vec![
+                "DM".into(),
+                "T".into(),
+                "id".into(),
+                "unexpected".into(),
+                "".into(),
+                "".into(),
+                "".into(),
+            ]],
+        )
+        .unwrap_err();
+        assert_eq!(err.sqlstate, "55000");
     }
 }

@@ -88,11 +88,13 @@ impl DemandRepairQueue {
         Ok(EnqueueStatus::Queued)
     }
 
+    #[cfg(test)]
     pub(super) fn pop_next(&self) -> Option<RepairTarget> {
         let mut s = self.state.lock().unwrap();
         s.high.pop_front().or_else(|| s.normal.pop_front())
     }
 
+    #[cfg(test)]
     pub(super) fn complete(&self, target: &RepairTarget) {
         let mut s = self.state.lock().unwrap();
         if s.queued_or_active.remove(target) {

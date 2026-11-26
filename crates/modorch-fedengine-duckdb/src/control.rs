@@ -55,7 +55,7 @@ pub(super) fn load_extension(
             d.pool_max_connections
         ),
         "mysql" => format!(
-            "SET mysql_pool_size={}; SET mysql_pool_acquire_mode='wait'; SET mysql_pool_wait_timeout_millis={}",
+            "SET mysql_time_as_time=true; SET mysql_pool_size={}; SET mysql_pool_acquire_mode='wait'; SET mysql_pool_wait_timeout_millis={}",
             d.pool_max_connections, d.pool_wait_timeout_ms
         ),
         "oracle" => format!(

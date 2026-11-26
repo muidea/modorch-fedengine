@@ -984,19 +984,34 @@ fn ddl_v6_constraints_conditional_and_ctas_across_dialects() {
             &my,
             "app",
             "app",
-            "flag BOOLEAN, at_t TIME, raw_b BYTEA, uid UUID",
+            "flag BOOLEAN, at_t TIME, ts TIMESTAMPTZ, raw_b BYTEA",
         ),
         (
             &mdb,
             "app",
             "app",
-            "flag BOOLEAN, at_t TIME, raw_b BYTEA, uid UUID",
+            "flag BOOLEAN, at_t TIME, ts TIMESTAMPTZ, raw_b BYTEA",
         ),
-        (&ora, "ORCL", "HR", "raw_b BYTEA, ts TIMESTAMPTZ, uid UUID"),
+        (&ora, "ORCL", "HR", "raw_b BYTEA, ts TIMESTAMPTZ"),
         (&mssql, "master", "dbo", "ts TIMESTAMPTZ, uid UUID"),
-        (&dm, "DAMENG", "DM", "ts TIMESTAMPTZ, uid UUID"),
-        (&db2, "TESTDB", "DB2INST1", "uid UUID, raw_b BYTEA"),
-        (&hana, "HDB", "APP", "uid UUID, raw_b BYTEA"),
+        (
+            &dm,
+            "DAMENG",
+            "DM",
+            "flag BOOLEAN, at_t TIME, ts TIMESTAMPTZ, raw_b BYTEA",
+        ),
+        (
+            &db2,
+            "TESTDB",
+            "DB2INST1",
+            "flag BOOLEAN, at_t TIME(0), raw_b BYTEA",
+        ),
+        (
+            &hana,
+            "HDB",
+            "APP",
+            "flag BOOLEAN, at_t TIME(0), raw_b BYTEA",
+        ),
     ] {
         let stmt = format!(
             "CREATE TABLE {}.\"{schema}\".t ({col_def})",
@@ -1013,10 +1028,20 @@ fn ddl_v6_constraints_conditional_and_ctas_across_dialects() {
         assert_eq!(plan.contract_version, 5, "{stmt}");
     }
     for (src, db, schema, col_def) in [
+        (&my, "app", "app", "uid UUID"),
+        (&mdb, "app", "app", "uid UUID"),
+        (&ora, "ORCL", "HR", "flag BOOLEAN"),
+        (&ora, "ORCL", "HR", "uid UUID"),
         (&ora, "ORCL", "HR", "at_t TIME"),
-        (&my, "app", "app", "ts TIMESTAMPTZ"),
+        (&dm, "DAMENG", "DM", "uid UUID"),
+        (&db2, "TESTDB", "DB2INST1", "uid UUID"),
         (&db2, "TESTDB", "DB2INST1", "ts TIMESTAMPTZ"),
+        (&db2, "TESTDB", "DB2INST1", "at_t TIME"),
+        (&db2, "TESTDB", "DB2INST1", "at_t TIME(3)"),
+        (&hana, "HDB", "APP", "uid UUID"),
         (&hana, "HDB", "APP", "ts TIMESTAMPTZ"),
+        (&hana, "HDB", "APP", "at_t TIME"),
+        (&hana, "HDB", "APP", "at_t TIME(6)"),
     ] {
         let stmt = format!(
             "CREATE TABLE {}.\"{schema}\".t ({col_def})",
@@ -1327,4 +1352,404 @@ fn guarded_mutation_param_reuse_reorder_and_all_dialect_returning() {
         .unwrap_err();
         assert_eq!(err.sqlstate, "0A000");
     }
+}
+
+#[test]
+fn fqe_9_00_ddl_precision_gates_widening_and_dml_casts() {
+    let pg = test_source("pg", DataSourceKind::Postgres, "pg_s", "public");
+    let gp = test_source("gp", DataSourceKind::Greenplum, "gp_s", "public");
+    let kb = test_source("kb", DataSourceKind::Kingbasees, "kb_s", "public");
+    let my = test_source("my", DataSourceKind::Mysql, "my_s", "app");
+    let mdb = test_source("mdb", DataSourceKind::Mariadb, "mdb_s", "app");
+    let ora = test_source("ora", DataSourceKind::Oracle, "ora_s", "HR");
+    let mssql = test_source("ms", DataSourceKind::Sqlserver, "ms_s", "dbo");
+    let dm = test_source("dm", DataSourceKind::Dameng, "dm_s", "DM");
+    let db2 = test_source("db2", DataSourceKind::Db2, "db2_s", "DB2INST1");
+    let hana = test_source("hana", DataSourceKind::Hana, "hana_s", "APP");
+
+    let a = Analyzer {
+        namespace: None,
+        sources: vec![
+            pg.clone(),
+            gp.clone(),
+            kb.clone(),
+            my.clone(),
+            mdb.clone(),
+            ora.clone(),
+            mssql.clone(),
+            dm.clone(),
+            db2.clone(),
+            hana.clone(),
+        ],
+        indexes: vec![],
+    };
+
+    // Omitted temporal precision defaults to 6 for TIME, TIMESTAMP, TIMESTAMPTZ
+    let temporal = a
+        .analyze("CREATE TABLE pg_s.public.t (a TIME, b TIMESTAMP, c TIMESTAMPTZ, d TIME(0))")
+        .unwrap();
+    let plan = temporal
+        .ddl_intent
+        .unwrap()
+        .into_guarded_plan(&pg, "db".into(), "public".into(), String::new())
+        .unwrap()
+        .unwrap();
+    assert_eq!(plan.columns[0].precision, 6);
+    assert_eq!(plan.columns[1].precision, 6);
+    assert_eq!(plan.columns[2].precision, 6);
+    assert_eq!(plan.columns[3].precision, 0);
+
+    // Invalid VARCHAR(0) and temporal precision > 6 rejected early
+    assert!(
+        a.analyze("CREATE TABLE pg_s.public.t (s VARCHAR(0))")
+            .is_err()
+    );
+    assert!(
+        a.analyze("CREATE TABLE pg_s.public.t (t TIMESTAMP(7))")
+            .is_err()
+    );
+
+    // NULL / NOT NULL / PRIMARY KEY / DEFAULT NULL contradictions rejected
+    for bad_ddl in [
+        "CREATE TABLE pg_s.public.t (id BIGINT NOT NULL DEFAULT NULL)",
+        "CREATE TABLE pg_s.public.t (id BIGINT PRIMARY KEY DEFAULT NULL)",
+        "CREATE TABLE pg_s.public.t (id BIGINT NULL PRIMARY KEY)",
+        "CREATE TABLE pg_s.public.t (id BIGINT DEFAULT NULL, PRIMARY KEY (id))",
+        "ALTER TABLE pg_s.public.t ADD COLUMN id BIGINT NOT NULL DEFAULT NULL",
+    ] {
+        assert!(a.analyze(bad_ddl).is_err(), "expected error: {bad_ddl}");
+    }
+
+    // Greenplum foreign key rejected; DB2 column ops & Oracle/Dameng/DB2/HANA TRUNCATE RESTART rejected
+    for (src, db, schema, sql) in [
+        (
+            &gp,
+            "db",
+            "public",
+            "ALTER TABLE gp_s.public.orders ADD CONSTRAINT fk_p FOREIGN KEY (parent_id) REFERENCES gp_s.public.parents(id)",
+        ),
+        (
+            &db2,
+            "TESTDB",
+            "DB2INST1",
+            "ALTER TABLE db2_s.\"DB2INST1\".orders DROP COLUMN note",
+        ),
+        (
+            &db2,
+            "TESTDB",
+            "DB2INST1",
+            "ALTER TABLE db2_s.\"DB2INST1\".orders ALTER COLUMN qty SET NOT NULL",
+        ),
+        (
+            &db2,
+            "TESTDB",
+            "DB2INST1",
+            "ALTER TABLE db2_s.\"DB2INST1\".orders ALTER COLUMN qty DROP NOT NULL",
+        ),
+        (
+            &ora,
+            "ORCL",
+            "HR",
+            "CREATE TABLE ora_s.\"HR\".bad (s VARCHAR(10) DEFAULT '')",
+        ),
+        (
+            &ora,
+            "ORCL",
+            "HR",
+            "CREATE TABLE ora_s.\"HR\".bad (b INTEGER DEFAULT true)",
+        ),
+        (
+            &ora,
+            "ORCL",
+            "HR",
+            "ALTER TABLE ora_s.\"HR\".bad ALTER COLUMN s SET DEFAULT ''",
+        ),
+        (
+            &ora,
+            "ORCL",
+            "HR",
+            "ALTER TABLE ora_s.\"HR\".bad ALTER COLUMN b SET DEFAULT false",
+        ),
+        (
+            &ora,
+            "ORCL",
+            "HR",
+            "TRUNCATE TABLE ora_s.\"HR\".orders RESTART IDENTITY",
+        ),
+        (
+            &dm,
+            "DAMENG",
+            "DM",
+            "TRUNCATE TABLE dm_s.\"DM\".orders RESTART IDENTITY",
+        ),
+        (
+            &db2,
+            "TESTDB",
+            "DB2INST1",
+            "TRUNCATE TABLE db2_s.\"DB2INST1\".orders RESTART IDENTITY",
+        ),
+        (
+            &hana,
+            "HDB",
+            "APP",
+            "TRUNCATE TABLE hana_s.\"APP\".orders RESTART IDENTITY",
+        ),
+    ] {
+        let analyzed = a.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+        let err = analyzed
+            .ddl_intent
+            .unwrap()
+            .into_guarded_plan(src, db.into(), schema.into(), String::new())
+            .unwrap_err();
+        assert_eq!(err.sqlstate, "0A000", "{sql}");
+    }
+
+    // REINDEX allowed on Oracle, SQL Server, Dameng per ddl-capability-matrix.md
+    let mut reindex_analyzer = a.clone();
+    for (src, schema, tbl, idx) in [
+        (&ora, "HR", "orders", "ora_orders_idx"),
+        (&mssql, "dbo", "orders", "ms_orders_idx"),
+        (&dm, "DM", "orders", "dm_orders_idx"),
+    ] {
+        reindex_analyzer.indexes.push(IndexOwner {
+            index: ObjectRef {
+                source: src.id.clone(),
+                catalog: src.catalog_alias.clone(),
+                schema: schema.into(),
+                name: idx.into(),
+            },
+            table: ObjectRef {
+                source: src.id.clone(),
+                catalog: src.catalog_alias.clone(),
+                schema: schema.into(),
+                name: tbl.into(),
+            },
+            protected: false,
+        });
+    }
+    for (src, db, schema, sql) in [
+        (
+            &ora,
+            "ORCL",
+            "HR",
+            "REINDEX INDEX ora_s.\"HR\".ora_orders_idx",
+        ),
+        (
+            &mssql,
+            "master",
+            "dbo",
+            "REINDEX INDEX ms_s.dbo.ms_orders_idx",
+        ),
+        (
+            &dm,
+            "DAMENG",
+            "DM",
+            "REINDEX INDEX dm_s.\"DM\".dm_orders_idx",
+        ),
+    ] {
+        let analyzed = reindex_analyzer
+            .analyze(sql)
+            .unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+        let plan = analyzed
+            .ddl_intent
+            .unwrap()
+            .into_guarded_plan(src, db.into(), schema.into(), "orders".into())
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.action, "reindex");
+    }
+
+    // Lossless ALTER COLUMN TYPE widening rules
+    let col = |ty: &str, length: i32, precision: i32, scale: i32| {
+        modorch_fedengine_contract::DdlColumnSpec {
+            name: "c".into(),
+            type_name: ty.into(),
+            length,
+            precision,
+            scale,
+            not_null: false,
+            primary_key: false,
+            unique: false,
+            default_kind: None,
+            default_value: None,
+        }
+    };
+    assert!(is_lossless_type_widening(
+        DataSourceKind::Postgres,
+        &col("smallint", 0, 0, 0),
+        &col("integer", 0, 0, 0)
+    ));
+    assert!(is_lossless_type_widening(
+        DataSourceKind::Postgres,
+        &col("varchar", 16, 0, 0),
+        &col("text", 0, 0, 0)
+    ));
+    assert!(!is_lossless_type_widening(
+        DataSourceKind::Mysql,
+        &col("varchar", 16, 0, 0),
+        &col("text", 0, 0, 0)
+    ));
+    assert!(!is_lossless_type_widening(
+        DataSourceKind::Postgres,
+        &col("integer", 0, 0, 0),
+        &col("smallint", 0, 0, 0)
+    ));
+    assert!(is_lossless_type_widening(
+        DataSourceKind::Db2,
+        &col("varchar", 16, 0, 0),
+        &col("varchar", 64, 0, 0)
+    ));
+    assert!(!is_lossless_type_widening(
+        DataSourceKind::Db2,
+        &col("integer", 0, 0, 0),
+        &col("bigint", 0, 0, 0)
+    ));
+    assert!(!is_lossless_type_widening(
+        DataSourceKind::Hana,
+        &col("timestamp", 0, 0, 0),
+        &col("timestamp", 0, 6, 0)
+    ));
+    assert!(is_lossless_type_widening(
+        DataSourceKind::Postgres,
+        &col("timestamp", 0, 0, 0),
+        &col("timestamp", 0, 6, 0)
+    ));
+    // Target widening gate in into_guarded_plan
+    assert!(
+        a.analyze("ALTER TABLE db2_s.\"DB2INST1\".t ALTER COLUMN c TYPE BIGINT")
+            .unwrap()
+            .ddl_intent
+            .unwrap()
+            .into_guarded_plan(&db2, "TESTDB".into(), "DB2INST1".into(), String::new())
+            .is_err()
+    );
+    assert!(
+        a.analyze("ALTER TABLE hana_s.\"APP\".t ALTER COLUMN c TYPE TIMESTAMP(6)")
+            .unwrap()
+            .ddl_intent
+            .unwrap()
+            .into_guarded_plan(&hana, "HDB".into(), "APP".into(), String::new())
+            .is_err()
+    );
+
+    // Oracle DML scalar cast translation keeping TO_DATE/TO_TIMESTAMP/TO_TIMESTAMP_TZ
+    let ora_ins = a
+        .analyze(
+            "INSERT INTO ora_s.\"HR\".events (id, cnt, f4, f8, dt, ts, tstz, lit) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 42::INTEGER)",
+        )
+        .unwrap();
+    let (compact_ora, _) = compact_parameters(&ora_ins.sql).unwrap();
+    let ora_mp = build_guarded_mutation_plan(
+        &compact_ora,
+        &ora,
+        ora_ins.primary.as_ref().unwrap(),
+        None,
+        &[
+            PgType::Int8,
+            PgType::Int4,
+            PgType::Float4,
+            PgType::Float8,
+            PgType::Date,
+            PgType::Timestamp,
+            PgType::Timestamptz,
+        ],
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        ora_mp.native_sql.contains("CAST(? AS NUMBER(19,0))"),
+        "{}",
+        ora_mp.native_sql
+    );
+    assert!(
+        ora_mp.native_sql.contains("CAST(? AS NUMBER(10,0))"),
+        "{}",
+        ora_mp.native_sql
+    );
+    assert!(
+        ora_mp.native_sql.contains("CAST(? AS BINARY_FLOAT)"),
+        "{}",
+        ora_mp.native_sql
+    );
+    assert!(
+        ora_mp.native_sql.contains("CAST(? AS BINARY_DOUBLE)"),
+        "{}",
+        ora_mp.native_sql
+    );
+    assert!(
+        ora_mp.native_sql.contains("TO_DATE(?, 'YYYY-MM-DD')"),
+        "{}",
+        ora_mp.native_sql
+    );
+    assert!(
+        ora_mp
+            .native_sql
+            .contains("TO_TIMESTAMP(?, 'YYYY-MM-DD HH24:MI:SS.FF6')"),
+        "{}",
+        ora_mp.native_sql
+    );
+    assert!(
+        ora_mp
+            .native_sql
+            .contains("TO_TIMESTAMP_TZ(?, 'YYYY-MM-DD HH24:MI:SS.FF6TZH:TZM')"),
+        "{}",
+        ora_mp.native_sql
+    );
+    assert!(
+        ora_mp.native_sql.contains("CAST(42 AS NUMBER(10,0))"),
+        "{}",
+        ora_mp.native_sql
+    );
+
+    // MySQL TIME parameter wrapper
+    let my_time = a
+        .analyze("INSERT INTO my_s.app.events (at_t) VALUES ($1)")
+        .unwrap();
+    let my_mp = build_guarded_mutation_plan(
+        &compact_parameters(&my_time.sql).unwrap().0,
+        &my,
+        my_time.primary.as_ref().unwrap(),
+        None,
+        &[PgType::Time],
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        my_mp
+            .native_sql
+            .contains("CAST(CAST(? AS CHAR) AS TIME(6))"),
+        "{}",
+        my_mp.native_sql
+    );
+
+    // KingbaseES pg_catalog.date casts and empty/non-ASCII text literal collection
+    let kb_ins = a
+        .analyze(
+            "INSERT INTO kb_s.public.events (dt, note, raw_dt) VALUES ($1, '', '2026-01-01'::DATE)",
+        )
+        .unwrap();
+    let kb_mp = build_guarded_mutation_plan(
+        &compact_parameters(&kb_ins.sql).unwrap().0,
+        &kb,
+        kb_ins.primary.as_ref().unwrap(),
+        None,
+        &[PgType::Date],
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        kb_mp.native_sql.contains("CAST($1 AS pg_catalog.date)"),
+        "{}",
+        kb_mp.native_sql
+    );
+    assert!(
+        kb_mp.native_sql.contains("pg_catalog.date"),
+        "{}",
+        kb_mp.native_sql
+    );
+    assert!(kb_mp.text_literals.contains(&String::new()));
+    assert!(validate_kingbase_text_literals("INSERT INTO t VALUES ('ok')", true, true).is_ok());
+    assert!(validate_kingbase_text_literals("INSERT INTO t VALUES ('')", false, true).is_err());
+    assert!(validate_kingbase_text_literals("INSERT INTO t VALUES ('中文')", true, false).is_err());
 }

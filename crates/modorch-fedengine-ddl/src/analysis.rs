@@ -5,7 +5,7 @@ use crate::{
 use modorch_fedengine_core::*;
 use sqlparser::{
     ast::*,
-    dialect::DuckDbDialect,
+    dialect::{DuckDbDialect, PostgreSqlDialect},
     parser::Parser,
     tokenizer::{Token, Tokenizer},
 };
@@ -47,8 +47,17 @@ impl Analyzer {
         if sql.len() > 1024 * 1024 {
             return Err(EngineError::new("54000", "SQL exceeds 1 MiB limit"));
         }
-        Parser::parse_sql(&DuckDbDialect {}, sql)
-            .map_err(|_| EngineError::new("42601", "SQL syntax is outside the supported grammar"))
+        Parser::parse_sql(&DuckDbDialect {}, sql).or_else(|_| {
+            if let Ok(stmts) = Parser::parse_sql(&PostgreSqlDialect {}, sql)
+                && matches!(stmts.as_slice(), [Statement::Truncate(_)])
+            {
+                return Ok(stmts);
+            }
+            Err(EngineError::new(
+                "42601",
+                "SQL syntax is outside the supported grammar",
+            ))
+        })
     }
     pub fn split(sql: &str) -> Result<Vec<String>> {
         if sql.len() > 1024 * 1024 {

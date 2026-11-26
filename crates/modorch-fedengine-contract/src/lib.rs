@@ -316,6 +316,7 @@ pub struct GuardedMutationPlan {
     pub native_sql: String,
     pub returning: Option<ReturningPlan>,
     pub param_map: Vec<usize>,
+    pub text_literals: Vec<String>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DdlColumnSpec {

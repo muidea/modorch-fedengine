@@ -123,6 +123,7 @@ pub(super) fn returning_oid_to_pg_type(oid: i64, mysql: bool) -> Result<PgType> 
         20 => Ok(PgType::Int8),
         21 => Ok(PgType::Int2),
         23 => Ok(PgType::Int4),
+        1700 if !mysql => Ok(PgType::Numeric),
         2950 if !mysql => Ok(PgType::Uuid),
         _ => Err(EngineError::unsupported(
             "returned identifier column type is unsupported",
@@ -162,12 +163,39 @@ pub(super) fn parse_returning_descriptor(
                     "smallint" | "int2" => Some(21),
                     "int" | "integer" | "int4" => Some(23),
                     "bigint" | "int8" => Some(20),
+                    "number" | "numeric" | "decimal" => Some(1700),
                     "uniqueidentifier" | "uuid" => Some(2950),
                     _ => None,
                 })
         })
         .ok_or_else(|| EngineError::unsupported("returned column OID is unavailable"))?;
     let pg = returning_oid_to_pg_type(oid, mysql)?;
+    if pg == PgType::Numeric {
+        let typmod = col
+            .get("pg_type")
+            .and_then(|t| t.get("typmod"))
+            .and_then(|v| v.as_i64())
+            .or_else(|| col.get("type_modifier").and_then(|v| v.as_i64()));
+        if let Some(tm) = typmod
+            && tm != 0
+        {
+            let raw = tm - 4;
+            let prec = raw >> 16;
+            let scale = raw & 0xffff;
+            if raw < 0 || scale != 0 || !(1..=18).contains(&prec) {
+                return Err(EngineError::unsupported(
+                    "returned identifier column type is unsupported",
+                ));
+            }
+        } else if let Some(prec) = col.get("precision").and_then(|v| v.as_i64()) {
+            let scale = col.get("scale").and_then(|v| v.as_i64()).unwrap_or(0);
+            if scale != 0 || !(1..=18).contains(&prec) {
+                return Err(EngineError::unsupported(
+                    "returned identifier column type is unsupported",
+                ));
+            }
+        }
+    }
     Ok((col_name.to_string(), oid, pg))
 }
 
@@ -219,6 +247,20 @@ pub(super) fn decode_returning_rows(
                         Cell::I64(s.parse::<i64>().map_err(|_| {
                             EngineError::new("22P02", "invalid returned bigint value")
                         })?)
+                    }
+                    PgType::Numeric => {
+                        let digits = s.strip_prefix(['+', '-']).unwrap_or(s);
+                        if s.contains('.')
+                            || digits.is_empty()
+                            || digits.len() > 38
+                            || !digits.bytes().all(|b| b.is_ascii_digit())
+                        {
+                            return Err(EngineError::new(
+                                "22P02",
+                                "invalid returned numeric value",
+                            ));
+                        }
+                        Cell::Numeric(modorch_fedengine_pg_compat::normalize_numeric_text(s)?)
                     }
                     PgType::Uuid => Cell::Uuid(
                         uuid::Uuid::parse_str(s)
@@ -327,17 +369,24 @@ fn cell_as_guarded_param(
     {
         return Ok(duckdb::types::Value::Blob(b.clone()));
     }
-    if let (Cell::Timestamp(v), PgType::Timestamptz) = (value, ty)
-        && matches!(
+    if let (Cell::Timestamp(v), PgType::Timestamptz) = (value, ty) {
+        if matches!(
             kind,
             DataSourceKind::Oracle | DataSourceKind::Sqlserver | DataSourceKind::Dameng
-        )
-    {
-        let dt = chrono::DateTime::from_timestamp_micros(*v)
-            .ok_or_else(|| EngineError::new("22007", "invalid timestamptz value"))?;
-        return Ok(duckdb::types::Value::Text(
-            dt.format("%Y-%m-%d %H:%M:%S%.6f+00:00").to_string(),
-        ));
+        ) {
+            let dt = chrono::DateTime::from_timestamp_micros(*v)
+                .ok_or_else(|| EngineError::new("22007", "invalid timestamptz value"))?;
+            return Ok(duckdb::types::Value::Text(
+                dt.format("%Y-%m-%d %H:%M:%S%.6f+00:00").to_string(),
+            ));
+        }
+        if matches!(kind, DataSourceKind::Mysql | DataSourceKind::Mariadb) {
+            let dt = chrono::DateTime::from_timestamp_micros(*v)
+                .ok_or_else(|| EngineError::new("22007", "invalid timestamptz value"))?;
+            return Ok(duckdb::types::Value::Text(
+                dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string(),
+            ));
+        }
     }
     if kind == DataSourceKind::Oracle {
         return Ok(match value {
@@ -376,6 +425,82 @@ fn cell_as_guarded_param(
         },
         _ => to_duckdb(value),
     })
+}
+
+fn check_kingbase_descriptor_and_params<'a>(
+    descriptor_json: &str,
+    text_literals: &[String],
+    params: impl IntoIterator<Item = (&'a Cell, PgType)>,
+) -> Result<()> {
+    let doc: serde_json::Value = serde_json::from_str(descriptor_json)
+        .map_err(|_| EngineError::new("XX000", "guarded metadata descriptor is invalid JSON"))?;
+    let Some(raw_facts) = doc.get("product_facts") else {
+        return Ok(());
+    };
+    let facts: serde_json::Value = match raw_facts {
+        serde_json::Value::String(s) => {
+            if s.is_empty() {
+                return Ok(());
+            }
+            serde_json::from_str(s).map_err(|_| {
+                EngineError::new("0A000", "invalid KingbaseES product_facts metadata")
+            })?
+        }
+        other @ serde_json::Value::Object(_) => other.clone(),
+        serde_json::Value::Null => return Ok(()),
+        _ => {
+            return Err(EngineError::new(
+                "0A000",
+                "invalid KingbaseES product_facts metadata",
+            ));
+        }
+    };
+    let encoding = facts.get("encoding").and_then(|v| v.as_str()).unwrap_or("");
+    let mode = facts.get("mode").and_then(|v| v.as_str()).unwrap_or("");
+    let empty_str_is_null = facts
+        .get("empty_str_is_null")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if (!encoding.is_empty() && encoding != "UTF8" && encoding != "SQL_ASCII")
+        || (!mode.is_empty() && mode != "oracle" && mode != "pg")
+        || (!empty_str_is_null.is_empty()
+            && empty_str_is_null != "on"
+            && empty_str_is_null != "off")
+    {
+        return Err(EngineError::new(
+            "0A000",
+            "uncertified KingbaseES encoding or mode metadata",
+        ));
+    }
+    let ascii_only_text = encoding == "SQL_ASCII";
+    let reject_empty_text = mode == "oracle" || empty_str_is_null == "on";
+    if !ascii_only_text && !reject_empty_text {
+        return Ok(());
+    }
+    let check_text = |s: &str| -> Result<()> {
+        if reject_empty_text && s.is_empty() {
+            return Err(EngineError::unsupported(
+                "empty string is not certified in Oracle-compatible SQL mode",
+            ));
+        }
+        if ascii_only_text && !s.is_ascii() {
+            return Err(EngineError::unsupported(
+                "non-ASCII text is not certified under SQL_ASCII encoding",
+            ));
+        }
+        Ok(())
+    };
+    for lit in text_literals {
+        check_text(lit)?;
+    }
+    for (cell, ty) in params {
+        if ty == PgType::Text
+            && let Cell::Text(s) = cell
+        {
+            check_text(s)?;
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn execute(
@@ -496,14 +621,22 @@ pub(super) fn execute(
     args.push(duckdb::types::Value::Text(plan.catalog.clone()));
     args.push(duckdb::types::Value::Text(plan.schema.clone()));
     args.push(duckdb::types::Value::Text(plan.table.clone()));
-    args.push(duckdb::types::Value::Text(descriptor));
+    args.push(duckdb::types::Value::Text(descriptor.clone()));
     args.push(duckdb::types::Value::Text(version));
     args.push(duckdb::types::Value::Text(plan.native_sql.clone()));
     if plan.param_map.is_empty() {
+        if plan.kind == DataSourceKind::Kingbasees {
+            check_kingbase_descriptor_and_params(
+                &descriptor,
+                &plan.text_literals,
+                r.parameters.iter().zip(param_types.iter().copied()),
+            )?;
+        }
         for (p, ty) in r.parameters.iter().zip(param_types.iter()) {
             args.push(cell_as_guarded_param(p, *ty, plan.kind)?);
         }
     } else {
+        let mut mapped = Vec::with_capacity(plan.param_map.len());
         for &idx in &plan.param_map {
             let p = r.parameters.get(idx).ok_or_else(|| {
                 EngineError::new("XX000", "guarded mutation parameter value out of bounds")
@@ -511,7 +644,17 @@ pub(super) fn execute(
             let ty = param_types.get(idx).ok_or_else(|| {
                 EngineError::new("XX000", "guarded mutation parameter type out of bounds")
             })?;
-            args.push(cell_as_guarded_param(p, *ty, plan.kind)?);
+            mapped.push((p, *ty));
+        }
+        if plan.kind == DataSourceKind::Kingbasees {
+            check_kingbase_descriptor_and_params(
+                &descriptor,
+                &plan.text_literals,
+                mapped.iter().copied(),
+            )?;
+        }
+        for (p, ty) in mapped {
+            args.push(cell_as_guarded_param(p, ty, plan.kind)?);
         }
     }
     if let Some((_, oid, _)) = &returning_info {
@@ -881,6 +1024,95 @@ mod tests {
                 "p1 := CAST(? AS VARCHAR), p2 := CAST(? AS BIGINT), p3 := CAST(? AS BIGINT)"
             ),
             "{reordered_sql}"
+        );
+
+        // P0-2: Oracle NUMBER(p,0) RETURNING (1 <= p <= 18, scale 0)
+        assert_eq!(
+            returning_oid_to_pg_type(1700, false).unwrap(),
+            PgType::Numeric
+        );
+        assert!(returning_oid_to_pg_type(1700, true).is_err());
+
+        let valid_typmod = (10i64 << 16) + 4;
+        let desc_ok = format!(
+            r#"{{"columns":[{{"name":"id","data_type":"NUMBER","pg_type":{{"oid":1700,"typmod":{valid_typmod}}}}}]}}"#
+        );
+        assert_eq!(
+            parse_returning_descriptor(&desc_ok, "id", false).unwrap(),
+            ("id".into(), 1700, PgType::Numeric)
+        );
+        let desc_prec_ok =
+            r#"{"columns":[{"name":"id","data_type":"NUMBER","precision":18,"scale":0}]}"#;
+        assert_eq!(
+            parse_returning_descriptor(desc_prec_ok, "id", false).unwrap(),
+            ("id".into(), 1700, PgType::Numeric)
+        );
+        for bad_desc in [
+            r#"{"columns":[{"name":"id","data_type":"NUMBER","precision":19,"scale":0}]}"#
+                .to_string(),
+            r#"{"columns":[{"name":"id","data_type":"NUMBER","precision":10,"scale":2}]}"#
+                .to_string(),
+            format!(
+                r#"{{"columns":[{{"name":"id","pg_type":{{"oid":1700,"typmod":{}}}}}]}}"#,
+                (19i64 << 16) + 4
+            ),
+        ] {
+            assert!(
+                parse_returning_descriptor(&bad_desc, "id", false).is_err(),
+                "{bad_desc}"
+            );
+        }
+        let decoded =
+            decode_returning_rows(r#"[["9007199254740993"]]"#, PgType::Numeric, 1).unwrap();
+        assert!(matches!(
+            decoded.as_slice(),
+            [row] if matches!(row.as_slice(), [Cell::Numeric(s)] if s == "9007199254740993")
+        ));
+        assert!(decode_returning_rows(r#"[["12.34"]]"#, PgType::Numeric, 1).is_err());
+        let too_long = format!(r#"[["{}"]]"#, "9".repeat(39));
+        assert!(decode_returning_rows(&too_long, PgType::Numeric, 1).is_err());
+
+        // P0-3: MySQL/MariaDB TIMESTAMPTZ wall-time formatting without +00
+        for kind in [DataSourceKind::Mysql, DataSourceKind::Mariadb] {
+            assert_eq!(
+                cell_as_guarded_param(&Cell::Timestamp(0), PgType::Timestamptz, kind).unwrap(),
+                duckdb::types::Value::Text("1970-01-01 00:00:00.000000".into())
+            );
+        }
+
+        // P0-3: KingbaseES SQL_ASCII and empty_str_is_null/oracle mode checks
+        let kb_ascii_oracle = r#"{"product_facts":{"encoding":"SQL_ASCII","mode":"oracle","empty_str_is_null":"on"}}"#;
+        assert!(
+            check_kingbase_descriptor_and_params(
+                kb_ascii_oracle,
+                &["ok".into()],
+                [(&Cell::Text("ascii".into()), PgType::Text)],
+            )
+            .is_ok()
+        );
+        assert!(
+            check_kingbase_descriptor_and_params(
+                kb_ascii_oracle,
+                &["".into()],
+                std::iter::empty(),
+            )
+            .is_err()
+        );
+        assert!(
+            check_kingbase_descriptor_and_params(
+                kb_ascii_oracle,
+                &[],
+                [(&Cell::Text("".into()), PgType::Text)],
+            )
+            .is_err()
+        );
+        assert!(
+            check_kingbase_descriptor_and_params(
+                kb_ascii_oracle,
+                &["中文".into()],
+                std::iter::empty(),
+            )
+            .is_err()
         );
     }
 }

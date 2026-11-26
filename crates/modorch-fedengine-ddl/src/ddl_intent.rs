@@ -53,10 +53,28 @@ fn column_spec(
     let Some(mut spec) = column_spec_from_type(ident_value(&col.name), &col.data_type)? else {
         return Ok(None);
     };
+    let mut seen_null = false;
+    let mut seen_not_null = false;
     for opt in &col.options {
         match &opt.option {
-            ColumnOption::NotNull => spec.not_null = true,
-            ColumnOption::Null => spec.not_null = false,
+            ColumnOption::NotNull => {
+                if seen_null || seen_not_null {
+                    return Err(EngineError::unsupported(
+                        "conflicting or duplicate NULL/NOT NULL column option",
+                    ));
+                }
+                seen_not_null = true;
+                spec.not_null = true;
+            }
+            ColumnOption::Null => {
+                if seen_null || seen_not_null {
+                    return Err(EngineError::unsupported(
+                        "conflicting or duplicate NULL/NOT NULL column option",
+                    ));
+                }
+                seen_null = true;
+                spec.not_null = false;
+            }
             ColumnOption::Default(expr) => {
                 let (kind, val) = default_literal(expr)?;
                 spec.default_kind = Some(kind);
@@ -104,6 +122,16 @@ fn column_spec(
             _ => return Ok(None),
         }
     }
+    if seen_null && spec.primary_key {
+        return Err(EngineError::unsupported(
+            "PRIMARY KEY column cannot be explicitly NULL",
+        ));
+    }
+    if (spec.not_null || spec.primary_key) && spec.default_kind.as_deref() == Some("null") {
+        return Err(EngineError::unsupported(
+            "NOT NULL or PRIMARY KEY column cannot have DEFAULT NULL",
+        ));
+    }
     Ok(Some(spec))
 }
 
@@ -115,14 +143,19 @@ fn column_spec_from_type(name: String, data_type: &DataType) -> Result<Option<Dd
         }
         DataType::BigInt(_) | DataType::Int8(_) => default_col_spec(name, "bigint", 0, 0, 0),
         DataType::Varchar(len) | DataType::CharacterVarying(len) => match len {
-            Some(CharacterLength::IntegerLength { length, .. }) => default_col_spec(
-                name,
-                "varchar",
-                i32::try_from(*length)
-                    .map_err(|_| EngineError::unsupported("VARCHAR length out of range"))?,
-                0,
-                0,
-            ),
+            Some(CharacterLength::IntegerLength { length, .. }) => {
+                if *length == 0 {
+                    return Err(EngineError::unsupported("VARCHAR length must be positive"));
+                }
+                default_col_spec(
+                    name,
+                    "varchar",
+                    i32::try_from(*length)
+                        .map_err(|_| EngineError::unsupported("VARCHAR length out of range"))?,
+                    0,
+                    0,
+                )
+            }
             _ => default_col_spec(name, "text", 0, 0, 0),
         },
         DataType::Text => default_col_spec(name, "text", 0, 0, 0),
@@ -141,17 +174,39 @@ fn column_spec_from_type(name: String, data_type: &DataType) -> Result<Option<Dd
                         .map_err(|_| EngineError::unsupported("DECIMAL scale out of range"))?,
                 ),
             };
+            if precision < 1 || scale < 0 || scale > precision {
+                return Err(EngineError::unsupported(
+                    "invalid DECIMAL precision or scale",
+                ));
+            }
             default_col_spec(name, "numeric", 0, precision, scale)
         }
         DataType::Date => default_col_spec(name, "date", 0, 0, 0),
-        DataType::Time(p, _) => default_col_spec(name, "time", 0, p.unwrap_or(0) as i32, 0),
+        DataType::Time(p, tz) => {
+            if matches!(tz, TimezoneInfo::WithTimeZone | TimezoneInfo::Tz) {
+                return Ok(None);
+            }
+            let prec = p.unwrap_or(6);
+            if prec > 6 {
+                return Err(EngineError::unsupported(
+                    "TIME precision must be between 0 and 6",
+                ));
+            }
+            default_col_spec(name, "time", 0, prec as i32, 0)
+        }
         DataType::Timestamp(p, tz) => {
+            let prec = p.unwrap_or(6);
+            if prec > 6 {
+                return Err(EngineError::unsupported(
+                    "TIMESTAMP precision must be between 0 and 6",
+                ));
+            }
             let with_tz = matches!(tz, TimezoneInfo::WithTimeZone | TimezoneInfo::Tz);
             default_col_spec(
                 name,
                 if with_tz { "timestamptz" } else { "timestamp" },
                 0,
-                p.unwrap_or(0) as i32,
+                prec as i32,
                 0,
             )
         }
@@ -443,6 +498,19 @@ pub(crate) fn extract_ddl_intent(
             }
             for c in &t.constraints {
                 constraints.push(constraint_spec(c, &target.schema, false)?);
+            }
+            for c in &constraints {
+                if c.kind == "primary_key" {
+                    for key in &c.columns {
+                        if columns.iter().any(|col| {
+                            col.name == *key && col.default_kind.as_deref() == Some("null")
+                        }) {
+                            return Err(EngineError::unsupported(
+                                "PRIMARY KEY column cannot have DEFAULT NULL",
+                            ));
+                        }
+                    }
+                }
             }
             let mut intent = empty_intent("create_table", &target.name);
             intent.columns = columns;
@@ -741,12 +809,26 @@ pub(crate) fn build_guarded_plan(
                     "DDL action has no equivalent native MySQL contract",
                 ));
             }
-            if let Some(c) = &intent.constraint
-                && c.kind == "primary_key"
-                && c.name != "PRIMARY"
+            if intent
+                .constraint
+                .iter()
+                .chain(intent.constraints.iter())
+                .any(|c| c.kind == "primary_key" && !c.name.is_empty() && c.name != "PRIMARY")
             {
                 return Err(EngineError::unsupported(
                     "MySQL primary key constraint name must be PRIMARY",
+                ));
+            }
+        }
+        DataSourceKind::Greenplum => {
+            if intent.action == "add_constraint"
+                && intent
+                    .constraint
+                    .as_ref()
+                    .is_some_and(|c| c.kind == "foreign_key")
+            {
+                return Err(EngineError::unsupported(
+                    "Greenplum ADD CONSTRAINT FOREIGN KEY is not supported",
                 ));
             }
         }
@@ -756,15 +838,55 @@ pub(crate) fn build_guarded_plan(
                     "Oracle schema DDL requires user/tablespace management outside guarded DDL",
                 ));
             }
-        }
-        DataSourceKind::Db2 | DataSourceKind::Hana => {
-            if intent.action == "reindex" {
+            if intent.action == "truncate" && intent.identity_mode == "restart" {
                 return Err(EngineError::unsupported(
-                    "REINDEX is not enabled for this database dialect",
+                    "Oracle TRUNCATE RESTART IDENTITY is not supported",
+                ));
+            }
+            if intent.action == "set_default"
+                && ((intent.default_kind == "string" && intent.default_value.is_empty())
+                    || intent.default_kind == "boolean")
+            {
+                return Err(EngineError::unsupported(
+                    "Oracle DDL default literal is outside contract",
+                ));
+            }
+        }
+        DataSourceKind::Dameng => {
+            if intent.action == "truncate" && intent.identity_mode == "restart" {
+                return Err(EngineError::unsupported(
+                    "Dameng TRUNCATE RESTART IDENTITY is not supported",
+                ));
+            }
+        }
+        DataSourceKind::Db2 => {
+            if matches!(
+                intent.action.as_str(),
+                "reindex" | "drop_column" | "set_not_null" | "drop_not_null"
+            ) || (intent.action == "truncate" && intent.identity_mode == "restart")
+            {
+                return Err(EngineError::unsupported(
+                    "DDL action is not enabled for DB2 dialect",
+                ));
+            }
+        }
+        DataSourceKind::Hana => {
+            if intent.action == "reindex"
+                || (intent.action == "truncate" && intent.identity_mode == "restart")
+            {
+                return Err(EngineError::unsupported(
+                    "DDL action is not enabled for SAP HANA dialect",
                 ));
             }
         }
         _ => {}
+    }
+    if intent.action == "alter_column_type"
+        && (intent.columns.len() != 1 || !can_be_widening_target(source.kind, &intent.columns[0]))
+    {
+        return Err(EngineError::unsupported(
+            "ALTER COLUMN TYPE must be a lossless widening target for this dialect",
+        ));
     }
     for c in intent.constraint.iter().chain(intent.constraints.iter()) {
         if c.name.len() > max_ident
@@ -787,70 +909,22 @@ pub(crate) fn build_guarded_plan(
         if c.name.len() > max_ident {
             return Err(EngineError::unsupported("column name exceeds native limit"));
         }
-        if mysql
-            && (c.length > 16383
-                || c.type_name == "timestamptz"
-                || (c.type_name == "numeric" && c.scale > 30))
-        {
+        if !column_type_supported_for_kind(source.kind, c) {
             return Err(EngineError::unsupported(
-                "MySQL native DDL column type is outside contract",
+                "DDL column type is outside dialect contract",
             ));
         }
-        match source.kind {
-            DataSourceKind::Postgres | DataSourceKind::Greenplum | DataSourceKind::Kingbasees => {
-                if c.type_name == "numeric" && c.precision > 38 {
-                    return Err(EngineError::unsupported(
-                        "PostgreSQL DDL numeric precision exceeds 38",
-                    ));
-                }
-            }
-            DataSourceKind::Oracle => {
-                if c.type_name == "time"
-                    || c.length > 4000
-                    || (c.type_name == "numeric" && c.precision > 38)
-                {
-                    return Err(EngineError::unsupported(
-                        "Oracle native DDL column type is outside contract",
-                    ));
-                }
-            }
-            DataSourceKind::Sqlserver => {
-                if c.length > 4000 || (c.type_name == "numeric" && c.precision > 38) {
-                    return Err(EngineError::unsupported(
-                        "SQL Server native DDL column type is outside contract",
-                    ));
-                }
-            }
-            DataSourceKind::Dameng => {
-                if c.length > 8188 || (c.type_name == "numeric" && c.precision > 38) {
-                    return Err(EngineError::unsupported(
-                        "Dameng native DDL column type is outside contract",
-                    ));
-                }
-            }
-            DataSourceKind::Db2 => {
-                if c.type_name == "timestamptz"
-                    || c.length > 32672
-                    || (c.type_name == "numeric" && c.precision > 31)
-                {
-                    return Err(EngineError::unsupported(
-                        "DB2 native DDL column type is outside contract",
-                    ));
-                }
-            }
-            DataSourceKind::Hana => {
-                if c.type_name == "timestamptz"
-                    || c.length > 5000
-                    || (c.type_name == "numeric" && c.precision > 34)
-                {
-                    return Err(EngineError::unsupported(
-                        "SAP HANA native DDL column type is outside contract",
-                    ));
-                }
-            }
-            _ => {}
+        if source.kind == DataSourceKind::Oracle
+            && ((c.default_kind.as_deref() == Some("string")
+                && c.default_value.as_deref() == Some(""))
+                || c.default_kind.as_deref() == Some("boolean"))
+        {
+            return Err(EngineError::unsupported(
+                "Oracle DDL default literal is outside contract",
+            ));
         }
     }
+    let _ = mysql;
     Ok(Some(GuardedDdlPlan {
         source: source.id.clone(),
         kind: source.kind,
@@ -875,4 +949,112 @@ pub(crate) fn build_guarded_plan(
         query_sql: intent.query_sql,
         contract_version: version,
     }))
+}
+
+fn column_type_valid(t: &DdlColumnSpec) -> bool {
+    match t.type_name.as_str() {
+        "smallint" | "integer" | "bigint" | "text" | "real" | "double" | "boolean" | "date"
+        | "uuid" | "bytea" => t.length == 0 && t.precision == 0 && t.scale == 0,
+        "varchar" => t.length >= 1 && t.length <= 10_485_760 && t.precision == 0 && t.scale == 0,
+        "numeric" => t.length == 0 && t.precision >= 1 && t.scale >= 0 && t.scale <= t.precision,
+        "time" | "timestamp" | "timestamptz" => {
+            t.length == 0 && (0..=6).contains(&t.precision) && t.scale == 0
+        }
+        _ => false,
+    }
+}
+
+fn column_type_supported_for_kind(kind: DataSourceKind, t: &DdlColumnSpec) -> bool {
+    if !column_type_valid(t) {
+        return false;
+    }
+    match kind {
+        DataSourceKind::Postgres | DataSourceKind::Greenplum | DataSourceKind::Kingbasees => {
+            t.type_name != "numeric" || t.precision <= 38
+        }
+        DataSourceKind::Mysql | DataSourceKind::Mariadb => {
+            t.type_name != "uuid"
+                && (t.type_name != "varchar" || t.length <= 16383)
+                && (t.type_name != "numeric" || (t.precision <= 38 && t.scale <= 30))
+        }
+        DataSourceKind::Sqlserver => {
+            (t.type_name != "varchar" || t.length <= 4000)
+                && (t.type_name != "numeric" || t.precision <= 38)
+        }
+        DataSourceKind::Oracle => {
+            !matches!(t.type_name.as_str(), "boolean" | "uuid" | "time")
+                && (t.type_name != "varchar" || t.length <= 4000)
+                && (t.type_name != "numeric" || t.precision <= 38)
+        }
+        DataSourceKind::Dameng => {
+            t.type_name != "uuid"
+                && (t.type_name != "varchar" || t.length <= 8188)
+                && (t.type_name != "numeric" || t.precision <= 38)
+        }
+        DataSourceKind::Db2 => {
+            !matches!(t.type_name.as_str(), "uuid" | "timestamptz")
+                && (t.type_name != "time" || t.precision == 0)
+                && (t.type_name != "varchar" || t.length <= 32672)
+                && (t.type_name != "numeric" || t.precision <= 31)
+        }
+        DataSourceKind::Hana => {
+            !matches!(t.type_name.as_str(), "uuid" | "timestamptz")
+                && (t.type_name != "time" || t.precision == 0)
+                && (t.type_name != "varchar" || t.length <= 5000)
+                && (t.type_name != "numeric" || t.precision <= 34)
+        }
+        DataSourceKind::Starrocks => false,
+    }
+}
+
+/// Validates lossless `ALTER COLUMN TYPE` widening against source and target column types.
+pub fn is_lossless_type_widening(
+    kind: DataSourceKind,
+    current: &DdlColumnSpec,
+    target: &DdlColumnSpec,
+) -> bool {
+    if !column_type_valid(current) || !column_type_supported_for_kind(kind, target) {
+        return false;
+    }
+    if kind == DataSourceKind::Db2 {
+        return current.type_name == "varchar"
+            && target.type_name == "varchar"
+            && target.length > current.length
+            && target.length <= 32672;
+    }
+    match (current.type_name.as_str(), target.type_name.as_str()) {
+        ("smallint", "integer" | "bigint") => true,
+        ("integer", "bigint") => true,
+        ("real", "double") => true,
+        ("numeric", "numeric") => {
+            target.scale == current.scale && target.precision > current.precision
+        }
+        ("varchar", "varchar") => target.length > current.length,
+        ("varchar", "text") => kind.is_postgres_family(),
+        ("timestamp", "timestamp") | ("timestamptz", "timestamptz") | ("time", "time") => {
+            kind != DataSourceKind::Hana
+                && target.precision > current.precision
+                && target.precision <= 6
+        }
+        _ => false,
+    }
+}
+
+fn can_be_widening_target(kind: DataSourceKind, target: &DdlColumnSpec) -> bool {
+    if !column_type_supported_for_kind(kind, target) {
+        return false;
+    }
+    if kind == DataSourceKind::Db2 {
+        return target.type_name == "varchar" && target.length >= 2 && target.length <= 32672;
+    }
+    match target.type_name.as_str() {
+        "integer" | "bigint" | "double" => true,
+        "numeric" => target.precision >= 2,
+        "varchar" => target.length >= 2,
+        "text" => kind.is_postgres_family(),
+        "timestamp" | "timestamptz" | "time" => {
+            kind != DataSourceKind::Hana && (1..=6).contains(&target.precision)
+        }
+        _ => false,
+    }
 }

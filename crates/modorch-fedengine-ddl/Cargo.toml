@@ -11,6 +11,7 @@ homepage.workspace = true
 [dependencies]
 modorch-fedengine-contract.workspace = true
 modorch-fedengine-core.workspace = true
+modorch-fedengine-pg-compat.workspace = true
 sqlparser.workspace = true
 
 [dev-dependencies]

@@ -95,18 +95,26 @@ impl Backend {
                             .cloned()
                             .unwrap_or_default()
                     }),
-                settings: client
-                    .metadata()
-                    .get(METADATA_APPLICATION_NAME)
-                    .map(|v| {
-                        [("application_name".into(), v.clone())]
-                            .into_iter()
-                            .collect()
-                    })
-                    .unwrap_or_default(),
+                settings: {
+                    let mut settings = BTreeMap::new();
+                    if let Some(v) = client.metadata().get(METADATA_APPLICATION_NAME) {
+                        settings.insert("application_name".into(), v.clone());
+                    }
+                    if let Some(v) = client.metadata().get("fedengine_timezone") {
+                        settings.insert("timezone".into(), v.clone());
+                    }
+                    settings
+                },
                 ..Default::default()
             })
             .clone()
+    }
+
+    pub(super) fn active_timezone<C: ClientInfo>(
+        &self,
+        client: &C,
+    ) -> PgWireResult<modorch_fedengine_pg_compat::SessionTimeZone> {
+        modorch_fedengine_pg_compat::active_timezone(&self.session(client)).map_err(pg_error)
     }
 
     async fn database_version<C: ClientInfo>(
@@ -201,8 +209,9 @@ impl Backend {
             .cloned()
             .unwrap_or_default();
         let session = self.session(client);
-        if let Some((next, command)) =
-            modorch_fedengine_pg_compat::session_command(&sql, &session).map_err(pg_error)?
+        if let Some((next, command, maybe_tz)) =
+            modorch_fedengine_pg_compat::session_command_with_timezone(&sql, &session)
+                .map_err(pg_error)?
         {
             let database_version = self.database_version(client).await?;
             if let QueryMode::Execute {
@@ -254,14 +263,99 @@ impl Backend {
                     .map_err(|_| {
                         pg_error(EngineError::new("XX000", "local session response failed"))
                     })?;
-                    QueryReply::Accepted(AcceptedExecution::new(
+                    let mut accepted = AcceptedExecution::new(
                         vec![],
                         StatementKind::Session,
                         ExecutionStream {
                             receiver: rx,
                             cancel: CancellationToken::new(),
                         },
-                    ))
+                    );
+                    if let Some(tz) = maybe_tz {
+                        accepted
+                            .parameter_status
+                            .push(("TimeZone".into(), tz.display));
+                    }
+                    QueryReply::Accepted(accepted)
+                }
+            };
+            return Ok(Arc::new(Ok(reply)));
+        }
+        if let Some((next, tz, col_name)) =
+            modorch_fedengine_pg_compat::set_config_timezone_query(&sql, &session)
+                .map_err(pg_error)?
+        {
+            let database_version = self.database_version(client).await?;
+            if let QueryMode::Execute {
+                expected_database: Some(expected),
+                ..
+            } = &mode
+                && Some(*expected) != database_version
+            {
+                return Err(pg_error(EngineError::new(
+                    "0A000",
+                    "virtual database definition changed; Parse/Bind the statement again",
+                )));
+            }
+            let column = ColumnMeta::new(col_name, PgType::Text);
+            let reply = match mode {
+                QueryMode::Prepare {
+                    ref parameter_types,
+                } => {
+                    if !parameter_types.is_empty() {
+                        return Err(pg_error(EngineError::new(
+                            "08P01",
+                            "set_config statement has no bound parameters",
+                        )));
+                    }
+                    QueryReply::Prepared(PreparedDescriptor {
+                        namespace_version: session.namespace_version,
+                        database_version,
+                        sql,
+                        parameters: vec![],
+                        columns: vec![column],
+                        generations: Default::default(),
+                        kind: StatementKind::Query,
+                    })
+                }
+                QueryMode::Execute { ref parameters, .. } => {
+                    if !parameters.is_empty() {
+                        return Err(pg_error(EngineError::new(
+                            "08P01",
+                            "set_config statement has no bound parameters",
+                        )));
+                    }
+                    *self.session_state.lock().unwrap() = Some(next);
+                    let (tx, rx) = tokio::sync::mpsc::channel(2);
+                    tx.try_send(ResultChunk::Rows(vec![vec![Cell::Text(
+                        tz.display.clone(),
+                    )]]))
+                    .and_then(|()| {
+                        tx.try_send(ResultChunk::Complete(Completion {
+                            notices: vec![],
+                            command: "SELECT 1".into(),
+                            affected_rows: Some(1),
+                            outcome: ExecutionOutcome::Completed,
+                        }))
+                    })
+                    .map_err(|_| {
+                        pg_error(EngineError::new(
+                            "XX000",
+                            "local set_config response failed",
+                        ))
+                    })?;
+                    let mut accepted = AcceptedExecution::new(
+                        vec![column],
+                        StatementKind::Query,
+                        ExecutionStream {
+                            receiver: rx,
+                            cancel: CancellationToken::new(),
+                        },
+                    );
+                    accepted
+                        .parameter_status
+                        .push(("TimeZone".into(), tz.display));
+                    QueryReply::Accepted(accepted)
                 }
             };
             return Ok(Arc::new(Ok(reply)));
@@ -323,6 +417,16 @@ impl Backend {
         C::Error: Debug,
         PgWireError: From<C::Error>,
     {
+        for (name, value) in std::mem::take(&mut cursor.parameter_status) {
+            send(
+                client,
+                PgWireBackendMessage::ParameterStatus(
+                    pgwire::messages::startup::ParameterStatus::new(name, value),
+                ),
+                self.config.pgwire.output_timeout_ms,
+            )
+            .await?;
+        }
         for (key, message) in std::mem::take(&mut cursor.notices) {
             let fresh = {
                 let mut seen = self.seen_notices.lock().unwrap();
@@ -360,6 +464,7 @@ impl Backend {
         expected: std::collections::BTreeMap<DataSourceId, modorch_fedengine_core::SourceVersion>,
         expected_database: Option<DatabaseVersion>,
     ) -> PgWireResult<Cursor> {
+        let timezone = self.active_timezone(client)?;
         let reply = self
             .call(
                 client,
@@ -379,6 +484,8 @@ impl Backend {
             )));
         };
         Ok(Cursor {
+            parameter_status: a.parameter_status.clone(),
+            timezone,
             notices: a.notices.clone(),
             columns: a.columns.clone(),
             stream: Some(a.take_stream().map_err(pg_error)?),

@@ -368,6 +368,125 @@ async fn query_idempotency_limits_cancel_timeout_and_checked_shutdown() {
     assert_eq!(engine.metrics().active_workers, 0);
 }
 
+async fn http_with_headers(
+    address: SocketAddr,
+    method: &str,
+    path: &str,
+    extra_headers: &[(&str, &str)],
+    body: Value,
+) -> (u16, Value) {
+    let mut socket = TcpStream::connect(address).await.unwrap();
+    let body = body.to_string();
+    let mut header_lines = String::new();
+    for (k, v) in extra_headers {
+        header_lines.push_str(&format!("{k}: {v}\r\n"));
+    }
+    socket
+        .write_all(
+            format!(
+                "{method} /api/v1/{path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nIdempotency-Key: test-{}\r\n{header_lines}Content-Length: {}\r\n\r\n{body}",
+                uuid::Uuid::new_v4(),
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut response = vec![];
+    tokio::time::timeout(Duration::from_secs(15), socket.read_to_end(&mut response))
+        .await
+        .unwrap()
+        .unwrap();
+    let response = String::from_utf8(response).unwrap();
+    let (head, body) = response.split_once("\r\n\r\n").unwrap();
+    (
+        head.split_whitespace().nth(1).unwrap().parse().unwrap(),
+        serde_json::from_str(body).unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn sql_debugger_timezone_header_query_param_and_validation() {
+    let dir = common::TestDirectory::new();
+    let engine = FedEngine::start(configuration(&dir)).await.unwrap();
+    let api = engine.management_address().unwrap();
+    let db = get(api, "virtual-databases/fedengine").await;
+    let sql =
+        "SELECT '2026-06-15 00:00:00+00'::TIMESTAMPTZ AS ts, current_setting('timezone') AS tz";
+
+    // Header X-FedQuery-TimeZone
+    let req_body = start(&db, sql);
+    let id_header = uuid::Uuid::new_v4().to_string();
+    let (status, view) = http_with_headers(
+        api,
+        "POST",
+        &format!("browser/queries/{id_header}"),
+        &[("X-FedQuery-TimeZone", "Asia/Shanghai")],
+        req_body.clone(),
+    )
+    .await;
+    assert_eq!(status, 200, "{view}");
+    let done = finish(api, &id_header).await;
+    assert_eq!(done["status"], "succeeded", "{done}");
+    assert_eq!(
+        done["result"]["rows"][0],
+        json!(["2026-06-15 08:00:00+08", "Asia/Shanghai"])
+    );
+
+    // Same UUID with different timezone triggers idempotency conflict (409)
+    let (conflict_status, _) = http_with_headers(
+        api,
+        "POST",
+        &format!("browser/queries/{id_header}?timezone=UTC"),
+        &[],
+        req_body,
+    )
+    .await;
+    assert_eq!(conflict_status, 409);
+
+    // Query parameter ?timezone=
+    for (qp, want_ts, want_tz) in [
+        ("%2B08%3A00", "2026-06-15 08:00:00+08", "+08:00"),
+        ("UTC-8", "2026-06-15 08:00:00+08", "UTC-8"),
+        ("Asia/Kolkata", "2026-06-15 05:30:00+05:30", "Asia/Kolkata"),
+    ] {
+        let id = uuid::Uuid::new_v4().to_string();
+        let (st, v) = http_with_headers(
+            api,
+            "POST",
+            &format!("browser/queries/{id}?timezone={qp}"),
+            &[],
+            start(&db, sql),
+        )
+        .await;
+        assert_eq!(st, 200, "{v}");
+        let res = finish(api, &id).await;
+        assert_eq!(res["status"], "succeeded", "{res}");
+        assert_eq!(res["result"]["rows"][0], json!([want_ts, want_tz]));
+    }
+
+    // Invalid / unsupported / conflicting timezones -> 400
+    for (qp, hdr, want_code) in [
+        (Some("Mars/Bad"), None, "22023"),
+        (Some("%2B05%3A30"), None, "0A000"),
+        (Some("UTC"), Some("Asia/Shanghai"), "22023"),
+    ] {
+        let id = uuid::Uuid::new_v4().to_string();
+        let path = match qp {
+            Some(q) => format!("browser/queries/{id}?timezone={q}"),
+            None => format!("browser/queries/{id}"),
+        };
+        let hdrs: Vec<(&str, &str)> = hdr
+            .map(|h| vec![("X-FedQuery-TimeZone", h)])
+            .unwrap_or_default();
+        let (st, v) = http_with_headers(api, "POST", &path, &hdrs, start(&db, sql)).await;
+        assert_eq!(st, 400, "{v}");
+        assert_eq!(v["code"], want_code, "{v}");
+    }
+
+    engine.shutdown_until_drained().await.unwrap();
+}
+
 async fn operation(api: SocketAddr, path: &str, body: Value) -> Value {
     let (status, op) = http(api, "POST", path, body).await;
     assert_eq!(status, 202, "{op}");

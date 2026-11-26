@@ -108,12 +108,24 @@ pub fn effective_path(session: &SessionContext, scope: &MetadataScope) -> Vec<St
     }
     result
 }
-pub fn setting(session: &SessionContext, scope: &MetadataScope, name: &str) -> Result<String> {
-    let name = match name.to_ascii_lowercase().as_str() {
+fn canonical_setting_name(raw: &str) -> String {
+    match raw.to_ascii_lowercase().as_str() {
         "time.zone" => "timezone".to_string(),
         "transaction.isolation.level" => "transaction_isolation".to_string(),
         other => other.to_string(),
-    };
+    }
+}
+
+/// Returns the active session timezone from `session.settings`, defaulting to UTC.
+pub fn active_timezone(session: &SessionContext) -> Result<crate::timezone::SessionTimeZone> {
+    match session.settings.get("timezone") {
+        Some(raw) => crate::timezone::parse_session_timezone(raw),
+        None => Ok(crate::timezone::SessionTimeZone::utc()),
+    }
+}
+
+pub fn setting(session: &SessionContext, scope: &MetadataScope, name: &str) -> Result<String> {
+    let name = canonical_setting_name(name);
     if name == "search_path" {
         let names = session
             .search_path
@@ -172,7 +184,7 @@ fn expr_string(expr: &Expr) -> Result<String> {
     }
 }
 fn set(session: &mut SessionContext, name: &str, values: &[Expr]) -> Result<()> {
-    let name = name.to_ascii_lowercase();
+    let name = canonical_setting_name(name);
     if name == "search_path" {
         let entries = values
             .iter()
@@ -231,12 +243,16 @@ fn set(session: &mut SessionContext, name: &str, values: &[Expr]) -> Result<()> 
     if values.len() != 1 {
         return Err(EngineError::unsupported("setting requires one value"));
     }
+    if name == "timezone" {
+        let tz = crate::timezone::parse_timezone_expr(&values[0])?;
+        session.settings.insert(name, tz.display);
+        return Ok(());
+    }
     let value = expr_string(&values[0])?;
     let normalized = value.to_ascii_lowercase();
     let valid = match name.as_str() {
         "application_name" => value.len() <= 256,
         "client_encoding" => matches!(normalized.as_str(), "utf8" | "utf-8"),
-        "timezone" => normalized == "utc",
         "datestyle" => matches!(normalized.as_str(), "iso" | "iso, ymd" | "iso, mdy"),
         "standard_conforming_strings" => matches!(normalized.as_str(), "on" | "true"),
         "extra_float_digits" => value == "3",
@@ -255,18 +271,106 @@ fn set(session: &mut SessionContext, name: &str, values: &[Expr]) -> Result<()> 
     }
     let value = match name.as_str() {
         "client_encoding" => "UTF8".into(),
-        "timezone" => "UTC".into(),
         "standard_conforming_strings" => "on".into(),
         _ => value,
     };
     session.settings.insert(name, value);
     Ok(())
 }
+/// Special `TIME ZONE` command variants that `sqlparser`'s PostgreSQL grammar cannot parse directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpecialTimezoneCommand {
+    /// `SET [SESSION] TIME ZONE DEFAULT` or `SET [SESSION] TIME ZONE LOCAL`.
+    SetDefault,
+    /// `SET LOCAL TIME ZONE DEFAULT` or `SET LOCAL TIME ZONE LOCAL` (unsupported `0A000`).
+    SetLocalUnsupported,
+    /// `RESET TIME ZONE`.
+    Reset,
+}
+
+/// Recognizes unquoted single-statement `RESET TIME ZONE` and `SET [SESSION|LOCAL] TIME ZONE (LOCAL|DEFAULT)` forms.
+pub fn parse_special_timezone_command(sql: &str) -> Option<SpecialTimezoneCommand> {
+    let Ok(tokens) = Tokenizer::new(&PostgreSqlDialect {}, sql).tokenize() else {
+        return None;
+    };
+    let mut non_ws = tokens
+        .into_iter()
+        .filter(|t| !matches!(t, Token::Whitespace(_)))
+        .collect::<Vec<_>>();
+    if matches!(non_ws.last(), Some(Token::SemiColon)) {
+        non_ws.pop();
+    }
+    if non_ws.iter().any(|t| matches!(t, Token::SemiColon)) {
+        return None;
+    }
+    let words = non_ws
+        .iter()
+        .map(|t| match t {
+            Token::Word(w) if w.quote_style.is_none() => Some(w.value.to_ascii_uppercase()),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let refs: Vec<&str> = words.iter().map(String::as_str).collect();
+    match refs.as_slice() {
+        ["RESET", "TIME", "ZONE"] => Some(SpecialTimezoneCommand::Reset),
+        ["SET", "TIME", "ZONE", "DEFAULT" | "LOCAL"]
+        | ["SET", "SESSION", "TIME", "ZONE", "DEFAULT" | "LOCAL"] => {
+            Some(SpecialTimezoneCommand::SetDefault)
+        }
+        ["SET", "LOCAL", "TIME", "ZONE", "DEFAULT" | "LOCAL"] => {
+            Some(SpecialTimezoneCommand::SetLocalUnsupported)
+        }
+        _ => None,
+    }
+}
+
 /// Parse validates against a copy; only Execute commits the returned session state.
 pub fn session_command(
     sql: &str,
     session: &SessionContext,
 ) -> Result<Option<(SessionContext, String)>> {
+    Ok(session_command_with_timezone(sql, session)?.map(|(next, cmd, _)| (next, cmd)))
+}
+
+/// Like [`session_command`], additionally returning the new [`crate::timezone::SessionTimeZone`]
+/// whenever the command updates or resets the active session timezone.
+pub fn session_command_with_timezone(
+    sql: &str,
+    session: &SessionContext,
+) -> Result<
+    Option<(
+        SessionContext,
+        String,
+        Option<crate::timezone::SessionTimeZone>,
+    )>,
+> {
+    if sql.len() > 1024 * 1024 {
+        return Err(EngineError::new("54000", "SQL exceeds 1 MiB limit"));
+    }
+    if let Some(cmd) = parse_special_timezone_command(sql) {
+        let mut next = session.clone();
+        return match cmd {
+            SpecialTimezoneCommand::Reset => {
+                reset(&mut next, "timezone")?;
+                Ok(Some((
+                    next,
+                    "RESET".into(),
+                    Some(crate::timezone::SessionTimeZone::utc()),
+                )))
+            }
+            SpecialTimezoneCommand::SetDefault => {
+                reset(&mut next, "timezone")?;
+                Ok(Some((
+                    next,
+                    "SET".into(),
+                    Some(crate::timezone::SessionTimeZone::utc()),
+                )))
+            }
+            SpecialTimezoneCommand::SetLocalUnsupported => Err(EngineError::unsupported(
+                "SET LOCAL TIME ZONE is not supported",
+            )),
+        };
+    }
     let mut statements = match parse_pg(sql) {
         Ok(s) => s,
         Err(_) if is_reindex_statement(sql) => return Ok(None),
@@ -288,33 +392,45 @@ pub fn session_command(
                     "SET LOCAL and dialect-specific settings are unsupported",
                 ));
             }
-            let name = variable.to_string();
+            let raw_name = variable.to_string();
+            let canonical = canonical_setting_name(&raw_name);
             if values.len() == 1
                 && matches!(&values[0],Expr::Identifier(i) if i.value.eq_ignore_ascii_case("default"))
             {
-                reset(&mut next, &name)?;
+                reset(&mut next, &canonical)?;
             } else {
-                set(&mut next, &name, &values)?;
+                set(&mut next, &canonical, &values)?;
             }
-            Ok(Some((next, "SET".into())))
+            let tz = (canonical == "timezone")
+                .then(|| active_timezone(&next))
+                .transpose()?;
+            Ok(Some((next, "SET".into(), tz)))
         }
-        Statement::Set(Set::SetTimeZone {
-            local: false,
-            value,
-        }) => {
+        Statement::Set(Set::SetTimeZone { local, value }) => {
+            if local {
+                return Err(EngineError::unsupported(
+                    "SET LOCAL TIME ZONE is not supported",
+                ));
+            }
             set(&mut next, "timezone", &[value])?;
-            Ok(Some((next, "SET".into())))
+            let tz = active_timezone(&next)?;
+            Ok(Some((next, "SET".into(), Some(tz))))
         }
         Statement::Reset(r) => {
-            match r.reset {
+            let tz = match r.reset {
                 Reset::ALL => {
                     next.settings.clear();
                     next.search_path = None;
                     next.namespace_version += 1;
+                    Some(crate::timezone::SessionTimeZone::utc())
                 }
-                Reset::ConfigurationParameter(n) => reset(&mut next, &n.to_string())?,
-            }
-            Ok(Some((next, "RESET".into())))
+                Reset::ConfigurationParameter(n) => {
+                    let canonical = canonical_setting_name(&n.to_string());
+                    reset(&mut next, &canonical)?;
+                    (canonical == "timezone").then(crate::timezone::SessionTimeZone::utc)
+                }
+            };
+            Ok(Some((next, "RESET".into(), tz)))
         }
         Statement::Set(_) => Err(EngineError::unsupported(
             "session command is outside the supported registry",
@@ -322,8 +438,105 @@ pub fn session_command(
         _ => Ok(None),
     }
 }
+
+/// Recognizes scalar `SELECT set_config('timezone', value, is_local)` statements,
+/// returning the updated session context, parsed timezone, and output column label.
+pub fn set_config_timezone_query(
+    sql: &str,
+    session: &SessionContext,
+) -> Result<Option<(SessionContext, crate::timezone::SessionTimeZone, String)>> {
+    let mut statements = match parse_pg(sql) {
+        Ok(s) => s,
+        Err(_) => return Ok(None),
+    };
+    if statements.len() != 1 {
+        return Ok(None);
+    }
+    let Statement::Query(q) = statements.remove(0) else {
+        return Ok(None);
+    };
+    if q.with.is_some() || q.order_by.is_some() || q.limit_clause.is_some() || !q.locks.is_empty() {
+        return Ok(None);
+    }
+    let SetExpr::Select(select) = q.body.as_ref() else {
+        return Ok(None);
+    };
+    if select.distinct.is_some()
+        || !select.from.is_empty()
+        || select.selection.is_some()
+        || !matches!(
+            &select.group_by,
+            GroupByExpr::Expressions(exprs, modifiers) if exprs.is_empty() && modifiers.is_empty()
+        )
+        || select.having.is_some()
+        || select.projection.len() != 1
+    {
+        return Ok(None);
+    }
+    let (expr, col_name) = match &select.projection[0] {
+        SelectItem::UnnamedExpr(e) => (e, "set_config".to_string()),
+        SelectItem::ExprWithAlias { expr, alias } => (expr, alias.value.clone()),
+        _ => return Ok(None),
+    };
+    let Expr::Function(f) = expr else {
+        return Ok(None);
+    };
+    let fn_name = f.name.to_string().to_ascii_lowercase();
+    if !matches!(
+        fn_name.as_str(),
+        "set_config"
+            | "pg_catalog.set_config"
+            | "system.main.set_config"
+            | "system.pg_catalog.set_config"
+    ) {
+        return Ok(None);
+    }
+    let FunctionArguments::List(arg_list) = &f.args else {
+        return Ok(None);
+    };
+    if !arg_list.clauses.is_empty() || arg_list.args.len() != 3 {
+        return Ok(None);
+    }
+    let mut args = Vec::with_capacity(3);
+    for a in &arg_list.args {
+        let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = a else {
+            return Ok(None);
+        };
+        args.push(e);
+    }
+    let Some((setting_name, false)) = crate::timezone::extract_interval_or_string_literal(args[0])
+    else {
+        return Ok(None);
+    };
+    if !setting_name.trim().eq_ignore_ascii_case("timezone") {
+        return Ok(None);
+    }
+    match args[2] {
+        Expr::Value(v) if v.value == Value::Boolean(true) => {
+            return Err(EngineError::unsupported(
+                "SET LOCAL TIME ZONE is not supported",
+            ));
+        }
+        Expr::Value(v) if v.value == Value::Boolean(false) => {}
+        _ => {
+            return Err(EngineError::config(
+                "set_config requires a boolean literal for is_local",
+            ));
+        }
+    }
+    let Some((raw_value, false)) = crate::timezone::extract_interval_or_string_literal(args[1])
+    else {
+        return Err(EngineError::config(
+            "invalid value for parameter \"TimeZone\"",
+        ));
+    };
+    let tz = crate::timezone::parse_session_timezone(&raw_value)?;
+    let mut next = session.clone();
+    next.settings.insert("timezone".into(), tz.display.clone());
+    Ok(Some((next, tz, col_name)))
+}
 fn reset(session: &mut SessionContext, name: &str) -> Result<()> {
-    let name = name.to_ascii_lowercase();
+    let name = canonical_setting_name(name);
     if name == "search_path" {
         session.search_path = None;
         session.namespace_version += 1;
@@ -357,6 +570,101 @@ mod tests {
         );
         assert!(
             session_command("REINDEX INDEX idx_a; SELECT 1", &SessionContext::default()).is_err()
+        );
+    }
+
+    #[test]
+    fn timezone_session_commands_and_set_config_work() {
+        let base = SessionContext::default();
+        for (sql, want_disp, want_duck, want_cmd) in [
+            (
+                "SET TIME ZONE 'Asia/Shanghai'",
+                "Asia/Shanghai",
+                "Asia/Shanghai",
+                "SET",
+            ),
+            ("SET TIME ZONE '+08:00'", "+08:00", "Etc/GMT-8", "SET"),
+            ("SET TIME ZONE 8", "+08:00", "Etc/GMT-8", "SET"),
+            ("SET TIME ZONE -5", "-05:00", "Etc/GMT+5", "SET"),
+            (
+                "SET TIME ZONE INTERVAL '+08:00'",
+                "+08:00",
+                "Etc/GMT-8",
+                "SET",
+            ),
+            (
+                "SET TIME ZONE INTERVAL '-5 hours'",
+                "-05:00",
+                "Etc/GMT+5",
+                "SET",
+            ),
+            (
+                "SET TIME ZONE INTERVAL '+08:00' HOUR TO MINUTE",
+                "+08:00",
+                "Etc/GMT-8",
+                "SET",
+            ),
+            ("SET timezone = 'UTC+8'", "UTC+8", "Etc/GMT+8", "SET"),
+            (
+                "SET SESSION TIME ZONE '+09:00'",
+                "+09:00",
+                "Etc/GMT-9",
+                "SET",
+            ),
+            ("SET TIME ZONE DEFAULT", "UTC", "UTC", "SET"),
+            ("SET TIME ZONE LOCAL", "UTC", "UTC", "SET"),
+            ("RESET TIME ZONE", "UTC", "UTC", "RESET"),
+            ("RESET ALL", "UTC", "UTC", "RESET"),
+        ] {
+            let (next, cmd, maybe_tz) = session_command_with_timezone(sql, &base).unwrap().unwrap();
+            assert_eq!(cmd, want_cmd, "{sql}");
+            let tz = maybe_tz.unwrap();
+            assert_eq!(tz.display, want_disp, "{sql}");
+            assert_eq!(tz.duckdb_zone, want_duck, "{sql}");
+            assert_eq!(active_timezone(&next).unwrap().display, want_disp, "{sql}");
+        }
+
+        for (bad_sql, want_state) in [
+            ("SET LOCAL TIME ZONE 'UTC'", "0A000"),
+            ("SET LOCAL timezone = 'UTC'", "0A000"),
+            ("SET TIME ZONE 5.5", "0A000"),
+            ("SET TIME ZONE INTERVAL '5 hours 30 minutes'", "0A000"),
+            ("SET TIME ZONE INTERVAL '1 day'", "22023"),
+            ("SET TIME ZONE 'Invalid/Zone'", "22023"),
+        ] {
+            let err = session_command_with_timezone(bad_sql, &base).unwrap_err();
+            assert_eq!(err.sqlstate, want_state, "{bad_sql}");
+        }
+
+        let (next, tz, col) = set_config_timezone_query(
+            "SELECT pg_catalog.set_config('TimeZone', 'Asia/Shanghai', false) AS tz",
+            &base,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(col, "tz");
+        assert_eq!(tz.display, "Asia/Shanghai");
+        assert_eq!(active_timezone(&next).unwrap().display, "Asia/Shanghai");
+
+        assert_eq!(
+            set_config_timezone_query(
+                "SELECT set_config('timezone', 'Asia/Shanghai', true)",
+                &base
+            )
+            .unwrap_err()
+            .sqlstate,
+            "0A000"
+        );
+        assert_eq!(
+            set_config_timezone_query("SELECT set_config('timezone', 'Mars/Bad', false)", &base)
+                .unwrap_err()
+                .sqlstate,
+            "22023"
+        );
+        assert!(
+            set_config_timezone_query("SELECT set_config('application_name', 'x', false)", &base)
+                .unwrap()
+                .is_none()
         );
     }
 }

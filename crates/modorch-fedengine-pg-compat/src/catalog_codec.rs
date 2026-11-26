@@ -1,4 +1,7 @@
-use super::{binary as scalar_binary, decode_parameter, invalid, text as scalar_text};
+use super::{
+    SessionTimeZone, binary as scalar_binary, decode_parameter_in_timezone, invalid,
+    text_value_in_timezone,
+};
 use bytes::{BufMut, BytesMut};
 use modorch_fedengine_contract::{Cell, PgType};
 use modorch_fedengine_core::*;
@@ -22,6 +25,7 @@ pub fn array_element_type(oid: u32) -> Option<PgType> {
         1182 => PgType::Date,
         1183 => PgType::Time,
         1185 => PgType::Timestamptz,
+        1270 => PgType::Timetz,
         1187 => PgType::Interval,
         1231 => PgType::Numeric,
         2951 => PgType::Uuid,
@@ -110,11 +114,19 @@ pub(super) fn binary(c: &Cell, oid: u32) -> Result<Vec<u8>> {
         }
     })
 }
+#[cfg(test)]
 pub(super) fn text(c: &Cell, t: PgType) -> Result<Option<String>> {
+    text_in_timezone(c, t, &SessionTimeZone::utc())
+}
+pub(super) fn text_in_timezone(
+    c: &Cell,
+    t: PgType,
+    tz: &SessionTimeZone,
+) -> Result<Option<String>> {
     let PgType::Catalog(oid) = t else {
         return Ok(None);
     };
-    let Some(_) = element(oid) else {
+    let Some(elem) = element(oid) else {
         return Ok(None);
     };
     let Cell::Array {
@@ -134,7 +146,7 @@ pub(super) fn text(c: &Cell, t: PgType) -> Result<Option<String>> {
                 }
                 return Ok("NULL".into());
             }
-            let s = scalar_text(v)?;
+            let s = text_value_in_timezone(v, elem, tz)?.unwrap_or_default();
             if vector {
                 Ok(s)
             } else {
@@ -157,10 +169,19 @@ pub(super) fn text(c: &Cell, t: PgType) -> Result<Option<String>> {
     };
     Ok(Some(format!("{dims}{{{}}}", items.join(","))))
 }
+#[cfg(test)]
 pub(super) fn decode(b: &[u8], oid: u32, is_binary: bool) -> Result<Cell> {
+    decode_in_timezone(b, oid, is_binary, &SessionTimeZone::utc())
+}
+pub(super) fn decode_in_timezone(
+    b: &[u8],
+    oid: u32,
+    is_binary: bool,
+    tz: &SessionTimeZone,
+) -> Result<Cell> {
     if let Some(t) = element(oid) {
         if !is_binary {
-            return array_text(std::str::from_utf8(b).map_err(|_| invalid())?, oid, t);
+            return array_text(std::str::from_utf8(b).map_err(|_| invalid())?, oid, t, tz);
         }
         let mut input = b;
         fn read(input: &mut &[u8]) -> Result<i32> {
@@ -214,7 +235,7 @@ pub(super) fn decode(b: &[u8], oid: u32, is_binary: bool) -> Result<Cell> {
             }
             let (v, rest) = input.split_at(n as usize);
             input = rest;
-            values.push(decode_parameter(Some(v), t, true)?);
+            values.push(decode_parameter_in_timezone(Some(v), t, true, tz)?);
         }
         if !input.is_empty() {
             return Err(invalid());
@@ -248,11 +269,11 @@ pub(super) fn decode(b: &[u8], oid: u32, is_binary: bool) -> Result<Cell> {
     }
     Ok(Cell::Text(v.into()))
 }
-fn array_text(s: &str, oid: u32, t: PgType) -> Result<Cell> {
+fn array_text(s: &str, oid: u32, t: PgType, tz: &SessionTimeZone) -> Result<Cell> {
     if matches!(oid, 22 | 30) {
         let values = s
             .split_whitespace()
-            .map(|v| decode_parameter(Some(v.as_bytes()), t, false))
+            .map(|v| decode_parameter_in_timezone(Some(v.as_bytes()), t, false, tz))
             .collect::<Result<_>>()?;
         return Ok(Cell::Array {
             lower_bound: 0,
@@ -316,7 +337,7 @@ fn array_text(s: &str, oid: u32, t: PgType) -> Result<Cell> {
             if !quoted && !escaped && item.eq_ignore_ascii_case("null") {
                 Cell::Null
             } else {
-                decode_parameter(Some(item.as_bytes()), t, false)?
+                decode_parameter_in_timezone(Some(item.as_bytes()), t, false, tz)?
             },
         );
         if values.len() > 100_000 {

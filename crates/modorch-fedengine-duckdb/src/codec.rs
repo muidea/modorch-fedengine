@@ -52,6 +52,24 @@ fn is_point_struct_type(t: &str) -> bool {
         (Some((n1, t1)), Some((n2, t2))) if n1 == "x" && t1 == "DOUBLE" && n2 == "y" && t2 == "DOUBLE"
     )
 }
+fn normalize_scalar_duckdb_type(t: &str) -> String {
+    if t.starts_with("STRUCT(") || t.starts_with("DECIMAL") || t.starts_with("MYSQL_DECIMAL(") {
+        return t.to_string();
+    }
+    if let (Some(open), Some(close)) = (t.find('('), t.find(')'))
+        && open < close
+    {
+        let left = t[..open].trim();
+        let right = t[close + 1..].trim();
+        if right.is_empty() {
+            left.to_string()
+        } else {
+            format!("{left} {right}")
+        }
+    } else {
+        t.to_string()
+    }
+}
 pub(super) fn type_name(t: &str) -> Result<PgType> {
     if let Some(elem) = t.strip_suffix("[]") {
         if elem.contains("[]") {
@@ -59,7 +77,8 @@ pub(super) fn type_name(t: &str) -> Result<PgType> {
                 "multi-dimensional arrays are not implemented",
             ));
         }
-        let oid = match elem {
+        let elem_norm = normalize_scalar_duckdb_type(elem);
+        let oid = match elem_norm.as_str() {
             "BOOLEAN" => 1000,
             "BLOB" => 1001,
             "TINYINT" | "SMALLINT" => 1005,
@@ -69,9 +88,14 @@ pub(super) fn type_name(t: &str) -> Result<PgType> {
             "DOUBLE" => 1022,
             "VARCHAR" => 1009,
             "DATE" => 1182,
-            "TIME" => 1183,
-            "TIMESTAMP" | "TIMESTAMP_NS" | "TIMESTAMP_MS" | "TIMESTAMP_S" => 1115,
-            "TIMESTAMP WITH TIME ZONE" => 1185,
+            "TIME" | "TIME WITHOUT TIME ZONE" => 1183,
+            "TIMETZ" | "TIME WITH TIME ZONE" => 1270,
+            "TIMESTAMP"
+            | "TIMESTAMP WITHOUT TIME ZONE"
+            | "TIMESTAMP_NS"
+            | "TIMESTAMP_MS"
+            | "TIMESTAMP_S" => 1115,
+            "TIMESTAMPTZ" | "TIMESTAMP WITH TIME ZONE" => 1185,
             "INTERVAL" => 1187,
             "UUID" => 2951,
             "JSON" => 199,
@@ -90,7 +114,8 @@ pub(super) fn type_name(t: &str) -> Result<PgType> {
         };
         return Ok(PgType::Catalog(oid));
     }
-    Ok(match t {
+    let norm = normalize_scalar_duckdb_type(t);
+    Ok(match norm.as_str() {
         "BOOLEAN" => PgType::Bool,
         "TINYINT" | "SMALLINT" => PgType::Int2,
         "INTEGER" | "UTINYINT" | "USMALLINT" => PgType::Int4,
@@ -100,9 +125,14 @@ pub(super) fn type_name(t: &str) -> Result<PgType> {
         "VARCHAR" | "NULL" | "\"NULL\"" => PgType::Text,
         "BLOB" => PgType::Bytea,
         "DATE" => PgType::Date,
-        "TIME" => PgType::Time,
-        "TIMESTAMP" | "TIMESTAMP_NS" | "TIMESTAMP_MS" | "TIMESTAMP_S" => PgType::Timestamp,
-        "TIMESTAMP WITH TIME ZONE" => PgType::Timestamptz,
+        "TIME" | "TIME WITHOUT TIME ZONE" => PgType::Time,
+        "TIMETZ" | "TIME WITH TIME ZONE" => PgType::Timetz,
+        "TIMESTAMP"
+        | "TIMESTAMP WITHOUT TIME ZONE"
+        | "TIMESTAMP_NS"
+        | "TIMESTAMP_MS"
+        | "TIMESTAMP_S" => PgType::Timestamp,
+        "TIMESTAMPTZ" | "TIMESTAMP WITH TIME ZONE" => PgType::Timestamptz,
         "INTERVAL" => PgType::Interval,
         "UUID" => PgType::Uuid,
         "JSON" => PgType::Json,
@@ -337,7 +367,22 @@ pub(super) fn to_duckdb(c: &Cell) -> Value {
         Cell::Text(v) | Cell::Numeric(v) => Value::Text(v.clone()),
         Cell::Bytes(v) => Value::Blob(v.clone()),
         Cell::Date(v) => Value::Date32(*v),
-        Cell::Time(v) => Value::Time64(duckdb::types::TimeUnit::Microsecond, *v),
+        Cell::Time(v) => {
+            if *v == 86_400_000_000 {
+                Value::Text("24:00:00".into())
+            } else {
+                Value::Time64(duckdb::types::TimeUnit::Microsecond, *v)
+            }
+        }
+        Cell::Timetz {
+            micros,
+            west_offset,
+        } => {
+            let clock = modorch_fedengine_pg_compat::format_time_micros(*micros)
+                .unwrap_or_else(|_| "00:00:00".into());
+            let off = modorch_fedengine_pg_compat::format_signed_duration_offset(-*west_offset);
+            Value::Text(format!("{clock}{off}"))
+        }
         Cell::Timestamp(v) => Value::Timestamp(duckdb::types::TimeUnit::Microsecond, *v),
         Cell::Interval {
             months,
@@ -397,6 +442,11 @@ pub(super) fn coerce(c: Cell, t: PgType) -> Result<Cell> {
             Cell::Oid(n.try_into().map_err(|_| range())?)
         }
         (PgType::Numeric, _, Cell::Text(v)) => Cell::Numeric(v),
+        (PgType::Timetz, _, Cell::Text(v)) => modorch_fedengine_pg_compat::decode_parameter(
+            Some(v.as_bytes()),
+            PgType::Timetz,
+            false,
+        )?,
         (PgType::Catalog(oid), _, Cell::Array { values, .. }) => {
             let element =
                 modorch_fedengine_pg_compat::array_element_type(oid).unwrap_or(PgType::Text);
@@ -410,4 +460,52 @@ pub(super) fn coerce(c: Cell, t: PgType) -> Result<Cell> {
         }
         (_, _, c) => c,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use duckdb::Connection;
+
+    #[test]
+    fn duckdb_timetz_and_timezone_arrow_behavior() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("SET TimeZone = 'Etc/GMT-8'").unwrap();
+        let tz: String = conn
+            .query_row("SELECT current_setting('TimeZone')", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(tz, "Etc/GMT-8");
+
+        let mut d_stmt = conn
+            .prepare("DESCRIBE SELECT TIMETZ '12:34:56.123456+08:00' AS tt, TIME '24:00:00' AS t24")
+            .unwrap();
+        let mut d_rows = d_stmt.query([]).unwrap();
+        let row0 = d_rows.next().unwrap().unwrap();
+        let dt0: String = row0.get(1).unwrap();
+        let row1 = d_rows.next().unwrap().unwrap();
+        let dt1: String = row1.get(1).unwrap();
+        assert_eq!(type_name(&dt0).unwrap(), PgType::Timetz, "{dt0}");
+        assert_eq!(type_name(&dt1).unwrap(), PgType::Time, "{dt1}");
+
+        // Check DuckDB v2.0.0 Arrow TIME '24:00:00' and CAST(TIMETZ AS VARCHAR) -> Cell::Timetz
+        let mut stmt = conn
+            .prepare("SELECT TIME '24:00:00', CAST(TIMETZ '12:34:56.123456+08:00' AS VARCHAR)")
+            .unwrap();
+        let mut stream = stmt.stream_arrow([]).unwrap();
+        let batch = stream.next().unwrap().unwrap();
+        let c0 = cell(batch.column(0).as_ref(), 0).unwrap();
+        assert!(matches!(c0, Cell::Time(86_400_000_000)));
+        let c1 = cell(batch.column(1).as_ref(), 0).unwrap();
+        let coerced = coerce(c1, PgType::Timetz).unwrap();
+        assert!(
+            matches!(
+                coerced,
+                Cell::Timetz {
+                    micros: 45_296_123_456,
+                    west_offset: -28_800
+                }
+            ),
+            "got {coerced:?}"
+        );
+    }
 }

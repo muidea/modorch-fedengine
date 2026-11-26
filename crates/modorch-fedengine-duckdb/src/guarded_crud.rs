@@ -892,6 +892,7 @@ mod tests {
             }),
             guarded_mutation: None,
             guarded_ddl: None,
+            session_timezone: "UTC".into(),
         };
         execute_local_returning(
             &conn,

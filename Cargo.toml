@@ -40,6 +40,7 @@ pgwire = "=0.42.1"
 duckdb = { version = "=1.20000.1", features = ["download-lib", "chrono", "uuid", "vscalar", "vscalar-arrow"] }
 sqlparser = { version = "0.62", features = ["visitor"] }
 chrono = "0.4"
+chrono-tz = "0.10"
 uuid = "1"
 rustls-pemfile = "2"
 tokio-rustls = "0.26"

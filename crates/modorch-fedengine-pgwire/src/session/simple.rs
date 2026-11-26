@@ -3,7 +3,7 @@ use futures::{Sink, SinkExt};
 use modorch::prelude::async_trait;
 use modorch_fedengine_core::EngineError;
 use modorch_fedengine_ddl::Analyzer;
-use modorch_fedengine_pg_compat::{encode_row, fields, pg_error};
+use modorch_fedengine_pg_compat::{encode_row_in_timezone, fields, pg_error};
 use pgwire::{
     api::{portal::Format, query::SimpleQueryHandler, results::Response, store::PortalStore, *},
     error::{PgWireError, PgWireResult},
@@ -58,8 +58,13 @@ impl SimpleQueryHandler for Backend {
                 send(
                     client,
                     PgWireBackendMessage::DataRow(
-                        encode_row(&row, &cursor.columns, &Format::UnifiedText)
-                            .map_err(pg_error)?,
+                        encode_row_in_timezone(
+                            &row,
+                            &cursor.columns,
+                            &Format::UnifiedText,
+                            &cursor.timezone,
+                        )
+                        .map_err(pg_error)?,
                     ),
                     self.config.pgwire.output_timeout_ms,
                 )

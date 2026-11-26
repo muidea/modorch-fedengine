@@ -9,6 +9,7 @@ mod planner;
 pub use planner::*;
 mod execution;
 mod result_types;
+pub mod timezone;
 use bytes::{BufMut, BytesMut};
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 pub use execution::{EXECUTION_SETTINGS, execution_sql};
@@ -22,6 +23,11 @@ use pgwire::{
     },
     error::{ErrorInfo, PgWireError},
     messages::data::DataRow,
+};
+pub use timezone::{
+    SessionTimeZone, format_pg_offset_suffix, format_signed_duration_offset, format_time_micros,
+    parse_numeric_timezone_hours, parse_session_timezone, parse_timezone_interval_literal,
+    parse_timezone_literal_for_at_time_zone, validate_utc_year,
 };
 const PG_EPOCH_MICROS: i64 = 946_684_800_000_000;
 const PG_EPOCH_DAYS: i32 = 10957;
@@ -57,6 +63,15 @@ pub fn fields(columns: &[ColumnMeta], format: &Format) -> Vec<FieldInfo> {
         .collect()
 }
 pub fn encode_row(row: &[Cell], columns: &[ColumnMeta], format: &Format) -> Result<DataRow> {
+    encode_row_in_timezone(row, columns, format, &SessionTimeZone::utc())
+}
+/// Encodes a result row in PostgreSQL wire format using `tz` for `TIMESTAMPTZ` text output.
+pub fn encode_row_in_timezone(
+    row: &[Cell],
+    columns: &[ColumnMeta],
+    format: &Format,
+    tz: &SessionTimeZone,
+) -> Result<DataRow> {
     if row.len() != columns.len() || row.len() > i16::MAX as usize {
         return Err(EngineError::new("08P01", "row/column count mismatch"));
     }
@@ -69,7 +84,9 @@ pub fn encode_row(row: &[Cell], columns: &[ColumnMeta], format: &Format) -> Resu
         let value = if format.format_for(i) == FieldFormat::Binary {
             binary(cell, col.data_type)?
         } else {
-            text_value(cell, col.data_type)?.unwrap().into_bytes()
+            text_value_in_timezone(cell, col.data_type, tz)?
+                .unwrap()
+                .into_bytes()
         };
         if value.len() > i32::MAX as usize {
             return Err(EngineError::new(
@@ -84,11 +101,31 @@ pub fn encode_row(row: &[Cell], columns: &[ColumnMeta], format: &Format) -> Resu
 }
 /// PostgreSQL text representation shared by wire and HTTP consumers. NULL remains distinct.
 pub fn text_value(cell: &Cell, data_type: PgType) -> Result<Option<String>> {
+    text_value_in_timezone(cell, data_type, &SessionTimeZone::utc())
+}
+/// PostgreSQL text representation formatted under the given active [`SessionTimeZone`].
+pub fn text_value_in_timezone(
+    cell: &Cell,
+    data_type: PgType,
+    tz: &SessionTimeZone,
+) -> Result<Option<String>> {
     if matches!(cell, Cell::Null) {
         return Ok(None);
     }
-    if let Some(value) = catalog_codec::text(cell, data_type)? {
+    if let Some(value) = catalog_codec::text_in_timezone(cell, data_type, tz)? {
         return Ok(Some(value));
+    }
+    if data_type == PgType::Timestamptz
+        && let Cell::Timestamp(v) = cell
+    {
+        return Ok(Some(tz.format_timestamptz(*v)?));
+    }
+    if let Cell::Timetz {
+        micros,
+        west_offset,
+    } = cell
+    {
+        return Ok(Some(tz.format_timetz(*micros, *west_offset)?));
     }
     let mut value = text(cell)?;
     if data_type == PgType::Timestamptz {
@@ -118,12 +155,37 @@ fn binary(c: &Cell, t: PgType) -> Result<Vec<u8>> {
             .ok_or_else(invalid)?
             .to_be_bytes()
             .to_vec(),
-        (PgType::Time, Cell::Time(v)) => v.to_be_bytes().to_vec(),
-        (PgType::Timestamp | PgType::Timestamptz, Cell::Timestamp(v)) => v
-            .checked_sub(PG_EPOCH_MICROS)
-            .ok_or_else(invalid)?
-            .to_be_bytes()
-            .to_vec(),
+        (PgType::Time, Cell::Time(v)) => {
+            if !(0..=86_400_000_000).contains(v) {
+                return Err(invalid());
+            }
+            v.to_be_bytes().to_vec()
+        }
+        (
+            PgType::Timetz,
+            Cell::Timetz {
+                micros,
+                west_offset,
+            },
+        ) => {
+            if !(0..=86_400_000_000).contains(micros)
+                || west_offset.abs() > 15 * 3600 + 59 * 60 + 59
+            {
+                return Err(invalid());
+            }
+            let mut b = Vec::with_capacity(12);
+            b.extend_from_slice(&micros.to_be_bytes());
+            b.extend_from_slice(&west_offset.to_be_bytes());
+            b
+        }
+        (PgType::Timestamp | PgType::Timestamptz, Cell::Timestamp(v)) => {
+            let dt = chrono::DateTime::from_timestamp_micros(*v).ok_or_else(invalid)?;
+            validate_utc_year(dt)?;
+            v.checked_sub(PG_EPOCH_MICROS)
+                .ok_or_else(invalid)?
+                .to_be_bytes()
+                .to_vec()
+        }
         (
             PgType::Interval,
             Cell::Interval {
@@ -222,18 +284,11 @@ fn text(c: &Cell) -> Result<String> {
             .checked_add_signed(chrono::Duration::days(*d as i64))
             .ok_or_else(invalid)?
             .to_string(),
-        Cell::Time(t) => {
-            if !(0..86_400_000_000).contains(t) {
-                return Err(invalid());
-            }
-            NaiveTime::from_num_seconds_from_midnight_opt(
-                (t / 1_000_000) as u32,
-                ((t % 1_000_000) * 1000) as u32,
-            )
-            .ok_or_else(invalid)?
-            .format("%H:%M:%S%.f")
-            .to_string()
-        }
+        Cell::Time(t) => format_time_micros(*t)?,
+        Cell::Timetz {
+            micros,
+            west_offset,
+        } => SessionTimeZone::utc().format_timetz(*micros, *west_offset)?,
         Cell::Timestamp(v) => chrono::DateTime::from_timestamp_micros(*v)
             .ok_or_else(invalid)?
             .naive_utc()
@@ -260,6 +315,15 @@ fn float_text(v: f64) -> String {
     }
 }
 pub fn decode_parameter(bytes: Option<&[u8]>, t: PgType, binary_format: bool) -> Result<Cell> {
+    decode_parameter_in_timezone(bytes, t, binary_format, &SessionTimeZone::utc())
+}
+/// Decodes a PostgreSQL bind parameter using `tz` when interpreting bare `TIMESTAMPTZ`/`TIMETZ` text values.
+pub fn decode_parameter_in_timezone(
+    bytes: Option<&[u8]>,
+    t: PgType,
+    binary_format: bool,
+    tz: &SessionTimeZone,
+) -> Result<Cell> {
     let Some(b) = bytes else {
         return Ok(Cell::Null);
     };
@@ -267,10 +331,10 @@ pub fn decode_parameter(bytes: Option<&[u8]>, t: PgType, binary_format: bool) ->
         return Err(EngineError::new("54000", "parameter exceeds 1 MiB limit"));
     }
     if let PgType::Catalog(oid) = t {
-        return catalog_codec::decode(b, oid, binary_format);
+        return catalog_codec::decode_in_timezone(b, oid, binary_format, tz);
     }
     if !binary_format {
-        return decode_text(std::str::from_utf8(b).map_err(|_| invalid())?, t);
+        return decode_text_in_timezone(std::str::from_utf8(b).map_err(|_| invalid())?, t, tz);
     }
     macro_rules! number {
         ($ty:ty,$variant:ident) => {
@@ -302,16 +366,43 @@ pub fn decode_parameter(bytes: Option<&[u8]>, t: PgType, binary_format: bool) ->
         ),
         PgType::Time => {
             let v = i64::from_be_bytes(b.try_into().map_err(|_| invalid())?);
-            if !(0..86_400_000_000).contains(&v) {
+            if !(0..=86_400_000_000).contains(&v) {
                 return Err(invalid());
             }
             Cell::Time(v)
         }
-        PgType::Timestamp | PgType::Timestamptz => Cell::Timestamp(
-            i64::from_be_bytes(b.try_into().map_err(|_| invalid())?)
+        PgType::Timetz => {
+            if b.len() != 12 {
+                return Err(invalid());
+            }
+            let micros = i64::from_be_bytes(b[0..8].try_into().unwrap());
+            let west_offset = i32::from_be_bytes(b[8..12].try_into().unwrap());
+            if !(0..=86_400_000_000).contains(&micros)
+                || west_offset.abs() > 15 * 3600 + 59 * 60 + 59
+            {
+                return Err(invalid());
+            }
+            Cell::Timetz {
+                micros,
+                west_offset,
+            }
+        }
+        PgType::Timestamp => {
+            let micros = i64::from_be_bytes(b.try_into().map_err(|_| invalid())?)
                 .checked_add(PG_EPOCH_MICROS)
-                .ok_or_else(invalid)?,
-        ),
+                .ok_or_else(invalid)?;
+            let dt = chrono::DateTime::from_timestamp_micros(micros).ok_or_else(invalid)?;
+            validate_utc_year(dt)?;
+            Cell::Timestamp(micros)
+        }
+        PgType::Timestamptz => {
+            let micros = i64::from_be_bytes(b.try_into().map_err(|_| invalid())?)
+                .checked_add(PG_EPOCH_MICROS)
+                .ok_or_else(invalid)?;
+            let dt = chrono::DateTime::from_timestamp_micros(micros).ok_or_else(invalid)?;
+            validate_utc_year(dt)?;
+            Cell::Timestamp(micros)
+        }
         PgType::Interval => {
             if b.len() != 16 {
                 return Err(invalid());
@@ -346,14 +437,142 @@ fn parse_point_coord(s: &str) -> Result<f64> {
         trimmed.parse::<f64>().map_err(|_| invalid())
     }
 }
-fn decode_text(v: &str, t: PgType) -> Result<Cell> {
+fn parse_time_text(v: &str) -> Result<i64> {
+    let trimmed = v.trim();
+    if let Some(rest) = trimmed.strip_prefix("24:00:00")
+        && (rest.is_empty()
+            || (rest.starts_with('.') && rest.len() > 1 && rest[1..].bytes().all(|b| b == b'0')))
+    {
+        return Ok(86_400_000_000);
+    }
+    let t = NaiveTime::parse_from_str(trimmed, "%H:%M:%S%.f")
+        .or_else(|_| NaiveTime::parse_from_str(trimmed, "%H:%M"))
+        .map_err(|_| invalid())?;
+    Ok(t.num_seconds_from_midnight() as i64 * 1_000_000 + t.nanosecond() as i64 / 1000)
+}
+
+fn parse_hms_offset_suffix(suffix: &str) -> Option<i32> {
+    if suffix.eq_ignore_ascii_case("Z") {
+        return Some(0);
+    }
+    let (sign, rest) = if let Some(r) = suffix.strip_prefix('+') {
+        (1i32, r)
+    } else if let Some(r) = suffix.strip_prefix('-') {
+        (-1i32, r)
+    } else {
+        return None;
+    };
+    let (h, m, s) = if rest.contains(':') {
+        let mut it = rest.split(':');
+        let h = it.next()?;
+        let m = it.next()?;
+        let s = it.next();
+        if it.next().is_some() {
+            return None;
+        }
+        (h, m, s.unwrap_or("0"))
+    } else if rest.bytes().all(|b| b.is_ascii_digit()) {
+        match rest.len() {
+            1 | 2 => (rest, "0", "0"),
+            4 => (&rest[..2], &rest[2..4], "0"),
+            6 => (&rest[..2], &rest[2..4], &rest[4..6]),
+            _ => return None,
+        }
+    } else {
+        return None;
+    };
+    if !(1..=2).contains(&h.len()) || (m != "0" && m.len() != 2) || (s != "0" && s.len() != 2) {
+        return None;
+    }
+    let h: i32 = h.parse().ok()?;
+    let m: i32 = m.parse().ok()?;
+    let s: i32 = s.parse().ok()?;
+    if !(0..=15).contains(&h) || !(0..60).contains(&m) || !(0..60).contains(&s) {
+        return None;
+    }
+    let total = h * 3600 + m * 60 + s;
+    if total > 15 * 3600 + 59 * 60 + 59 {
+        return None;
+    }
+    Some(sign * total)
+}
+
+fn parse_timetz_text(v: &str, tz: &SessionTimeZone) -> Result<Cell> {
+    let trimmed = v.trim();
+    if let Some(clock) = trimmed.strip_suffix(['Z', 'z']) {
+        return Ok(Cell::Timetz {
+            micros: parse_time_text(clock)?,
+            west_offset: 0,
+        });
+    }
+    if let Some(pos) = trimmed.rfind(['+', '-'])
+        && pos > 0
+    {
+        let (clock, offset_str) = trimmed.split_at(pos);
+        if let Some(east_seconds) = parse_hms_offset_suffix(offset_str) {
+            return Ok(Cell::Timetz {
+                micros: parse_time_text(clock)?,
+                west_offset: -east_seconds,
+            });
+        }
+    }
+    let east_seconds = tz.offset_seconds_at_utc(chrono::Utc::now().timestamp_micros())?;
+    Ok(Cell::Timetz {
+        micros: parse_time_text(trimmed)?,
+        west_offset: -east_seconds,
+    })
+}
+
+fn parse_timestamptz_text(v: &str, tz: &SessionTimeZone) -> Result<i64> {
+    let trimmed = v.trim();
+    let normalized = if let Some(prefix) = trimmed.strip_suffix('z') {
+        format!("{prefix}Z")
+    } else {
+        trimmed.to_string()
+    };
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&normalized)
+        .or_else(|_| chrono::DateTime::parse_from_str(&normalized, "%Y-%m-%d %H:%M:%S%.f%#z"))
+        .or_else(|_| chrono::DateTime::parse_from_str(&normalized, "%Y-%m-%dT%H:%M:%S%.f%#z"))
+    {
+        let utc = validate_utc_year(dt.with_timezone(&chrono::Utc))?;
+        return Ok(utc.timestamp_micros());
+    }
+    if let Some(sep_idx) = normalized.find([' ', 'T'])
+        && let Some(pos) = normalized[sep_idx + 1..].rfind(['+', '-'])
+    {
+        let split_at = sep_idx + 1 + pos;
+        let (ts_part, off_part) = normalized.split_at(split_at);
+        let east_seconds = parse_hms_offset_suffix(off_part).ok_or_else(invalid)?;
+        let fixed = chrono::FixedOffset::east_opt(east_seconds).ok_or_else(invalid)?;
+        let naive = NaiveDateTime::parse_from_str(ts_part, "%Y-%m-%d %H:%M:%S%.f")
+            .or_else(|_| NaiveDateTime::parse_from_str(ts_part, "%Y-%m-%dT%H:%M:%S%.f"))
+            .map_err(|_| invalid())?;
+        let dt = chrono::TimeZone::from_local_datetime(&fixed, &naive)
+            .single()
+            .ok_or_else(invalid)?;
+        let utc = validate_utc_year(dt.with_timezone(&chrono::Utc))?;
+        return Ok(utc.timestamp_micros());
+    }
+    let naive = NaiveDateTime::parse_from_str(&normalized, "%Y-%m-%d %H:%M:%S%.f")
+        .or_else(|_| NaiveDateTime::parse_from_str(&normalized, "%Y-%m-%dT%H:%M:%S%.f"))
+        .or_else(|_| {
+            NaiveDate::parse_from_str(&normalized, "%Y-%m-%d")
+                .map(|d| d.and_hms_opt(0, 0, 0).unwrap())
+        })
+        .map_err(|_| invalid())?;
+    tz.local_naive_to_utc_micros(naive)
+}
+
+fn decode_text_in_timezone(v: &str, t: PgType, tz: &SessionTimeZone) -> Result<Cell> {
     macro_rules! parse {
         ($ty:ty,$variant:ident) => {
             Cell::$variant(v.parse::<$ty>().map_err(|_| invalid())?)
         };
     }
     Ok(match t {
-        PgType::Catalog(oid) => return catalog_codec::decode(v.as_bytes(), oid, false),
+        PgType::Catalog(oid) => {
+            return catalog_codec::decode_in_timezone(v.as_bytes(), oid, false, tz);
+        }
         PgType::Bool => Cell::Bool(match v.to_lowercase().as_str() {
             "t" | "true" | "1" => true,
             "f" | "false" | "0" => false,
@@ -387,24 +606,16 @@ fn decode_text(v: &str, t: PgType) -> Result<Cell> {
                     .map_err(|_| invalid())?,
             )
         }
-        PgType::Time => {
-            let t = NaiveTime::parse_from_str(v, "%H:%M:%S%.f").map_err(|_| invalid())?;
-            Cell::Time(
-                t.num_seconds_from_midnight() as i64 * 1_000_000 + t.nanosecond() as i64 / 1000,
-            )
+        PgType::Time => Cell::Time(parse_time_text(v)?),
+        PgType::Timetz => parse_timetz_text(v, tz)?,
+        PgType::Timestamp => {
+            let dt = NaiveDateTime::parse_from_str(v, "%Y-%m-%d %H:%M:%S%.f")
+                .map_err(|_| invalid())?
+                .and_utc();
+            validate_utc_year(dt)?;
+            Cell::Timestamp(dt.timestamp_micros())
         }
-        PgType::Timestamp => Cell::Timestamp(
-            NaiveDateTime::parse_from_str(v, "%Y-%m-%d %H:%M:%S%.f")
-                .map_err(|_| invalid())?
-                .and_utc()
-                .timestamp_micros(),
-        ),
-        PgType::Timestamptz => Cell::Timestamp(
-            chrono::DateTime::parse_from_rfc3339(v)
-                .or_else(|_| chrono::DateTime::parse_from_str(v, "%Y-%m-%d %H:%M:%S%.f%#z"))
-                .map_err(|_| invalid())?
-                .timestamp_micros(),
-        ),
+        PgType::Timestamptz => Cell::Timestamp(parse_timestamptz_text(v, tz)?),
         PgType::Interval => {
             if v.trim().is_empty() {
                 return Err(invalid());
@@ -850,6 +1061,112 @@ mod tests {
         assert_eq!(text(&decoded).unwrap(), "(1.5,-2.25)");
         let decoded_text = decode_parameter(Some(b"(1.5, -2.25)"), PgType::Point, false).unwrap();
         assert_eq!(text(&decoded_text).unwrap(), "(1.5,-2.25)");
+    }
+
+    #[test]
+    fn timezone_temporal_codecs_24h_lowercase_z_and_timetz() {
+        let sh = parse_session_timezone("Asia/Shanghai").unwrap();
+        let kolkata = parse_session_timezone("Asia/Kolkata").unwrap();
+        let instant = Cell::Timestamp(
+            NaiveDate::from_ymd_opt(2026, 6, 15)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_utc()
+                .timestamp_micros(),
+        );
+        assert_eq!(
+            text_value_in_timezone(&instant, PgType::Timestamptz, &sh)
+                .unwrap()
+                .as_deref(),
+            Some("2026-06-15 08:00:00+08")
+        );
+        assert_eq!(
+            text_value_in_timezone(&instant, PgType::Timestamptz, &kolkata)
+                .unwrap()
+                .as_deref(),
+            Some("2026-06-15 05:30:00+05:30")
+        );
+
+        // Bare timestamptz interpreted in active SessionTimeZone, lowercase 'z' normalized
+        let bare = decode_parameter_in_timezone(
+            Some(b"2026-06-15 08:00:00"),
+            PgType::Timestamptz,
+            false,
+            &sh,
+        )
+        .unwrap();
+        assert_eq!(
+            text_value_in_timezone(&bare, PgType::Timestamptz, &SessionTimeZone::utc())
+                .unwrap()
+                .as_deref(),
+            Some("2026-06-15 00:00:00+00")
+        );
+        let lower_z = decode_parameter_in_timezone(
+            Some(b"2026-06-15T00:00:00z"),
+            PgType::Timestamptz,
+            false,
+            &sh,
+        )
+        .unwrap();
+        assert_eq!(
+            text_value_in_timezone(&lower_z, PgType::Timestamptz, &SessionTimeZone::utc())
+                .unwrap()
+                .as_deref(),
+            Some("2026-06-15 00:00:00+00")
+        );
+
+        // Year [1..9999] enforced
+        assert_eq!(
+            decode_parameter(Some(b"0000-12-31 23:00:00+00"), PgType::Timestamptz, false)
+                .unwrap_err()
+                .sqlstate,
+            "22008"
+        );
+        assert_eq!(
+            decode_parameter(Some(b"9999-12-31 23:00:00-02"), PgType::Timestamptz, false)
+                .unwrap_err()
+                .sqlstate,
+            "22008"
+        );
+
+        // TIME 24:00:00 text & binary round-trip
+        let t24_text = decode_parameter(Some(b"24:00:00"), PgType::Time, false).unwrap();
+        assert!(matches!(t24_text, Cell::Time(86_400_000_000)));
+        assert_eq!(text(&t24_text).unwrap(), "24:00:00");
+        let t24_wire = binary(&t24_text, PgType::Time).unwrap();
+        assert!(matches!(
+            decode_parameter(Some(&t24_wire), PgType::Time, true).unwrap(),
+            Cell::Time(86_400_000_000)
+        ));
+        assert!(decode_parameter(Some(b"24:00:01"), PgType::Time, false).is_err());
+
+        // TIMETZ text & binary round-trip
+        let tz_cell = decode_parameter_in_timezone(
+            Some(b"12:34:56.123456+08:00"),
+            PgType::Timetz,
+            false,
+            &SessionTimeZone::utc(),
+        )
+        .unwrap();
+        assert!(matches!(
+            tz_cell,
+            Cell::Timetz {
+                micros: 45_296_123_456,
+                west_offset: -28_800
+            }
+        ));
+        assert_eq!(
+            text_value(&tz_cell, PgType::Timetz).unwrap().as_deref(),
+            Some("12:34:56.123456+08")
+        );
+        let tz_wire = binary(&tz_cell, PgType::Timetz).unwrap();
+        assert_eq!(tz_wire.len(), 12);
+        let tz_dec = decode_parameter(Some(&tz_wire), PgType::Timetz, true).unwrap();
+        assert_eq!(
+            text_value(&tz_dec, PgType::Timetz).unwrap().as_deref(),
+            Some("12:34:56.123456+08")
+        );
     }
 }
 

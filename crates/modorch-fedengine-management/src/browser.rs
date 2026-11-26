@@ -2,7 +2,7 @@
 use crate::browser_query::{self, QueryResult};
 use axum::{
     body::Bytes,
-    http::{Method, Uri},
+    http::{HeaderMap, Method, Uri},
 };
 use modorch::{prelude::*, *};
 use modorch_fedengine_catalog::{CATALOG_TOPIC, CatalogReply, CatalogRequest};
@@ -63,6 +63,51 @@ struct Parameters {
     #[serde(default)]
     system: bool,
 }
+#[derive(Deserialize)]
+struct TimeZoneQuery {
+    #[serde(default)]
+    timezone: Option<String>,
+}
+
+fn resolve_request_timezone(
+    uri: &Uri,
+    headers: &HeaderMap,
+) -> Result<modorch_fedengine_pg_compat::SessionTimeZone> {
+    let query_tz = if uri.query().is_some() {
+        axum::extract::Query::<TimeZoneQuery>::try_from_uri(uri)
+            .map_err(|_| EngineError::config("invalid timezone query parameter"))?
+            .0
+            .timezone
+    } else {
+        None
+    };
+    let header_tz = match headers.get("x-fedquery-timezone") {
+        Some(value) => Some(
+            value
+                .to_str()
+                .map_err(|_| EngineError::config("invalid X-FedQuery-TimeZone header"))?
+                .to_string(),
+        ),
+        None => None,
+    };
+    match (header_tz, query_tz) {
+        (Some(h), Some(q)) => {
+            let h_tz = modorch_fedengine_pg_compat::parse_session_timezone(&h)?;
+            let q_tz = modorch_fedengine_pg_compat::parse_session_timezone(&q)?;
+            if h_tz != q_tz {
+                return Err(EngineError::config(
+                    "conflicting X-FedQuery-TimeZone header and timezone query parameter",
+                ));
+            }
+            Ok(h_tz)
+        }
+        (Some(raw), None) | (None, Some(raw)) => {
+            modorch_fedengine_pg_compat::parse_session_timezone(&raw)
+        }
+        (None, None) => Ok(modorch_fedengine_pg_compat::SessionTimeZone::utc()),
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Start {
@@ -161,7 +206,13 @@ impl Browser {
             stamp: current,
         })
     }
-    pub async fn route(&self, method: &Method, uri: &Uri, body: &Bytes) -> Result<Value> {
+    pub async fn route(
+        &self,
+        method: &Method,
+        uri: &Uri,
+        headers: &HeaderMap,
+        body: &Bytes,
+    ) -> Result<Value> {
         let route: Vec<_> = uri
             .path()
             .trim_end_matches('/')
@@ -170,9 +221,10 @@ impl Browser {
             .collect();
         match route.as_slice() {
             ["queries", id] if *method == Method::POST => {
+                let tz = resolve_request_timezone(uri, headers)?;
                 let input: Start = serde_json::from_slice(body)
                     .map_err(|_| EngineError::config("invalid query request"))?;
-                self.start(id, input).await
+                self.start(id, input, tz).await
             }
             ["queries", id] if *method == Method::GET => self.job(id, false),
             ["queries", id, "cancel"] if *method == Method::POST => self.job(id, true),
@@ -209,6 +261,7 @@ impl Browser {
             self.timeout(),
             CancellationToken::new(),
             limit,
+            modorch_fedengine_pg_compat::SessionTimeZone::utc(),
         )
         .await
     }
@@ -507,7 +560,12 @@ impl Browser {
         };
         Ok(json!({"stamp":ctx.stamp,"objects":objects,"offset":p.offset,"has_more":more}))
     }
-    async fn start(&self, id: &str, input: Start) -> Result<Value> {
+    async fn start(
+        &self,
+        id: &str,
+        input: Start,
+        timezone: modorch_fedengine_pg_compat::SessionTimeZone,
+    ) -> Result<Value> {
         uuid::Uuid::parse_str(id).map_err(|_| EngineError::config("query id must be UUID"))?;
         let now = chrono::Utc::now().timestamp();
         if input.issued_at < now - RETENTION_SECONDS || input.issued_at > now + 30 {
@@ -516,7 +574,7 @@ impl Browser {
             ));
         }
         browser_query::read_only(&input.sql)?;
-        let digest = Sha256::digest(serde_json::to_vec(&json!({"database":input.database,"oid":input.oid,"revision":input.revision,"sql":input.sql,"issued_at":input.issued_at})).unwrap()).to_vec();
+        let digest = Sha256::digest(serde_json::to_vec(&json!({"database":input.database,"oid":input.oid,"revision":input.revision,"sql":input.sql,"issued_at":input.issued_at,"timezone":timezone.display})).unwrap()).to_vec();
         {
             let mut jobs = self.jobs.lock().unwrap();
             jobs.retain(|_, j| j.running || j.expires >= now);
@@ -567,7 +625,7 @@ impl Browser {
         let key = id.to_string();
         let submitted = self.tasks.spawn(move |shutdown| async move {
             let started = Instant::now();
-            let execution = browser_query::execute(&browser.hub, &ctx.database, input.sql, browser.timeout(), cancel.clone(), browser_query::ROW_LIMIT);
+            let execution = browser_query::execute(&browser.hub, &ctx.database, input.sql, browser.timeout(), cancel.clone(), browser_query::ROW_LIMIT, timezone);
             tokio::pin!(execution);
             let result = tokio::select! { r=&mut execution => r, _=shutdown.cancelled()=> {cancel.cancel(); execution.await} };
             let mut jobs=browser.jobs.lock().unwrap();

@@ -13,6 +13,17 @@ pub fn rewrite(
     sources: &BTreeSet<DataSourceId>,
     definitions: &[DataSourceDefinition],
 ) -> Result<String> {
+    rewrite_with_timezone(sql, sources, definitions, "UTC")
+}
+
+/// Timezone-aware pushdown rewriter. Single-source full-query pushdown is bypassed when the
+/// active session timezone is non-UTC or the AST uses `AT TIME ZONE` / `timezone(...)`.
+pub fn rewrite_with_timezone(
+    sql: &str,
+    sources: &BTreeSet<DataSourceId>,
+    definitions: &[DataSourceDefinition],
+    session_timezone: &str,
+) -> Result<String> {
     let mut statements = Analyzer::parse(sql)?;
     if statements.len() != 1 {
         return Ok(sql.to_string());
@@ -34,7 +45,24 @@ pub fn rewrite(
         ControlFlow::Continue(())
     })
     .is_break();
+    let has_timezone_fn = visit_expressions(query.as_ref(), |expr| match expr {
+        Expr::AtTimeZone { .. } => ControlFlow::Break(()),
+        Expr::Function(f)
+            if f.name
+                .0
+                .last()
+                .and_then(|p| p.as_ident())
+                .is_some_and(|i| i.value.eq_ignore_ascii_case("timezone")) =>
+        {
+            ControlFlow::Break(())
+        }
+        _ => ControlFlow::Continue(()),
+    })
+    .is_break();
+    let non_utc_session = !session_timezone.trim().eq_ignore_ascii_case("UTC");
     if !has_param_or_decode
+        && !non_utc_session
+        && !has_timezone_fn
         && sources.len() == 1
         && let Some(id) = sources.iter().next()
         && let Some(source) = definitions.iter().find(|d| &d.id == id)
@@ -941,5 +969,60 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.sqlstate, "0A000");
+    }
+
+    #[test]
+    fn non_utc_session_or_at_time_zone_bypasses_single_source_pushdown() {
+        let defs = vec![
+            source("gp1", DataSourceKind::Greenplum, "gp_src"),
+            source("my1", DataSourceKind::Mysql, "my_src"),
+        ];
+        let mut gp = BTreeSet::new();
+        gp.insert(DataSourceId("gp1".into()));
+        let mut my = BTreeSet::new();
+        my.insert(DataSourceId("my1".into()));
+
+        let gp_plain =
+            "SELECT gp_src.public.t.ts AT TIME ZONE 'Asia/Shanghai' FROM gp_src.public.t";
+        let gp_utc = rewrite_with_timezone(
+            "SELECT gp_src.public.t.id FROM gp_src.public.t",
+            &gp,
+            &defs,
+            "UTC",
+        )
+        .unwrap();
+        assert!(
+            gp_utc.starts_with("SELECT * FROM postgres_query('gp_src',"),
+            "{gp_utc}"
+        );
+        let bypassed_gp = rewrite_with_timezone(gp_plain, &gp, &defs, "Asia/Shanghai").unwrap();
+        assert!(
+            bypassed_gp.contains("postgres_query('gp_src', 'SELECT * FROM \"public\".\"t\"')")
+                && bypassed_gp.contains("AT TIME ZONE 'Asia/Shanghai'"),
+            "{bypassed_gp}"
+        );
+
+        let my_plain = "SELECT my_src.app.t.id FROM my_src.app.t";
+        assert!(
+            rewrite_with_timezone(my_plain, &my, &defs, "UTC")
+                .unwrap()
+                .contains("mysql_query('my_src'")
+        );
+        assert_eq!(
+            rewrite_with_timezone(my_plain, &my, &defs, "Asia/Shanghai").unwrap(),
+            my_plain
+        );
+
+        let tz_sql = "SELECT timezone('Etc/GMT-8', my_src.app.t.ts) FROM my_src.app.t";
+        assert_eq!(
+            rewrite_with_timezone(tz_sql, &my, &defs, "UTC").unwrap(),
+            tz_sql
+        );
+
+        let at_sql = "SELECT my_src.app.t.ts AT TIME ZONE 'Etc/GMT-8' FROM my_src.app.t";
+        assert_eq!(
+            rewrite_with_timezone(at_sql, &my, &defs, "UTC").unwrap(),
+            at_sql
+        );
     }
 }

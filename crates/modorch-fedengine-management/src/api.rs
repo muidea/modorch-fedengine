@@ -258,7 +258,7 @@ async fn dispatch(
             .into_response();
     }
     if uri.path().starts_with("/api/v1/browser/") {
-        return match state.browser.route(&method, &uri, &body).await {
+        return match state.browser.route(&method, &uri, &headers, &body).await {
             Ok(value) => (StatusCode::OK, axum::Json(value)).into_response(),
             Err(error) => error_response(error),
         };

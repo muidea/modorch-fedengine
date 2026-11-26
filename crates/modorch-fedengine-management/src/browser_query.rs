@@ -78,14 +78,20 @@ pub(crate) async fn execute(
     timeout: Duration,
     cancel: CancellationToken,
     row_limit: usize,
+    timezone: modorch_fedengine_pg_compat::SessionTimeZone,
 ) -> Result<QueryResult> {
     read_only(&sql)?;
     let _guard = CancelOnDrop(cancel.clone());
     let started = Instant::now();
     let deadline = started + timeout;
+    let mut settings = std::collections::BTreeMap::new();
+    if !timezone.is_utc {
+        settings.insert("timezone".into(), timezone.display.clone());
+    }
     let session = SessionContext {
         database: database.config.name.clone(),
         database_oid: Some(database.oid),
+        settings,
         ..Default::default()
     };
     let mut request = QueryRequest {
@@ -177,7 +183,11 @@ pub(crate) async fn execute(
                         .iter()
                         .zip(&accepted.columns)
                         .map(|(cell, col)| {
-                            modorch_fedengine_pg_compat::text_value(cell, col.data_type)
+                            modorch_fedengine_pg_compat::text_value_in_timezone(
+                                cell,
+                                col.data_type,
+                                &timezone,
+                            )
                         })
                         .collect::<Result<Vec<_>>>()?;
                     bytes += serde_json::to_vec(&row)

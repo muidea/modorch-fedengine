@@ -76,6 +76,9 @@ impl ServerParameterProvider for Parameters {
             self.search_path.lock().unwrap().clone(),
         );
         values.insert("DateStyle".into(), "ISO, YMD".into());
+        if let Some(tz) = client.metadata().get("fedengine_timezone") {
+            values.insert("TimeZone".into(), tz.clone());
+        }
         Some(values)
     }
 }
@@ -163,9 +166,27 @@ impl Authentication {
                     .filter(|s| !s.is_empty())
                     .cloned()
                     .unwrap_or(principal);
+                let startup_tz = if let Some((_, raw_tz)) = startup
+                    .parameters
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("timezone"))
+                {
+                    Some(
+                        modorch_fedengine_pg_compat::parse_session_timezone(raw_tz)
+                            .map_err(pg_error)?
+                            .display,
+                    )
+                } else {
+                    None
+                };
                 startup.parameters.insert("database".into(), database);
                 protocol_negotiation(client, &startup).await?;
                 save_startup_parameters_to_metadata(client, &startup);
+                if let Some(tz) = startup_tz {
+                    client
+                        .metadata_mut()
+                        .insert("fedengine_timezone".into(), tz);
+                }
                 self.driver
                     .begin_authentication(client, self.mechanisms.create())
                     .await?;

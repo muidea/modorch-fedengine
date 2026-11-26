@@ -38,6 +38,7 @@ pub enum PgType {
     Bytea,
     Date,
     Time,
+    Timetz,
     Timestamp,
     Timestamptz,
     Interval,
@@ -62,6 +63,7 @@ impl PgType {
             Self::Catalog(1115) => "TIMESTAMP[]",
             Self::Catalog(1182) => "DATE[]",
             Self::Catalog(1183) => "TIME[]",
+            Self::Catalog(1270) => "TIMETZ[]",
             Self::Catalog(1185) => "TIMESTAMPTZ[]",
             Self::Catalog(1187) => "INTERVAL[]",
             Self::Catalog(1231) => "DECIMAL(38,10)[]",
@@ -79,6 +81,7 @@ impl PgType {
             Self::Bytea => "BLOB",
             Self::Date => "DATE",
             Self::Time => "TIME",
+            Self::Timetz => "TIMETZ",
             Self::Timestamp => "TIMESTAMP",
             Self::Timestamptz => "TIMESTAMPTZ",
             Self::Interval => "INTERVAL",
@@ -101,6 +104,7 @@ impl PgType {
             Self::Bytea => 17,
             Self::Date => 1082,
             Self::Time => 1083,
+            Self::Timetz => 1266,
             Self::Timestamp => 1114,
             Self::Timestamptz => 1184,
             Self::Interval => 1186,
@@ -113,7 +117,9 @@ impl PgType {
         Some(match oid {
             18 | 19 | 22 | 24 | 26 | 28 | 29 | 30 | 194 | 199 | 1000 | 1001 | 1002 | 1003
             | 1005 | 1007 | 1009 | 1014 | 1015 | 1016 | 1017 | 1021 | 1022 | 1028 | 1034 | 1115
-            | 1182 | 1183 | 1185 | 1187 | 1231 | 2205 | 2206 | 2277 | 2951 => Self::Catalog(oid),
+            | 1182 | 1183 | 1185 | 1187 | 1231 | 1270 | 2205 | 2206 | 2277 | 2951 => {
+                Self::Catalog(oid)
+            }
             16 => Self::Bool,
             21 => Self::Int2,
             23 => Self::Int4,
@@ -125,6 +131,7 @@ impl PgType {
             17 => Self::Bytea,
             1082 => Self::Date,
             1083 => Self::Time,
+            1266 => Self::Timetz,
             1114 => Self::Timestamp,
             1184 => Self::Timestamptz,
             1186 => Self::Interval,
@@ -159,6 +166,10 @@ pub enum Cell {
     Numeric(String),
     Date(i32),
     Time(i64),
+    Timetz {
+        micros: i64,
+        west_offset: i32,
+    },
     Timestamp(i64),
     Interval {
         months: i32,
@@ -248,6 +259,7 @@ pub enum QueryReply {
 }
 pub struct AcceptedExecution {
     pub notices: Vec<(String, String)>,
+    pub parameter_status: Vec<(String, String)>,
     pub columns: Vec<ColumnMeta>,
     pub kind: StatementKind,
     stream: Mutex<Option<ExecutionStream>>,
@@ -256,6 +268,7 @@ impl AcceptedExecution {
     pub fn new(columns: Vec<ColumnMeta>, kind: StatementKind, stream: ExecutionStream) -> Self {
         Self {
             notices: vec![],
+            parameter_status: vec![],
             columns,
             kind,
             stream: Mutex::new(Some(stream)),
@@ -386,6 +399,7 @@ pub struct ExecuteRequest {
     pub returning: Option<ReturningPlan>,
     pub guarded_mutation: Option<GuardedMutationPlan>,
     pub guarded_ddl: Option<GuardedDdlPlan>,
+    pub session_timezone: String,
 }
 
 #[derive(Debug, Clone)]

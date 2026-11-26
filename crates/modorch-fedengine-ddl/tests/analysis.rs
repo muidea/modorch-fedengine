@@ -1753,3 +1753,50 @@ fn fqe_9_00_ddl_precision_gates_widening_and_dml_casts() {
     assert!(validate_kingbase_text_literals("INSERT INTO t VALUES ('')", false, true).is_err());
     assert!(validate_kingbase_text_literals("INSERT INTO t VALUES ('中文')", true, false).is_err());
 }
+
+#[test]
+fn at_time_zone_and_timezone_fn_and_timetz_casts_rewrite_cleanly() {
+    let a = analyzer();
+    let res1 = a
+        .analyze("SELECT '2026-06-15 00:00:00+00'::TIMESTAMPTZ AT TIME ZONE '+08:00'")
+        .unwrap();
+    assert!(
+        res1.sql.contains("AT TIME ZONE 'Etc/GMT-8'"),
+        "{}",
+        res1.sql
+    );
+
+    let res2 = a
+        .analyze("SELECT pg_catalog.timezone('UTC+8', '2026-06-15 00:00:00+00'::TIMESTAMPTZ)")
+        .unwrap();
+    assert!(res2.sql.contains("timezone('Etc/GMT+8'"), "{}", res2.sql);
+    assert!(!res2.sql.contains("pg_catalog.timezone"), "{}", res2.sql);
+
+    let res3 = a
+        .analyze("SELECT '2026-06-15 00:00:00+00'::TIMESTAMPTZ AT TIME ZONE INTERVAL '+08:00'")
+        .unwrap();
+    assert!(
+        res3.sql.contains("AT TIME ZONE 'Etc/GMT-8'"),
+        "{}",
+        res3.sql
+    );
+
+    let res4 = a
+        .analyze("SELECT '12:34:56+08:00'::TIMETZ, '12:34:56+08:00'::pg_catalog.timetz")
+        .unwrap();
+    assert!(res4.sql.contains("TIMETZ"), "{}", res4.sql);
+    assert!(!res4.sql.contains("pg_catalog.timetz"), "{}", res4.sql);
+
+    assert_eq!(
+        a.analyze("SELECT '2026-06-15 00:00:00+00'::TIMESTAMPTZ AT TIME ZONE '+05:30'")
+            .unwrap_err()
+            .sqlstate,
+        "0A000"
+    );
+    assert_eq!(
+        a.analyze("SELECT timezone(INTERVAL '1 day', '2026-06-15 00:00:00+00'::TIMESTAMPTZ)")
+            .unwrap_err()
+            .sqlstate,
+        "22023"
+    );
+}

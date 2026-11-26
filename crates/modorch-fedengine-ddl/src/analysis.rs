@@ -42,6 +42,95 @@ pub struct Analyzer {
     pub sources: Vec<DataSourceDefinition>,
     pub indexes: Vec<IndexOwner>,
 }
+fn split_pg_fallback_statements(sql: &str) -> Result<Option<Vec<String>>> {
+    if modorch_fedengine_pg_compat::parse_special_timezone_command(sql).is_some() {
+        return Ok(Some(vec![
+            sql.trim().trim_end_matches(';').trim().to_string(),
+        ]));
+    }
+    let Ok(tokens) = Tokenizer::new(&PostgreSqlDialect {}, sql).tokenize_with_location() else {
+        return Ok(None);
+    };
+    let semi_locations: Vec<(u64, u64)> = tokens
+        .iter()
+        .filter(|t| matches!(t.token, Token::SemiColon))
+        .map(|t| (t.span.start.line, t.span.start.column))
+        .collect();
+    if semi_locations.is_empty() {
+        return Ok(None);
+    }
+
+    let mut split_offsets = Vec::with_capacity(semi_locations.len());
+    let mut loc_idx = 0usize;
+    let mut line = 1u64;
+    let mut col = 1u64;
+    for (byte_idx, ch) in sql.char_indices() {
+        if loc_idx < semi_locations.len() && (line, col) == semi_locations[loc_idx] {
+            split_offsets.push(byte_idx);
+            loc_idx += 1;
+        }
+        if ch == '\n' {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+    }
+    if loc_idx != semi_locations.len() {
+        return Ok(None);
+    }
+
+    let mut raw_chunks = Vec::new();
+    let mut start = 0usize;
+    for semi_idx in split_offsets {
+        let trimmed = sql[start..semi_idx].trim();
+        if !trimmed.is_empty() {
+            raw_chunks.push(trimmed.to_string());
+        }
+        start = semi_idx + 1;
+    }
+    let tail = sql[start..].trim();
+    if !tail.is_empty() {
+        raw_chunks.push(tail.to_string());
+    }
+    if raw_chunks.is_empty() {
+        return Ok(None);
+    }
+
+    let multi = raw_chunks.len() > 1;
+    let mut out = Vec::with_capacity(raw_chunks.len());
+    let mut has_special = false;
+    for chunk in raw_chunks {
+        if modorch_fedengine_pg_compat::parse_special_timezone_command(&chunk).is_some() {
+            has_special = true;
+            out.push(chunk);
+        } else if let Ok(stmts) = Parser::parse_sql(&PostgreSqlDialect {}, &chunk)
+            && stmts.len() == 1
+        {
+            match &stmts[0] {
+                Statement::Query(_) | Statement::Set(_) | Statement::Reset(_) => {
+                    out.push(stmts[0].to_string());
+                }
+                _ if multi => {
+                    return Err(EngineError::unsupported(
+                        "multi-statement messages containing writes, DDL or transaction commands are disabled",
+                    ));
+                }
+                _ => return Ok(None),
+            }
+        } else {
+            return Ok(None);
+        }
+    }
+    if !has_special {
+        return Ok(None);
+    }
+    if out.len() > 64 {
+        return Err(EngineError::new("54000", "too many statements"));
+    }
+    Ok(Some(out))
+}
+
 impl Analyzer {
     pub fn parse(sql: &str) -> Result<Vec<Statement>> {
         if sql.len() > 1024 * 1024 {
@@ -66,10 +155,26 @@ impl Analyzer {
         let statements = match Self::parse(sql) {
             Ok(s) => s,
             Err(err) => {
-                if parse_reindex_index(sql)?.is_some() {
+                if let Ok(pg_stmts) = Parser::parse_sql(&PostgreSqlDialect {}, sql)
+                    && !pg_stmts.is_empty()
+                    && pg_stmts
+                        .iter()
+                        .any(|s| matches!(s, Statement::Set(_) | Statement::Reset(_)))
+                    && pg_stmts.iter().all(|s| {
+                        matches!(
+                            s,
+                            Statement::Query(_) | Statement::Set(_) | Statement::Reset(_)
+                        )
+                    })
+                {
+                    pg_stmts
+                } else if let Some(split) = split_pg_fallback_statements(sql)? {
+                    return Ok(split);
+                } else if parse_reindex_index(sql)?.is_some() {
                     return Ok(vec![sql.trim().trim_end_matches(';').trim().to_string()]);
+                } else {
+                    return Err(err);
                 }
-                return Err(err);
             }
         };
         if statements.len() > 64 {

@@ -4,6 +4,8 @@ use modorch_fedengine_pg_compat::pg_error;
 use pgwire::{api::results::Tag, error::PgWireResult};
 use std::collections::VecDeque;
 pub(super) struct Cursor {
+    pub(super) parameter_status: Vec<(String, String)>,
+    pub(super) timezone: modorch_fedengine_pg_compat::SessionTimeZone,
     pub(super) notices: Vec<(String, String)>,
     pub(super) columns: Vec<ColumnMeta>,
     pub(super) stream: Option<ExecutionStream>,

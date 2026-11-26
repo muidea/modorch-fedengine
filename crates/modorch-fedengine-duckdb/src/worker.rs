@@ -225,6 +225,35 @@ pub(super) fn run(
         if r.cancel.is_cancelled() {
             return Err(EngineError::new("57014", "query canceled before streaming"));
         }
+        let has_timetz = described_columns
+            .iter()
+            .any(|col| matches!(col.data_type, PgType::Timetz | PgType::Catalog(1270)));
+        let mut exec_stmt = if has_timetz {
+            let col_aliases: Vec<String> = (0..described_columns.len())
+                .map(|i| format!("__fed_tz_c{i}"))
+                .collect();
+            let proj: Vec<String> = described_columns
+                .iter()
+                .enumerate()
+                .map(|(i, col)| {
+                    let alias = &col_aliases[i];
+                    match col.data_type {
+                        PgType::Timetz => format!("CAST({alias} AS VARCHAR) AS {alias}"),
+                        PgType::Catalog(1270) => format!("CAST({alias} AS VARCHAR[]) AS {alias}"),
+                        _ => alias.clone(),
+                    }
+                })
+                .collect();
+            let wrapped_sql = format!(
+                "SELECT {} FROM ({sql}) AS __fed_tz({})",
+                proj.join(", "),
+                col_aliases.join(", ")
+            );
+            drop(stmt);
+            conn.prepare(&wrapped_sql).map_err(engine_error)?
+        } else {
+            stmt
+        };
         let columns = described_columns;
         let row_types: Vec<_> = columns.iter().map(|c| c.data_type).collect();
         let regclass_names = if row_types.contains(&PgType::Catalog(2205)) {
@@ -236,7 +265,7 @@ pub(super) fn run(
         } else {
             Default::default()
         };
-        let mut stream = stmt
+        let mut stream = exec_stmt
             .stream_arrow(params_from_iter(values.iter()))
             .map_err(engine_error)?;
         let _ = metadata.take().unwrap().send(Ok(Metadata {

@@ -181,6 +181,7 @@ impl QueryHandler {
                 .map(|(i, t)| (i + 1, t))
                 .collect(),
         };
+        let session_tz = modorch_fedengine_pg_compat::active_timezone(&r.session)?;
         let business_sql = match modorch_fedengine_pg_compat::plan_with_parameters(
             &r.sql,
             &r.session,
@@ -246,6 +247,7 @@ impl QueryHandler {
                             returning: None,
                             guarded_mutation: None,
                             guarded_ddl: None,
+                            session_timezone: session_tz.duckdb_zone.clone(),
                         },
                         Box::new((
                             self.runtime.acquire().map_err(message_error)?,
@@ -562,7 +564,12 @@ impl QueryHandler {
                 .unwrap();
             index.duckdb_adapter_sql(source.kind)?
         } else if analysis.kind == Kind::Query {
-            modorch_fedengine_ddl::rewrite_pushdown(&analysis.sql, &analysis.sources, &definitions)?
+            modorch_fedengine_ddl::rewrite_pushdown_with_timezone(
+                &analysis.sql,
+                &analysis.sources,
+                &definitions,
+                &session_tz.duckdb_zone,
+            )?
         } else {
             analysis.sql
         };
@@ -638,6 +645,7 @@ impl QueryHandler {
                     returning,
                     guarded_mutation,
                     guarded_ddl,
+                    session_timezone: session_tz.duckdb_zone,
                 },
                 ownership,
             )
@@ -681,8 +689,9 @@ fn hint_type(t: &str) -> Option<PgType> {
             "DOUBLE" | "DOUBLE PRECISION" | "FLOAT8" => 1022,
             "TEXT" | "VARCHAR" | "CHARACTER VARYING" | "CHAR" | "BPCHAR" | "NAME" => 1009,
             "DATE" => 1182,
-            "TIME" => 1183,
-            "TIMESTAMP" => 1115,
+            "TIME" | "TIME WITHOUT TIME ZONE" => 1183,
+            "TIMETZ" | "TIME WITH TIME ZONE" => 1270,
+            "TIMESTAMP" | "TIMESTAMP WITHOUT TIME ZONE" => 1115,
             "TIMESTAMPTZ" | "TIMESTAMP WITH TIME ZONE" => 1185,
             "INTERVAL" => 1187,
             "UUID" => 2951,
@@ -693,7 +702,16 @@ fn hint_type(t: &str) -> Option<PgType> {
         return Some(PgType::Catalog(oid));
     }
     let base = normalized.split('(').next().unwrap().trim();
-    Some(match base {
+    let suffix = normalized
+        .find('(')
+        .and_then(|_| normalized.split_once(')').map(|(_, s)| s.trim()))
+        .unwrap_or("");
+    let canonical = if suffix.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base} {suffix}")
+    };
+    Some(match canonical.as_str() {
         "INT" | "INTEGER" | "INT4" => PgType::Int4,
         "BIGINT" | "INT8" => PgType::Int8,
         "SMALLINT" | "INT2" => PgType::Int2,
@@ -704,6 +722,7 @@ fn hint_type(t: &str) -> Option<PgType> {
         "BLOB" | "BYTEA" => PgType::Bytea,
         "DATE" => PgType::Date,
         "TIME" | "TIME WITHOUT TIME ZONE" => PgType::Time,
+        "TIMETZ" | "TIME WITH TIME ZONE" => PgType::Timetz,
         "TIMESTAMP" | "TIMESTAMP WITHOUT TIME ZONE" => PgType::Timestamp,
         "TIMESTAMPTZ" | "TIMESTAMP WITH TIME ZONE" => PgType::Timestamptz,
         "INTERVAL" => PgType::Interval,

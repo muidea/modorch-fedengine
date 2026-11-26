@@ -469,6 +469,21 @@ impl VisitorMut for Binder<'_> {
             }
             unqualify_pg_catalog_json(data_type);
         }
+        if let Expr::AtTimeZone { time_zone, .. } = e
+            && let Some((raw, is_interval)) =
+                modorch_fedengine_pg_compat::timezone::extract_interval_or_string_literal(time_zone)
+        {
+            match modorch_fedengine_pg_compat::parse_timezone_literal_for_at_time_zone(
+                &raw,
+                is_interval,
+            ) {
+                Ok(Some(duckdb_zone)) => {
+                    **time_zone = Expr::Value(Value::SingleQuotedString(duckdb_zone).into());
+                }
+                Ok(None) => {}
+                Err(err) => return ControlFlow::Break(err),
+            }
+        }
         if self.analyzer.namespace.is_some()
             && let Expr::CompoundIdentifier(parts) = e
         {
@@ -493,6 +508,13 @@ impl VisitorMut for Binder<'_> {
             }
         }
         if let Expr::Function(f) = e {
+            if let Ok(parts) = Analyzer::parts(&f.name)
+                && parts.len() == 2
+                && parts[0] == "pg_catalog"
+                && parts[1] == "timezone"
+            {
+                f.name = ObjectName(vec![ObjectNamePart::Identifier(Ident::new("timezone"))]);
+            }
             let name = f.name.to_string().to_lowercase();
             const ALLOWED: &[&str] = &[
                 "decode",
@@ -527,6 +549,7 @@ impl VisitorMut for Binder<'_> {
                 "now",
                 "current_timestamp",
                 "current_date",
+                "timezone",
                 "row_number",
                 "rank",
                 "dense_rank",
@@ -553,6 +576,27 @@ impl VisitorMut for Binder<'_> {
                 return ControlFlow::Break(EngineError::denied(
                     "function is not in the safe function whitelist",
                 ));
+            }
+            if name == "timezone"
+                && let FunctionArguments::List(arg_list) = &mut f.args
+                && arg_list.args.len() == 2
+                && let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(tz_expr))) =
+                    arg_list.args.first_mut()
+                && let Some((raw, is_interval)) =
+                    modorch_fedengine_pg_compat::timezone::extract_interval_or_string_literal(
+                        tz_expr,
+                    )
+            {
+                match modorch_fedengine_pg_compat::parse_timezone_literal_for_at_time_zone(
+                    &raw,
+                    is_interval,
+                ) {
+                    Ok(Some(duckdb_zone)) => {
+                        *tz_expr = Expr::Value(Value::SingleQuotedString(duckdb_zone).into());
+                    }
+                    Ok(None) => {}
+                    Err(err) => return ControlFlow::Break(err),
+                }
             }
         }
         ControlFlow::Continue(())
@@ -667,6 +711,14 @@ fn unqualify_pg_catalog_json(ty: &mut DataType) {
         {
             *ty = DataType::JSON;
         }
+        DataType::Custom(name, modifiers)
+            if modifiers.is_empty()
+                && Analyzer::parts(name).is_ok_and(|parts| {
+                    parts.len() == 2 && parts[0] == "pg_catalog" && parts[1] == "timetz"
+                }) =>
+        {
+            *ty = DataType::Time(None, TimezoneInfo::WithTimeZone);
+        }
         DataType::Array(ArrayElemTypeDef::AngleBracket(inner))
         | DataType::Array(ArrayElemTypeDef::SquareBracket(inner, _)) => {
             unqualify_pg_catalog_json(inner);
@@ -732,6 +784,7 @@ pub(super) fn validate_cast_type(ty: &DataType) -> Result<()> {
                         | "bytea"
                         | "date"
                         | "time"
+                        | "timetz"
                         | "timestamp"
                         | "timestamptz"
                         | "interval"
@@ -761,7 +814,6 @@ pub(super) fn validate_cast_type(ty: &DataType) -> Result<()> {
                     | "xml"
                     | "bit"
                     | "varbit"
-                    | "timetz"
                     | "tsvector"
                     | "tsquery"
                     | "line"
@@ -791,6 +843,7 @@ pub(super) fn validate_cast_type(ty: &DataType) -> Result<()> {
                     | "float4"
                     | "float8"
                     | "bpchar"
+                    | "timetz"
                     | "timestamptz"
                     | "point"
             ) && modifiers.is_empty()
@@ -845,6 +898,8 @@ pub(super) fn validate_cast_type(ty: &DataType) -> Result<()> {
         "BYTEA",
         "DATE",
         "TIME",
+        "TIMETZ",
+        "TIME WITH TIME ZONE",
         "TIMESTAMP",
         "TIMESTAMP WITHOUT TIME ZONE",
         "TIMESTAMPTZ",

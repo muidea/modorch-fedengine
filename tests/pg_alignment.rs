@@ -872,3 +872,252 @@ async fn metadata_parameters_and_regclass_match_native_postgres() {
     task.await.unwrap();
     engine.shutdown_until_drained().await.unwrap();
 }
+
+#[tokio::test]
+async fn session_timezone_startup_set_reset_set_config_and_temporal_types() {
+    use postgres_protocol::authentication::sasl::{ChannelBinding, ScramSha256};
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpStream;
+
+    let temp = common::TestDirectory::new();
+    let engine = FedEngine::start(configuration(&temp)).await.unwrap();
+    let addr = engine.address().unwrap();
+
+    // 1. Startup TimeZone validation & ParameterStatus
+    async fn startup_handshake(
+        addr: std::net::SocketAddr,
+        tz_param: Option<&str>,
+    ) -> std::result::Result<(TcpStream, Vec<(String, String)>), Vec<u8>> {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let mut body = b"\0\x03\0\0user\0fedengine\0database\0fedengine\0".to_vec();
+        if let Some(tz) = tz_param {
+            body.extend_from_slice(format!("TimeZone\0{tz}\0").as_bytes());
+        }
+        body.push(0);
+        stream.write_i32((body.len() + 4) as i32).await.unwrap();
+        stream.write_all(&body).await.unwrap();
+        let mut scram = ScramSha256::new(
+            std::env::var("USER").unwrap().as_bytes(),
+            ChannelBinding::unrequested(),
+        );
+        let mut params = Vec::new();
+        loop {
+            let (tag, b) = wire::message(&mut stream).await;
+            match tag {
+                b'R' => {
+                    let code = i32::from_be_bytes(b[..4].try_into().unwrap());
+                    match code {
+                        10 => {
+                            let mut p = b"SCRAM-SHA-256\0".to_vec();
+                            p.extend_from_slice(&(scram.message().len() as i32).to_be_bytes());
+                            p.extend_from_slice(scram.message());
+                            wire::packet(&mut stream, b'p', &p).await;
+                        }
+                        11 => {
+                            scram.update(&b[4..]).unwrap();
+                            wire::packet(&mut stream, b'p', scram.message()).await;
+                        }
+                        12 => scram.finish(&b[4..]).unwrap(),
+                        0 => {}
+                        _ => panic!("unexpected auth code {code}"),
+                    }
+                }
+                b'S' => {
+                    let mut parts = b.split(|byte| *byte == 0);
+                    let name = String::from_utf8(parts.next().unwrap().to_vec()).unwrap();
+                    let val = String::from_utf8(parts.next().unwrap().to_vec()).unwrap();
+                    params.push((name, val));
+                }
+                b'Z' => return Ok((stream, params)),
+                b'E' => return Err(b),
+                _ => {}
+            }
+        }
+    }
+
+    let bad_err = startup_handshake(addr, Some("Mars/Bad")).await.unwrap_err();
+    assert!(bad_err.windows(6).any(|w| w == b"22023\0"));
+    let sub_err = startup_handshake(addr, Some("+05:30")).await.unwrap_err();
+    assert!(sub_err.windows(6).any(|w| w == b"0A000\0"));
+
+    let (mut raw, startup_params) = startup_handshake(addr, Some("Asia/Shanghai"))
+        .await
+        .unwrap();
+    assert!(
+        startup_params
+            .iter()
+            .any(|(k, v)| k == "TimeZone" && v == "Asia/Shanghai"),
+        "{startup_params:?}"
+    );
+
+    async fn wire_simple_query(
+        stream: &mut TcpStream,
+        sql: &str,
+    ) -> (Vec<(String, String)>, Vec<String>, Vec<String>) {
+        let mut q = sql.as_bytes().to_vec();
+        q.push(0);
+        wire::packet(stream, b'Q', &q).await;
+        let mut status_updates = Vec::new();
+        let mut rows = Vec::new();
+        let mut tags = Vec::new();
+        loop {
+            let (tag, b) = wire::message(stream).await;
+            match tag {
+                b'S' => {
+                    let mut parts = b.split(|byte| *byte == 0);
+                    let name = String::from_utf8(parts.next().unwrap().to_vec()).unwrap();
+                    let val = String::from_utf8(parts.next().unwrap().to_vec()).unwrap();
+                    status_updates.push((name, val));
+                }
+                b'D' => {
+                    let n = i32::from_be_bytes(b[2..6].try_into().unwrap());
+                    rows.push(String::from_utf8(b[6..6 + n as usize].to_vec()).unwrap());
+                }
+                b'C' => tags.push(String::from_utf8_lossy(&b).trim_end_matches('\0').into()),
+                b'Z' => return (status_updates, rows, tags),
+                b'E' => panic!("unexpected query error: {:?}", String::from_utf8_lossy(&b)),
+                _ => {}
+            }
+        }
+    }
+
+    let (ps1, rows1, _) = wire_simple_query(
+        &mut raw,
+        "SELECT set_config('timezone', 'Asia/Kolkata', false)",
+    )
+    .await;
+    assert_eq!(ps1, vec![("TimeZone".into(), "Asia/Kolkata".into())]);
+    assert_eq!(rows1, vec!["Asia/Kolkata"]);
+
+    let (_, rows2, _) =
+        wire_simple_query(&mut raw, "SELECT '2026-06-15 00:00:00+00'::timestamptz").await;
+    assert_eq!(rows2, vec!["2026-06-15 05:30:00+05:30"]);
+
+    let (ps3, _, tags3) = wire_simple_query(&mut raw, "SET TIME ZONE '+08:00'").await;
+    assert_eq!(ps3, vec![("TimeZone".into(), "+08:00".into())]);
+    assert_eq!(tags3, vec!["SET"]);
+
+    let (_, rows4, _) =
+        wire_simple_query(&mut raw, "SELECT '2026-06-15 00:00:00+00'::timestamptz").await;
+    assert_eq!(rows4, vec!["2026-06-15 08:00:00+08"]);
+
+    let (ps5, _, tags5) = wire_simple_query(&mut raw, "RESET ALL").await;
+    assert_eq!(ps5, vec![("TimeZone".into(), "UTC".into())]);
+    assert_eq!(tags5, vec!["RESET"]);
+    drop(raw);
+
+    // 2. tokio_postgres simple & extended queries across timezones, AT TIME ZONE, TIME 24:00, TIMETZ
+    let (client, task) = connect(&engine).await;
+    client
+        .batch_execute("SET TIME ZONE 'America/New_York'")
+        .await
+        .unwrap();
+    let tz_show = client.simple_query("SHOW TIME ZONE").await.unwrap();
+    assert!(
+        tz_show.iter().any(
+            |m| matches!(m, SimpleQueryMessage::Row(r) if r.get(0) == Some("America/New_York"))
+        )
+    );
+    let cur = client
+        .query_one("SELECT current_setting('timezone')", &[])
+        .await
+        .unwrap();
+    assert_eq!(cur.get::<_, &str>(0), "America/New_York");
+
+    let summer = client
+        .simple_query("SELECT '2026-06-15 12:00:00+00'::timestamptz")
+        .await
+        .unwrap();
+    assert!(summer.iter().any(
+        |m| matches!(m, SimpleQueryMessage::Row(r) if r.get(0) == Some("2026-06-15 08:00:00-04"))
+    ));
+    let winter = client
+        .simple_query("SELECT '2026-01-15 12:00:00+00'::timestamptz")
+        .await
+        .unwrap();
+    assert!(winter.iter().any(
+        |m| matches!(m, SimpleQueryMessage::Row(r) if r.get(0) == Some("2026-01-15 07:00:00-05"))
+    ));
+
+    // Bare timestamptz parameter interpreted in active session timezone (Asia/Shanghai)
+    client
+        .batch_execute("SET TIME ZONE 'Asia/Shanghai'")
+        .await
+        .unwrap();
+    let bare_row = client
+        .query_one("SELECT $1::text::timestamptz", &[&"2026-06-15 08:00:00"])
+        .await
+        .unwrap();
+    let expected_utc = chrono::DateTime::parse_from_rfc3339("2026-06-15T00:00:00Z")
+        .unwrap()
+        .to_utc();
+    assert_eq!(
+        bare_row.get::<_, chrono::DateTime<chrono::Utc>>(0),
+        expected_utc
+    );
+
+    // AT TIME ZONE and timezone() rewrites
+    let at_rows = client
+        .simple_query("SELECT ('2026-06-15 00:00:00+00'::timestamptz AT TIME ZONE '+08:00')::timestamp, pg_catalog.timezone('UTC+8', '2026-06-15 00:00:00+00'::timestamptz)::timestamp")
+        .await
+        .unwrap();
+    assert!(
+        at_rows.iter().any(|m| matches!(m, SimpleQueryMessage::Row(r) if r.get(0) == Some("2026-06-15 08:00:00") && r.get(1) == Some("2026-06-14 16:00:00"))),
+        "{at_rows:?}"
+    );
+
+    // TIME 24:00:00 & TIMETZ (OID 1266)
+    let t_rows = client
+        .simple_query("SELECT '24:00:00'::time, '12:34:56.123456+08:00'::timetz")
+        .await
+        .unwrap();
+    assert!(
+        t_rows.iter().any(|m| matches!(m, SimpleQueryMessage::Row(r) if r.get(0) == Some("24:00:00") && r.get(1) == Some("12:34:56.123456+08"))),
+        "{t_rows:?}"
+    );
+
+    // Numeric & interval SET TIME ZONE + SQLSTATE error checks
+    client.batch_execute("SET TIME ZONE 8").await.unwrap();
+    assert_eq!(
+        client
+            .query_one("SELECT current_setting('timezone')", &[])
+            .await
+            .unwrap()
+            .get::<_, &str>(0),
+        "+08:00"
+    );
+    client
+        .batch_execute("SET TIME ZONE INTERVAL '-5 hours'")
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .query_one("SELECT current_setting('timezone')", &[])
+            .await
+            .unwrap()
+            .get::<_, &str>(0),
+        "-05:00"
+    );
+    client.batch_execute("RESET TIME ZONE").await.unwrap();
+    assert_eq!(
+        client
+            .query_one("SELECT current_setting('timezone')", &[])
+            .await
+            .unwrap()
+            .get::<_, &str>(0),
+        "UTC"
+    );
+
+    for (bad, state) in [
+        ("SET LOCAL TIME ZONE 'UTC'", "0A000"),
+        ("SET TIME ZONE 5.5", "0A000"),
+        ("SET TIME ZONE 'Invalid/Zone'", "22023"),
+    ] {
+        let err = client.batch_execute(bad).await.unwrap_err();
+        assert_eq!(err.code().unwrap().code(), state, "{bad}");
+    }
+
+    drop(client);
+    task.await.unwrap();
+    engine.shutdown_until_drained().await.unwrap();
+}

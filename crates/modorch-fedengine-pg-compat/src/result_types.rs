@@ -37,6 +37,7 @@ pub(crate) fn type_from_name(name: &str) -> Option<PgType> {
             "bytea" => PgType::Bytea,
             "date" => PgType::Date,
             "time" | "time without time zone" => PgType::Time,
+            "timetz" | "time with time zone" => PgType::Timetz,
             "timestamp" | "timestamp without time zone" => PgType::Timestamp,
             "timestamptz" | "timestamp with time zone" => PgType::Timestamptz,
             "interval" => PgType::Interval,

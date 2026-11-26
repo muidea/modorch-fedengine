@@ -91,6 +91,11 @@ impl ExecutionPort for DuckdbRuntime {
                 let conn=root.lock().unwrap().try_clone().map_err(engine_error)?;
                 if cloning.elapsed()>Duration::from_millis(100) { tracing::debug!(elapsed_ms=cloning.elapsed().as_secs_f64()*1000., "query connection acquisition delayed"); }
                 conn.execute_batch(modorch_fedengine_pg_compat::EXECUTION_SETTINGS).map_err(engine_error)?;
+                let session_tz = request.session_timezone.trim();
+                if !session_tz.is_empty() && !session_tz.eq_ignore_ascii_case("UTC") {
+                    conn.execute_batch(&format!("SET TimeZone={};", quote_literal(session_tz)))
+                        .map_err(engine_error)?;
+                }
                 *interrupt.lock().unwrap()=Some(conn.interrupt_handle());
                 if request.cancel.is_cancelled(){return Err(EngineError::new("57014","query canceled before execution"));}
                 if request.metadata.is_some(){conn.execute_batch("SET lambda_syntax='ENABLE_SINGLE_ARROW'; BEGIN TRANSACTION").map_err(engine_error)?;}

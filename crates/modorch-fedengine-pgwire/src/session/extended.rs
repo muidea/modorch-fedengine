@@ -3,7 +3,9 @@ use futures::{Sink, SinkExt};
 use modorch::prelude::async_trait;
 use modorch_fedengine_contract::*;
 use modorch_fedengine_core::EngineError;
-use modorch_fedengine_pg_compat::{decode_parameter, encode_row, fields, pg_error};
+use modorch_fedengine_pg_compat::{
+    decode_parameter_in_timezone, encode_row_in_timezone, fields, pg_error,
+};
 use pgwire::{
     api::{
         portal::{Format, Portal},
@@ -128,6 +130,7 @@ impl ExtendedQueryHandler for Backend {
                 let mut portal = Portal::try_new(&message, stmt)?;
                 let mut names = Vec::new();
                 let mut formats = Vec::new();
+                let tz = self.active_timezone(client)?;
                 for (i, t) in portal.statement.statement.parameters.iter().enumerate() {
                     let binary = portal.parameter_format.is_binary(i);
                     formats.push(i16::from(binary));
@@ -161,7 +164,7 @@ impl ExtendedQueryHandler for Backend {
                             continue;
                         }
                     }
-                    decode_parameter(portal.parameters[i].as_deref(), *t, binary)
+                    decode_parameter_in_timezone(portal.parameters[i].as_deref(), *t, binary, &tz)
                         .map_err(pg_error)?;
                 }
                 if !names.is_empty() {
@@ -270,15 +273,17 @@ impl ExtendedQueryHandler for Backend {
                     "session namespace changed; Parse/Bind the statement again",
                 )));
             }
+            let tz = self.active_timezone(client)?;
             let parameters = s
                 .parameters
                 .iter()
                 .enumerate()
                 .map(|(i, t)| {
-                    decode_parameter(
+                    decode_parameter_in_timezone(
                         portal.parameters[i].as_deref(),
                         *t,
                         portal.parameter_format.is_binary(i),
+                        &tz,
                     )
                     .map_err(pg_error)
                 })
@@ -323,8 +328,13 @@ impl ExtendedQueryHandler for Backend {
                 send(
                     client,
                     PgWireBackendMessage::DataRow(
-                        encode_row(&row, &cursor.columns, &portal.result_column_format)
-                            .map_err(pg_error)?,
+                        encode_row_in_timezone(
+                            &row,
+                            &cursor.columns,
+                            &portal.result_column_format,
+                            &cursor.timezone,
+                        )
+                        .map_err(pg_error)?,
                     ),
                     self.config.pgwire.output_timeout_ms,
                 )

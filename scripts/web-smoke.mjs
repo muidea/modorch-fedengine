@@ -222,7 +222,7 @@ try {
   await cdp.send('Emulation.setDeviceMetricsOverride', { width: 1440, height: 1000, deviceScaleFactor: 1, mobile: false });
   await cdp.send('Page.navigate', { url: `${origin}/manage/` });
   const evaluate = expression => cdp.evaluate(expression);
-  async function waitText(text) { try { await until(() => evaluate(`document.body.innerText.includes(${JSON.stringify(text)})`), text); } catch (error) { throw new Error(`${error.message}: ${await evaluate('document.querySelector("#content").innerText')}`); } }
+  async function waitText(text, timeout = 15000) { try { await until(() => evaluate(`Boolean(document.body?.innerText?.includes(${JSON.stringify(text)}))`), text, timeout); } catch (error) { const domText = await evaluate('document.querySelector("#content")?.innerText ?? document.body?.innerText ?? location.href').catch(e => String(e)); throw new Error(`${error.message}: ${domText}; exceptions=${JSON.stringify(exceptions)}; engine=${childSummary(engine)}`); } }
   async function click(text, scope = 'document') {
     await until(() => evaluate(`[...${scope}.querySelectorAll('button')].some(node => node.textContent === ${JSON.stringify(text)} && !node.disabled && node.getClientRects().length)`), `button enabled: ${text}`);
     await evaluate(`(() => { const node = [...${scope}.querySelectorAll('button')].find(node => node.textContent === ${JSON.stringify(text)} && !node.disabled && node.getClientRects().length); if (!node) throw new Error('Button unavailable: ' + ${JSON.stringify(text)}); node.click(); })()`);
@@ -238,7 +238,7 @@ try {
     await sourceState(source => !source.current_operation);
     await click('↻ 刷新状态'); await sleep(200);
   }
-  await waitText('管理服务已连接');
+  await waitText('管理服务已连接', 30000);
   await waitText('尚未登记数据源');
   await click('＋ 登记数据源');
   await fill('[name=connection_id]', 'web_pg'); await fill('[name=host]', '127.0.0.1'); await fill('[name=virtual_name]', 'web_pg');

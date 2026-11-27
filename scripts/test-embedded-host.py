@@ -116,6 +116,14 @@ def main():
     triple = next(line.removeprefix("host: ") for line in rustc.splitlines() if line.startswith("host: "))
     # Dynamic binaries run outside cargo's injected library search environment.
     library = args.target_dir / "duckdb-download" / triple / "v2.0.0/libduckdb.so"
+    if not library.is_file():
+        candidates = sorted(
+            args.target_dir.glob("*/build/libduckdb-sys-*/out/libduckdb.so"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if candidates:
+            library = candidates[0]
     if library.is_file():
         environment["LD_LIBRARY_PATH"] = str(library.parent.resolve()) + os.pathsep + environment.get("LD_LIBRARY_PATH", "")
     flags = ["--locked"] + ([] if args.online else ["--offline"])

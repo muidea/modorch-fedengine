@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { mkdir, mkdtemp, readFile, writeFile, rm, readdir } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, writeFile, rm, readdir, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, resolve, join } from 'node:path';
 import { parseArgs } from 'node:util';
@@ -94,10 +94,40 @@ try {
   }
   await writeFile(join(temporary, 'application.toml'), config);
   const env = { ...process.env, FEDENGINE_PASSWORD: 'disposable-web-smoke', RUST_LOG: 'fedengine_test_host=info,modorch_fedengine=info', NO_COLOR: '1' };
-  const libraries = resolve(dirname(binary), '../../duckdb-download');
-  for (const triple of await readdir(libraries)) {
-    env.LD_LIBRARY_PATH = `${join(libraries, triple, 'v2.0.0')}:${process.env.LD_LIBRARY_PATH ?? ''}`;
-    break;
+  const targetRoot = resolve(dirname(binary), '../..');
+  let libDir = null;
+  try {
+    for (const triple of await readdir(join(targetRoot, 'duckdb-download'))) {
+      const candidate = join(targetRoot, 'duckdb-download', triple, 'v2.0.0');
+      try {
+        if ((await stat(join(candidate, 'libduckdb.so'))).isFile()) {
+          libDir = candidate;
+          break;
+        }
+      } catch {}
+    }
+  } catch {}
+  if (!libDir) {
+    let newest = -1;
+    for (const profile of ['debug', 'release']) {
+      const buildDir = join(targetRoot, profile, 'build');
+      try {
+        for (const entry of await readdir(buildDir)) {
+          if (!entry.startsWith('libduckdb-sys-')) continue;
+          const candidate = join(buildDir, entry, 'out');
+          try {
+            const info = await stat(join(candidate, 'libduckdb.so'));
+            if (info.isFile() && info.mtimeMs > newest) {
+              newest = info.mtimeMs;
+              libDir = candidate;
+            }
+          } catch {}
+        }
+      } catch {}
+    }
+  }
+  if (libDir) {
+    env.LD_LIBRARY_PATH = `${libDir}:${process.env.LD_LIBRARY_PATH ?? ''}`;
   }
   const engine = launch(binary, ['--config', join(temporary, 'application.toml')], { env });
   const address = await until(

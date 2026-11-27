@@ -30,7 +30,14 @@ def main():
         configuration.write_text(text)
         environment = dict(os.environ, FEDENGINE_PASSWORD="disposable-smoke-password", RUST_LOG="fedengine_test_host=info,modorch_fedengine=info", NO_COLOR="1")
         # Match cargo run's library search path when exercising a download-lib build.
-        libraries = list((Path(binary).parent.parent.parent / "duckdb-download").glob("*/v2.0.0/libduckdb.so"))
+        target_root = Path(binary).parent.parent.parent
+        libraries = list((target_root / "duckdb-download").glob("*/v2.0.0/libduckdb.so"))
+        if not libraries:
+            libraries = sorted(
+                target_root.glob("*/build/libduckdb-sys-*/out/libduckdb.so"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
         if libraries:
             environment["LD_LIBRARY_PATH"] = str(libraries[0].parent) + os.pathsep + environment.get("LD_LIBRARY_PATH", "")
         process = subprocess.Popen([binary, "--config", str(configuration)], env=environment,
